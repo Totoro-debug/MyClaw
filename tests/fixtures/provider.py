@@ -1,7 +1,7 @@
 """Scripted provider boundary for deterministic offline tests."""
 
 from collections import deque
-from collections.abc import AsyncIterator, Iterable, Sequence
+from collections.abc import AsyncIterator, Iterable, Mapping, Sequence
 from copy import deepcopy
 from dataclasses import dataclass
 from typing import Any
@@ -9,11 +9,12 @@ from typing import Any
 from myclaw.config.config import ProviderConfiguration
 from myclaw.errors import ErrorInfo
 from myclaw.provider.errors import ModelCallError
-from myclaw.provider.model_router import ModelAttemptGuard
+from myclaw.provider.model_router import ModelAttemptGuard, ModelRouteStatus
 from myclaw.provider.models import (
     ModelContinuation,
     ModelProvider,
     ModelResponse,
+    ModelRoute,
     ModelStreamEvent,
     ReasoningEffort,
 )
@@ -161,19 +162,30 @@ class ScriptedFakeProvider:
 class ScriptedFakeRouter:
     """Adapt a direct provider test double to the route-only test seam."""
 
-    def __init__(self, provider: ModelProvider) -> None:
+    def __init__(
+        self,
+        provider: ModelProvider,
+        *,
+        route_statuses: Mapping[ModelRoute, ModelRouteStatus] | None = None,
+    ) -> None:
         self._provider = provider
         self.complete_calls = 0
+        self._route_statuses = dict(route_statuses or {})
+        self._current_call_statuses: dict[ModelRoute, ModelRouteStatus] = {}
 
     def stream(
         self,
-        route: str,
+        route: ModelRoute,
         *,
         messages: Sequence[dict[str, object]],
         tools: Sequence[dict[str, Any]],
         continuation: ModelContinuation | None = None,
+        guard: ModelAttemptGuard | None = None,
     ) -> AsyncIterator[ModelStreamEvent]:
-        del route
+        status = self.call_route_status(route, continuation=continuation)
+        self._current_call_statuses[route] = status
+        if guard is not None:
+            guard(status, messages, tools)
         return self._provider.stream(
             messages=messages,
             tools=tools,
@@ -187,14 +199,17 @@ class ScriptedFakeRouter:
 
     async def complete(
         self,
-        route: str,
+        route: ModelRoute,
         *,
         messages: Sequence[dict[str, object]],
         tools: Sequence[dict[str, Any]],
         continuation: ModelContinuation | None = None,
         guard: ModelAttemptGuard | None = None,
     ) -> ModelResponse:
-        del route, guard
+        status = self.call_route_status(route, continuation=continuation)
+        self._current_call_statuses[route] = status
+        if guard is not None:
+            guard(status, messages, tools)
         self.complete_calls += 1
         return await self._provider.complete(
             messages=messages,
@@ -205,6 +220,29 @@ class ScriptedFakeRouter:
             reasoning_effort=None,
             timeout=30,
             continuation=continuation,
+        )
+
+    def current_call_status(self, route: ModelRoute) -> ModelRouteStatus | None:
+        return self._current_call_statuses.get(route)
+
+    def call_route_status(
+        self,
+        route: ModelRoute,
+        *,
+        continuation: ModelContinuation | None,
+    ) -> ModelRouteStatus:
+        del continuation
+        return self._route_statuses.get(
+            route,
+            ModelRouteStatus(
+                requested_route=route,
+                selected_route=route,
+                provider_id="test-provider",
+                model="test-model",
+                context_window=16_384,
+                max_output=1_024,
+                used_default=False,
+            ),
         )
 
     async def close(self) -> None:

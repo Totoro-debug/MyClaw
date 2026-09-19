@@ -6,27 +6,26 @@ from collections.abc import Sequence
 from copy import deepcopy
 from typing import Any
 
-from myclaw.provider.models import ModelResponse
+from myclaw.provider.models import ModelContinuation, ModelResponse
 
 
 class DetachedRequestPreparer:
     """Return a detached request without adding a context projection."""
 
-    @property
-    def recounts_retained_tool_calls(self) -> bool:
-        return False
+    def __init__(self, initial_messages: Sequence[dict[str, Any]] = ()) -> None:
+        self._initial_messages = deepcopy(list(initial_messages))
 
     async def prepare(
         self,
-        candidate: Sequence[dict[str, Any]],
         *,
         increment: Sequence[dict[str, Any]],
         latest_cycle_start: int | None,
         tools: Sequence[dict[str, Any]],
+        continuation: ModelContinuation | None,
         continuation_revision: int,
     ) -> list[dict[str, Any]]:
-        del increment, latest_cycle_start, tools, continuation_revision
-        return deepcopy(list(candidate))
+        del latest_cycle_start, tools, continuation, continuation_revision
+        return deepcopy([*self._initial_messages, *increment])
 
     def observe_request_projection(
         self,
@@ -43,5 +42,6 @@ class DetachedRequestPreparer:
         tools: Sequence[dict[str, Any]],
         response: ModelResponse,
         increment: Sequence[dict[str, Any]],
-    ) -> None:
+    ) -> dict[str, object] | None:
         del request_messages, tools, response, increment
+        return None

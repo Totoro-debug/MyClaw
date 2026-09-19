@@ -179,8 +179,6 @@ class _AgentRunContext:
 
     route: Literal["chat", "schedule"]
     current_user: dict[str, Any]
-    route_context_window: int
-    route_max_output: int
     project_messages: Callable[[Sequence[dict[str, Any]]], list[dict[str, Any]]]
     router: AgentRunContextRouterAdapter
     controller: AgentRunContextController
@@ -802,10 +800,6 @@ class AgentLoop:
         route: Literal["chat", "schedule"],
         project_messages: Callable[[Sequence[dict[str, Any]]], list[dict[str, Any]]],
     ) -> _AgentRunContext:
-        resolved = self._configuration.resolve_route(route)
-        configured_route = resolved.route
-        route_status = _configured_model_route_status(self._configuration, route)
-        memory_route_status = _configured_model_route_status(self._configuration, "memory")
         run_router = AgentRunContextRouterAdapter(self._model_router)
         controller = AgentRunContextController.from_session(
             session,
@@ -815,29 +809,15 @@ class AgentLoop:
         )
         request_preparer = AgentRunContextRequestPreparer(
             controller,
+            router=run_router,
+            requested_route=route,
             project_messages=project_messages,
-            route_context_window=configured_route.context_window,
-            route_max_output=configured_route.max_output,
             current_user=current_user,
             compact_ratio=self._configuration.runtime.compact_ratio,
-            route_status=lambda: run_router.current_call_status(route) or route_status,
-            memory_route_status=lambda: (
-                run_router.current_call_status("memory") or memory_route_status
-            ),
-            requested_route=route,
-            selected_route=(route_status.selected_route if route_status is not None else route),
-            provider_id=(
-                route_status.provider_id
-                if route_status is not None
-                else resolved.provider.provider_id
-            ),
-            model=(route_status.model if route_status is not None else configured_route.model),
         )
         return _AgentRunContext(
             route=route,
             current_user=deepcopy(current_user),
-            route_context_window=configured_route.context_window,
-            route_max_output=configured_route.max_output,
             project_messages=project_messages,
             router=run_router,
             controller=controller,
@@ -850,23 +830,15 @@ class AgentLoop:
         *,
         tool_gateway: ToolGateway,
     ) -> list[dict[str, Any]]:
-        route_status = _configured_model_route_status(self._configuration, context.route)
-        memory_route_status = _configured_model_route_status(self._configuration, "memory")
+        route_status = context.router.call_route_status(context.route, continuation=None)
+        memory_route_status = context.router.call_route_status("memory", continuation=None)
         retained_messages = await context.controller.prepare_run_start(
             project_messages=context.project_messages,
-            route_context_window=context.route_context_window,
-            route_max_output=context.route_max_output,
+            route_status=route_status,
+            memory_route_status=memory_route_status,
             tools=tool_gateway.schemas,
             current_user=deepcopy(context.current_user),
             compact_ratio=self._configuration.runtime.compact_ratio,
-            route_status=route_status,
-            memory_route_status=memory_route_status,
-            requested_route=context.route,
-            selected_route=(
-                route_status.selected_route if route_status is not None else context.route
-            ),
-            provider_id=(route_status.provider_id if route_status is not None else "configured"),
-            model=(route_status.model if route_status is not None else "configured"),
         )
         return list(deepcopy(retained_messages))
 

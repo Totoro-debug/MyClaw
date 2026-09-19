@@ -39,8 +39,6 @@ type CompactionProjection = Callable[
     [Sequence[dict[str, Any]]],
     list[dict[str, Any]],
 ]
-type RouteStatusSource = ModelRouteStatus | Callable[[], ModelRouteStatus | None] | None
-
 _COMPACTION_JSON_TRANSLATION = str.maketrans({"`": r"\u0060"})
 
 __all__ = [
@@ -92,6 +90,13 @@ class AgentRunRouter(Protocol):
     ) -> Coroutine[Any, Any, ModelResponse]: ...
 
     def current_call_status(self, route: ModelRoute) -> ModelRouteStatus | None: ...
+
+    def call_route_status(
+        self,
+        route: ModelRoute,
+        *,
+        continuation: ModelContinuation | None,
+    ) -> ModelRouteStatus: ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -220,34 +225,20 @@ class AgentRunContextController:
         self,
         *,
         project_messages: CompactionProjection,
-        route_context_window: int,
-        route_max_output: int,
+        route_status: ModelRouteStatus,
+        memory_route_status: ModelRouteStatus,
         tools: Sequence[dict[str, Any]] = (),
         current_user: dict[str, Any] | None = None,
         compact_ratio: float = 0.9,
-        route_status: ModelRouteStatus | None = None,
-        memory_route_status: ModelRouteStatus | None = None,
-        requested_route: str = "chat",
-        selected_route: str | None = None,
-        provider_id: str = "",
-        model: str = "",
         estimator_version: str = CONTEXT_ESTIMATOR_VERSION,
     ) -> tuple[dict[str, Any], ...]:
         """Check and stage Run-start history compression without publishing Session state."""
         budget = ContextBudget(
-            context_window=route_context_window,
-            max_output=route_max_output,
+            context_window=route_status.context_window,
+            max_output=route_status.max_output,
             compact_ratio=compact_ratio,
         )
-        route_values = _route_projection_values(
-            route_status=route_status,
-            requested_route=requested_route,
-            selected_route=selected_route,
-            provider_id=provider_id,
-            model=model,
-            context_window=route_context_window,
-            max_output=route_max_output,
-        )
+        route_values = _route_projection_values(route_status)
         effective_tools = tuple(deepcopy(list(tools)))
         copied_user = None if current_user is None else deepcopy(current_user)
         projected = self._project_candidate(
@@ -345,14 +336,9 @@ class AgentRunContextController:
             if pending_fact is None
             else pending_fact.selected_payload
         )
-        memory_context_window, memory_max_output = _memory_budget_values(
-            memory_route_status=memory_route_status,
-            fallback_context_window=route_context_window,
-            fallback_max_output=route_max_output,
-        )
         memory_budget = ContextBudget(
-            context_window=memory_context_window,
-            max_output=memory_max_output,
+            context_window=memory_route_status.context_window,
+            max_output=memory_route_status.max_output,
             compact_ratio=0.9,
         )
         if pending_fact is None:
@@ -466,25 +452,11 @@ class AgentRunContextController:
         tools: Sequence[dict[str, Any]],
         response: ModelResponse,
         increment: Sequence[dict[str, Any]],
-        route_status: ModelRouteStatus | None,
-        requested_route: str,
-        selected_route: str | None,
-        provider_id: str,
-        model: str,
-        route_context_window: int,
-        route_max_output: int,
+        route_status: ModelRouteStatus,
         estimator_version: str,
     ) -> ContextUsageSnapshot:
         """Record one main response's route, anchor and run projection provenance."""
-        route_values = _route_projection_values(
-            route_status=route_status,
-            requested_route=requested_route,
-            selected_route=selected_route,
-            provider_id=provider_id,
-            model=model,
-            context_window=route_context_window,
-            max_output=route_max_output,
-        )
+        route_values = _route_projection_values(route_status)
         anchor_estimated_tokens = estimate_request_tokens(
             [*request_messages, response.message.to_dict()],
             tools,
@@ -549,31 +521,17 @@ class AgentRunContextController:
         project_messages: CompactionProjection,
         increment: Sequence[dict[str, Any]],
         latest_cycle_start: int | None,
-        route_context_window: int,
-        route_max_output: int,
+        route_status: ModelRouteStatus,
+        memory_route_status: ModelRouteStatus,
         tools: Sequence[dict[str, Any]] = (),
         current_user: dict[str, Any] | None = None,
         compact_ratio: float = 0.9,
-        route_status: ModelRouteStatus | None = None,
-        memory_route_status: ModelRouteStatus | None = None,
-        requested_route: str = "chat",
-        selected_route: str | None = None,
-        provider_id: str = "",
-        model: str = "",
         estimator_version: str = CONTEXT_ESTIMATOR_VERSION,
         continuation_revision: int = 0,
         micro_compression_enabled: bool = False,
     ) -> tuple[dict[str, Any], ...]:
         """Prepare one ReAct request from the run's raw increment."""
-        route_values = _route_projection_values(
-            route_status=route_status,
-            requested_route=requested_route,
-            selected_route=selected_route,
-            provider_id=provider_id,
-            model=model,
-            context_window=route_context_window,
-            max_output=route_max_output,
-        )
+        route_values = _route_projection_values(route_status)
         budget = ContextBudget(
             context_window=route_values.context_window,
             max_output=route_values.max_output,
@@ -666,14 +624,9 @@ class AgentRunContextController:
             if pending_fact is None
             else pending_fact.selected_payload
         )
-        memory_context_window, memory_max_output = _memory_budget_values(
-            memory_route_status=memory_route_status,
-            fallback_context_window=route_context_window,
-            fallback_max_output=route_max_output,
-        )
         memory_budget = ContextBudget(
-            context_window=memory_context_window,
-            max_output=memory_max_output,
+            context_window=memory_route_status.context_window,
+            max_output=memory_route_status.max_output,
             compact_ratio=0.9,
         )
         if pending_fact is None:
@@ -1123,80 +1076,56 @@ class AgentRunContextRequestPreparer:
         self,
         controller: AgentRunContextController,
         *,
+        router: AgentRunContextRouterAdapter,
+        requested_route: Literal["chat", "schedule"],
         project_messages: CompactionProjection,
-        route_context_window: int,
-        route_max_output: int,
         current_user: dict[str, Any] | None = None,
         compact_ratio: float = 0.9,
-        route_status: RouteStatusSource = None,
-        memory_route_status: RouteStatusSource = None,
-        requested_route: str = "chat",
-        selected_route: str | None = None,
-        provider_id: str = "",
-        model: str = "",
         estimator_version: str = CONTEXT_ESTIMATOR_VERSION,
     ) -> None:
         if not isinstance(controller, AgentRunContextController):
             raise TypeError("request preparer requires an Agent Run context controller")
+        if not isinstance(router, AgentRunContextRouterAdapter):
+            raise TypeError("request preparer requires an Agent Run context router")
+        if requested_route not in {"chat", "schedule"}:
+            raise ValueError("request preparer route must be chat or schedule")
         if not callable(project_messages):
             raise TypeError("request preparer requires a projection callback")
         self._controller = controller
+        self._router = router
+        self._requested_route = requested_route
         self._project_messages = project_messages
-        self._route_context_window = route_context_window
-        self._route_max_output = route_max_output
         self._current_user = None if current_user is None else deepcopy(current_user)
         self._compact_ratio = compact_ratio
-        self._route_status = route_status
-        self._memory_route_status = memory_route_status
-        self._requested_route = requested_route
-        self._selected_route = selected_route
-        self._provider_id = provider_id
-        self._model = model
         self._estimator_version = estimator_version
         self._micro_compression_enabled = False
         self._pending_observation: _ReactRevisionObservation | None = None
 
-    @property
-    def recounts_retained_tool_calls(self) -> bool:
-        return True
-
     async def prepare(
         self,
-        candidate: Sequence[dict[str, Any]],
         *,
         increment: Sequence[dict[str, Any]],
         latest_cycle_start: int | None,
         tools: Sequence[dict[str, Any]],
+        continuation: ModelContinuation | None,
         continuation_revision: int,
     ) -> list[dict[str, Any]]:
-        del candidate
         self._pending_observation = None
-        route_status = _resolve_route_status(self._route_status)
-        memory_route_status = _resolve_route_status(self._memory_route_status)
-        route_values = _route_projection_values(
-            route_status=route_status,
-            requested_route=self._requested_route,
-            selected_route=self._selected_route,
-            provider_id=self._provider_id,
-            model=self._model,
-            context_window=self._route_context_window,
-            max_output=self._route_max_output,
+        route_status = self._router.call_route_status(
+            self._requested_route,
+            continuation=continuation,
         )
+        memory_route_status = self._router.call_route_status("memory", continuation=None)
+        route_values = _route_projection_values(route_status)
         prepared_messages = await self._controller.prepare_react(
             project_messages=self._project_messages,
             increment=deepcopy(list(increment)),
             latest_cycle_start=latest_cycle_start,
-            route_context_window=route_values.context_window,
-            route_max_output=route_values.max_output,
+            route_status=route_status,
+            memory_route_status=memory_route_status,
             tools=deepcopy(list(tools)),
             current_user=None if self._current_user is None else deepcopy(self._current_user),
             compact_ratio=self._compact_ratio,
-            route_status=route_status,
-            memory_route_status=memory_route_status,
-            requested_route=self._requested_route,
-            selected_route=self._selected_route,
-            provider_id=self._provider_id,
-            model=self._model,
             estimator_version=self._estimator_version,
             continuation_revision=continuation_revision,
             micro_compression_enabled=self._micro_compression_enabled,
@@ -1245,21 +1174,15 @@ class AgentRunContextRequestPreparer:
         increment: Sequence[dict[str, Any]],
     ) -> dict[str, object] | None:
         """Attach the usage anchor for the assistant response just produced."""
-        route_status = _resolve_route_status(self._route_status)
-        if route_status is None and (not self._provider_id or not self._model):
-            return None
+        route_status = self._router.current_call_status(self._requested_route)
+        if route_status is None:
+            raise RuntimeError("response recording requires one completed Model call")
         return self._controller.record_main_agent_response(
             request_messages=request_messages,
             tools=tools,
             response=response,
             increment=increment,
             route_status=route_status,
-            requested_route=self._requested_route,
-            selected_route=self._selected_route,
-            provider_id=self._provider_id,
-            model=self._model,
-            route_context_window=self._route_context_window,
-            route_max_output=self._route_max_output,
             estimator_version=self._estimator_version,
         ).to_dict()
 
@@ -1320,6 +1243,14 @@ class AgentRunContextRouterAdapter:
     def current_call_status(self, route: ModelRoute) -> ModelRouteStatus | None:
         return self._call_statuses.get(route)
 
+    def call_route_status(
+        self,
+        route: ModelRoute,
+        *,
+        continuation: ModelContinuation | None,
+    ) -> ModelRouteStatus:
+        return self._router.call_route_status(route, continuation=continuation)
+
     def _remember_call_status(self, route: ModelRoute) -> None:
         status = self._router.current_call_status(route)
         if status is not None:
@@ -1346,52 +1277,15 @@ class _RouteProjectionValues:
         }
 
 
-def _resolve_route_status(source: RouteStatusSource) -> ModelRouteStatus | None:
-    if callable(source):
-        source = source()
-    if source is not None and not isinstance(source, ModelRouteStatus):
-        raise TypeError("route status source must return ModelRouteStatus or None")
-    return source
-
-
-def _route_projection_values(
-    *,
-    route_status: ModelRouteStatus | None,
-    requested_route: str,
-    selected_route: str | None,
-    provider_id: str,
-    model: str,
-    context_window: int,
-    max_output: int,
-) -> _RouteProjectionValues:
-    if route_status is not None:
-        return _RouteProjectionValues(
-            requested_route=route_status.requested_route,
-            selected_route=route_status.selected_route,
-            provider_id=route_status.provider_id,
-            model=route_status.model,
-            context_window=route_status.context_window,
-            max_output=route_status.max_output,
-        )
+def _route_projection_values(route_status: ModelRouteStatus) -> _RouteProjectionValues:
     return _RouteProjectionValues(
-        requested_route=requested_route,
-        selected_route=requested_route if selected_route is None else selected_route,
-        provider_id=provider_id,
-        model=model,
-        context_window=context_window,
-        max_output=max_output,
+        requested_route=route_status.requested_route,
+        selected_route=route_status.selected_route,
+        provider_id=route_status.provider_id,
+        model=route_status.model,
+        context_window=route_status.context_window,
+        max_output=route_status.max_output,
     )
-
-
-def _memory_budget_values(
-    *,
-    memory_route_status: ModelRouteStatus | None,
-    fallback_context_window: int,
-    fallback_max_output: int,
-) -> tuple[int, int]:
-    if memory_route_status is not None:
-        return memory_route_status.context_window, memory_route_status.max_output
-    return fallback_context_window, fallback_max_output
 
 
 def _completed_run_ranges(messages: Sequence[dict[str, Any]]) -> list[tuple[int, int]]:

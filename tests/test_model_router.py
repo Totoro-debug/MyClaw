@@ -682,6 +682,10 @@ async def test_model_router_continues_the_selected_stream_route() -> None:
 
     first = await collect(router.stream("chat", **request()))
     assert isinstance(first[-1], ModelCompleted)
+    preview = router.call_route_status(
+        "chat",
+        continuation=first[-1].response.continuation,
+    )
     observed = await collect(
         router.stream(
             "chat",
@@ -691,6 +695,7 @@ async def test_model_router_continues_the_selected_stream_route() -> None:
     )
 
     assert observed == [completed()]
+    assert preview == router.current_call_status("chat")
     assert len(chat_provider.stream_requests) == 1
     assert [call.model for call in default_provider.stream_requests] == [
         "default-model",
@@ -970,6 +975,144 @@ def test_model_router_route_status_starts_from_static_default_fallback() -> None
     )
 
 
+def test_model_router_call_route_status_has_no_side_effects_for_static_fallback() -> None:
+    factory_calls: list[str] = []
+
+    def provider_factory(provider: ProviderConfiguration) -> ScriptedFakeProvider:
+        factory_calls.append(provider.provider_id)
+        return ScriptedFakeProvider()
+
+    router = ModelRouter(
+        configuration=configuration(),
+        provider_factory=provider_factory,
+        clock=FakeClock(NOW),
+        jitter=None,
+    )
+    capture = capture_diagnostics()
+
+    try:
+        with capture.session(SESSION_ID):
+            preview = router.call_route_status("chat", continuation=None)
+    finally:
+        capture.close()
+
+    assert preview == ModelRouteStatus(
+        requested_route="chat",
+        selected_route="default",
+        provider_id="default-provider",
+        model="default-model",
+        context_window=100_000,
+        max_output=4096,
+        used_default=True,
+    )
+    assert factory_calls == []
+    assert router._providers == {}
+    assert router._route_statuses == {}
+    assert router._current_call_statuses.get() is None
+    assert "Default Model Route selected" not in capture.event_text
+    assert "Provider attempt failed" not in capture.event_text
+
+
+@pytest.mark.asyncio
+async def test_model_router_call_route_status_matches_configured_route_call() -> None:
+    provider = ScriptedFakeProvider(streams=(StreamScript(events=(completed(),)),))
+    router = ModelRouter(
+        configuration=routed_configuration(),
+        provider_factory=lambda _: provider,
+        clock=FakeClock(NOW),
+        jitter=None,
+    )
+
+    preview = router.call_route_status("chat", continuation=None)
+    observed = await collect(router.stream("chat", **request()))
+
+    assert observed == [completed()]
+    assert preview == ModelRouteStatus(
+        requested_route="chat",
+        selected_route="chat",
+        provider_id="chat-provider",
+        model="chat-model",
+        context_window=200_000,
+        max_output=8192,
+        used_default=False,
+    )
+    assert router.current_call_status("chat") == preview
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("previous", "continuation"),
+    (
+        pytest.param(
+            ModelRouteStatus(
+                requested_route="chat",
+                selected_route="default",
+                provider_id="default-provider",
+                model="default-model",
+                context_window=100_000,
+                max_output=4096,
+                used_default=True,
+            ),
+            ModelContinuation(provider_id="chat-provider", payload="chat-state"),
+            id="provider",
+        ),
+        pytest.param(
+            ModelRouteStatus(
+                requested_route="chat",
+                selected_route="memory",
+                provider_id="default-provider",
+                model="default-model",
+                context_window=100_000,
+                max_output=4096,
+                used_default=True,
+            ),
+            ModelContinuation(provider_id="default-provider", payload="default-state"),
+            id="configured-route",
+        ),
+        pytest.param(
+            ModelRouteStatus(
+                requested_route="chat",
+                selected_route="default",
+                provider_id="default-provider",
+                model="retired-model",
+                context_window=100_000,
+                max_output=4096,
+                used_default=True,
+            ),
+            ModelContinuation(provider_id="default-provider", payload="default-state"),
+            id="model",
+        ),
+    ),
+)
+async def test_model_router_call_route_status_rejects_incompatible_continuation_route(
+    previous: ModelRouteStatus,
+    continuation: ModelContinuation,
+) -> None:
+    provider = ScriptedFakeProvider(streams=(StreamScript(events=(completed(),)),))
+    router = ModelRouter(
+        configuration=routed_configuration(),
+        provider_factory=lambda _: provider,
+        clock=FakeClock(NOW),
+        jitter=None,
+    )
+    router._current_call_statuses.set({"chat": previous})
+
+    preview = router.call_route_status("chat", continuation=continuation)
+    observed = await collect(router.stream("chat", **request(), continuation=continuation))
+
+    assert observed == [completed()]
+    assert preview == ModelRouteStatus(
+        requested_route="chat",
+        selected_route="chat",
+        provider_id="chat-provider",
+        model="chat-model",
+        context_window=200_000,
+        max_output=8192,
+        used_default=False,
+    )
+    assert router.current_call_status("chat") == preview
+
+
 @pytest.mark.asyncio
 async def test_model_router_records_static_default_fallback_without_provider_attempt(
     agent_home: Path,
@@ -1027,12 +1170,13 @@ async def test_model_router_route_status_recovers_on_the_next_logical_stream() -
     assert first == [completed("Fallback response.")]
     assert router.route_status("chat").selected_route == "default"
 
+    preview = router.call_route_status("chat", continuation=None)
     second = await collect(router.stream("chat", **request()))
 
     assert second == [completed("Chat recovered.")]
     assert len(chat_provider.stream_requests) == 2
     assert len(default_provider.stream_requests) == 1
-    assert router.route_status("chat") == ModelRouteStatus(
+    assert preview == ModelRouteStatus(
         requested_route="chat",
         selected_route="chat",
         provider_id="chat-provider",
@@ -1041,6 +1185,8 @@ async def test_model_router_route_status_recovers_on_the_next_logical_stream() -
         max_output=8192,
         used_default=False,
     )
+    assert router.current_call_status("chat") == preview
+    assert router.route_status("chat") == preview
 
 
 @pytest.mark.asyncio
@@ -1560,8 +1706,9 @@ async def test_agent_runner_next_tool_loop_request_reads_latest_runtime_effort()
                 content="updated",
             )
 
-    result = await AgentRunner(router, DetachedRequestPreparer()).run(
-        [{"role": "user", "content": "Run work."}],
+    initial_messages = [{"role": "user", "content": "Run work."}]
+    result = await AgentRunner(router, DetachedRequestPreparer(initial_messages)).run(
+        initial_messages,
         model="chat",
         tool_gateway=cast(Any, UpdatingGateway()),
         on_output=None,

@@ -92,6 +92,18 @@ class ModelRouter:
         statuses = self._current_call_statuses.get()
         return None if statuses is None else statuses.get(requested_route)
 
+    def call_route_status(
+        self,
+        requested_route: ModelRoute,
+        *,
+        continuation: ModelContinuation | None,
+    ) -> ModelRouteStatus:
+        """Preview the initial route for one logical call without publishing state."""
+        return _route_status(
+            requested_route,
+            self._resolve_call_route(requested_route, continuation),
+        )
+
     @property
     def reasoning_effort(self) -> ReasoningEffort:
         """Return the effective chat Reasoning Effort for this Runtime Lifetime."""
@@ -332,9 +344,7 @@ class ModelRouter:
         continuation: ModelContinuation | None,
     ) -> tuple[ResolvedModelRoute, ReasoningEffort | None]:
         reasoning_effort = self._reasoning_effort_override
-        resolved = self._continuation_route(requested_route, continuation)
-        if resolved is None:
-            resolved = self._configuration.resolve_route(requested_route)
+        resolved = self._resolve_call_route(requested_route, continuation)
         if reasoning_effort is not None and resolved.selected_route in {"default", "chat"}:
             resolved = replace(
                 resolved,
@@ -354,28 +364,26 @@ class ModelRouter:
             )
         return resolved, reasoning_effort
 
-    def _continuation_route(
+    def _resolve_call_route(
         self,
         requested_route: ModelRoute,
         continuation: ModelContinuation | None,
-    ) -> ResolvedModelRoute | None:
-        if continuation is None:
-            return None
-        previous = self.current_call_status(requested_route)
-        if previous is None or previous.provider_id != continuation.provider_id:
-            return None
-        resolved = self._configuration.resolve_route(previous.selected_route)
-        if (
-            resolved.selected_route != previous.selected_route
-            or resolved.provider.provider_id != previous.provider_id
-            or resolved.route.model != previous.model
-        ):
-            return None
-        return replace(
-            resolved,
-            requested_route=requested_route,
-            used_default=previous.selected_route != requested_route,
-        )
+    ) -> ResolvedModelRoute:
+        if continuation is not None:
+            previous = self.current_call_status(requested_route)
+            if previous is not None and previous.provider_id == continuation.provider_id:
+                resolved = self._configuration.resolve_route(previous.selected_route)
+                if (
+                    resolved.selected_route == previous.selected_route
+                    and resolved.provider.provider_id == previous.provider_id
+                    and resolved.route.model == previous.model
+                ):
+                    return replace(
+                        resolved,
+                        requested_route=requested_route,
+                        used_default=previous.selected_route != requested_route,
+                    )
+        return self._configuration.resolve_route(requested_route)
 
     def _remember_current_call_status(
         self,

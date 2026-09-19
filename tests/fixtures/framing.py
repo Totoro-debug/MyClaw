@@ -117,6 +117,22 @@ class TaskFramingRouterAdapter:
                 return status
         return self._last_statuses.get(route)
 
+    def call_route_status(
+        self,
+        route: ModelRoute,
+        *,
+        continuation: ModelContinuation | None,
+    ) -> ModelRouteStatus:
+        call_route_status = getattr(self._delegate, "call_route_status", None)
+        if callable(call_route_status):
+            status = call_route_status(route, continuation=continuation)
+            if isinstance(status, ModelRouteStatus):
+                return status
+        status = self._configured_statuses.get(route)
+        if status is None:
+            raise AssertionError("test Router requires a bound configuration")
+        return status
+
     def _check_fake_attempt(
         self,
         route: ModelRoute,

@@ -104,16 +104,13 @@ class AgentRunnerRouter(Protocol):
 class AgentRunRequestPreparer(Protocol):
     """Prepare one provider-neutral request from detached Agent Run snapshots."""
 
-    @property
-    def recounts_retained_tool_calls(self) -> bool: ...
-
     async def prepare(
         self,
-        candidate: Sequence[dict[str, Any]],
         *,
         increment: Sequence[dict[str, Any]],
         latest_cycle_start: int | None,
         tools: Sequence[dict[str, Any]],
+        continuation: ModelContinuation | None,
         continuation_revision: int,
     ) -> Sequence[dict[str, Any]]: ...
 
@@ -349,10 +346,10 @@ class AgentRunner:
                 )
                 try:
                     prepared_messages = await active_preparer.prepare(
-                        deepcopy(runtime_messages),
                         increment=deepcopy(increment),
                         latest_cycle_start=latest_cycle_start,
                         tools=deepcopy(exposed_tools),
+                        continuation=continuation,
                         continuation_revision=continuation_revision,
                     )
                 except (asyncio.CancelledError, ModelCallError):
@@ -360,7 +357,7 @@ class AgentRunner:
                 except BaseException as error:
                     raise _RequestPreparationFailure(error) from error
                 request_messages: Sequence[dict[str, Any]]
-                if active_preparer.recounts_retained_tool_calls and tool_gateway is not None:
+                if tool_gateway is not None:
                     retained_eligible_count = _micro_compression_eligible_count(
                         prepared_messages,
                         gateway=tool_gateway,

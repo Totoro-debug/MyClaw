@@ -56,8 +56,23 @@ async def _ignore_output(event: object) -> None:
     del event
 
 
-def _runner(router: AgentRunnerRouter) -> AgentRunner:
-    return AgentRunner(router, DetachedRequestPreparer())
+class _DetachedRunner:
+    def __init__(self, router: AgentRunnerRouter) -> None:
+        self._router = router
+
+    async def run(
+        self,
+        initial_messages: Sequence[dict[str, Any]],
+        **kwargs: Any,
+    ) -> AgentRunnerResult:
+        return await AgentRunner(
+            self._router,
+            DetachedRequestPreparer(initial_messages),
+        ).run(initial_messages, **kwargs)
+
+
+def _runner(router: AgentRunnerRouter) -> _DetachedRunner:
+    return _DetachedRunner(router)
 
 
 @pytest.mark.asyncio
@@ -75,14 +90,14 @@ async def test_committable_preparation_failure_forms_terminal_result_without_mod
     class FailingSummaryPreparer(DetachedRequestPreparer):
         async def prepare(
             self,
-            candidate: Sequence[dict[str, Any]],
             *,
             increment: Sequence[dict[str, Any]],
             latest_cycle_start: int | None,
             tools: Sequence[dict[str, Any]],
+            continuation: ModelContinuation | None,
             continuation_revision: int,
         ) -> list[dict[str, Any]]:
-            del self, candidate, increment, latest_cycle_start, tools, continuation_revision
+            del self, increment, latest_cycle_start, tools, continuation, continuation_revision
             raise CommittableAgentRunError(error)
 
     provider = ScriptedFakeProvider()
@@ -149,23 +164,27 @@ async def test_runner_uses_run_local_router_and_request_provenance_recorder() ->
             del route, messages, tools, continuation
             raise AssertionError("unexpected completion")
 
-    class RecordingPreparer:
-        recounts_retained_tool_calls = False
-
-        def __init__(self) -> None:
+    class RecordingPreparer(DetachedRequestPreparer):
+        def __init__(self, initial_messages: Sequence[dict[str, Any]]) -> None:
+            super().__init__(initial_messages)
             self.recorded = 0
 
         async def prepare(
             self,
-            candidate: Sequence[dict[str, Any]],
             *,
             increment: Sequence[dict[str, Any]],
             latest_cycle_start: int | None,
             tools: Sequence[dict[str, Any]],
+            continuation: ModelContinuation | None,
             continuation_revision: int,
         ) -> list[dict[str, Any]]:
-            del increment, latest_cycle_start, tools, continuation_revision
-            return deepcopy(list(candidate))
+            return await super().prepare(
+                increment=increment,
+                latest_cycle_start=latest_cycle_start,
+                tools=tools,
+                continuation=continuation,
+                continuation_revision=continuation_revision,
+            )
 
         def observe_request_projection(
             self,
@@ -187,10 +206,11 @@ async def test_runner_uses_run_local_router_and_request_provenance_recorder() ->
             self.recorded += 1
             return {"selected_route": "default"}
 
+    initial_messages = [{"role": "user", "content": "request"}]
     router = Router()
-    preparer = RecordingPreparer()
+    preparer = RecordingPreparer(initial_messages)
     result = await AgentRunner(router, preparer).run(
-        [{"role": "user", "content": "request"}],
+        initial_messages,
         model="chat",
         tool_gateway=None,
         on_output=None,
@@ -369,33 +389,38 @@ class _RetryingRouter:
 
 
 class _RecordingRequestPreparer(DetachedRequestPreparer):
-    def __init__(self) -> None:
+    def __init__(self, initial_messages: Sequence[dict[str, Any]]) -> None:
+        super().__init__(initial_messages)
         self.requests: list[dict[str, Any]] = []
         self.observations: list[dict[str, Any]] = []
 
-    @property
-    def recounts_retained_tool_calls(self) -> bool:
-        return False
-
     async def prepare(
         self,
-        candidate: Sequence[dict[str, Any]],
         *,
         increment: Sequence[dict[str, Any]],
         latest_cycle_start: int | None,
         tools: Sequence[dict[str, Any]],
+        continuation: ModelContinuation | None,
         continuation_revision: int,
     ) -> list[dict[str, Any]]:
+        prepared = await super().prepare(
+            increment=increment,
+            latest_cycle_start=latest_cycle_start,
+            tools=tools,
+            continuation=continuation,
+            continuation_revision=continuation_revision,
+        )
         self.requests.append(
             {
-                "candidate": deepcopy(list(candidate)),
+                "prepared": deepcopy(prepared),
                 "increment": deepcopy(list(increment)),
                 "latest_cycle_start": latest_cycle_start,
                 "tools": deepcopy(tuple(tools)),
+                "continuation": continuation,
                 "continuation_revision": continuation_revision,
             }
         )
-        return deepcopy(list(candidate))
+        return prepared
 
     def observe_request_projection(
         self,
@@ -504,10 +529,14 @@ async def test_runner_prepares_each_logical_request_with_run_local_context() -> 
     )
     gateway = _DirectGateway([])
     gateway.schemas = [{"name": "work", "description": "work"}]
-    preparer = _RecordingRequestPreparer()
+    initial_messages = [
+        {"role": "system", "content": "System"},
+        {"role": "user", "content": "Run."},
+    ]
+    preparer = _RecordingRequestPreparer(initial_messages)
 
     result = await AgentRunner(ScriptedFakeRouter(provider), preparer).run(
-        [{"role": "system", "content": "System"}, {"role": "user", "content": "Run."}],
+        initial_messages,
         model="chat",
         tool_gateway=gateway,  # type: ignore[arg-type]
         on_output=_ignore_output,
@@ -521,6 +550,10 @@ async def test_runner_prepares_each_logical_request_with_run_local_context() -> 
     assert len(preparer.requests) == 3
     assert [request["latest_cycle_start"] for request in preparer.requests] == [None, 0, 2]
     assert [request["continuation_revision"] for request in preparer.requests] == [0, 1, 2]
+    assert [
+        None if request["continuation"] is None else request["continuation"].provider_id
+        for request in preparer.requests
+    ] == [None, "test-provider", None]
     assert all(request["tools"] == tuple(gateway.schemas) for request in preparer.requests)
     assert [len(request["increment"]) for request in preparer.requests] == [0, 2, 4]
     assert len(preparer.observations) == len(preparer.requests)
@@ -529,19 +562,19 @@ async def test_runner_prepares_each_logical_request_with_run_local_context() -> 
         for request in preparer.requests
         for message in request["increment"]
     )
-    assert preparer.requests[1]["candidate"][-1]["content"] == "done"
-    assert preparer.requests[2]["candidate"][-1]["content"] == "done"
+    assert preparer.requests[1]["prepared"][-1]["content"] == "done"
+    assert preparer.requests[2]["prepared"][-1]["content"] == "done"
 
 
 @pytest.mark.asyncio
 async def test_detached_request_preparation_is_value_equivalent() -> None:
     messages = [{"role": "user", "content": {"nested": ["original"]}}]
 
-    prepared = await DetachedRequestPreparer().prepare(
-        messages,
+    prepared = await DetachedRequestPreparer(messages).prepare(
         increment=(),
         latest_cycle_start=None,
         tools=(),
+        continuation=None,
         continuation_revision=0,
     )
 
@@ -554,23 +587,25 @@ async def test_detached_request_preparation_is_value_equivalent() -> None:
 @pytest.mark.asyncio
 async def test_request_preparer_cannot_mutate_runner_messages_or_provider_tools() -> None:
     class MutatingPreparer(DetachedRequestPreparer):
-        @property
-        def recounts_retained_tool_calls(self) -> bool:
-            return False
-
         async def prepare(
             self,
-            candidate: Sequence[dict[str, Any]],
             *,
             increment: Sequence[dict[str, Any]],
             latest_cycle_start: int | None,
             tools: Sequence[dict[str, Any]],
+            continuation: ModelContinuation | None,
             continuation_revision: int,
         ) -> list[dict[str, Any]]:
-            del increment, latest_cycle_start, continuation_revision
-            candidate[0]["content"]["nested"].append("projected")
+            prepared = await super().prepare(
+                increment=increment,
+                latest_cycle_start=latest_cycle_start,
+                tools=tools,
+                continuation=continuation,
+                continuation_revision=continuation_revision,
+            )
+            prepared[0]["content"]["nested"].append("projected")
             tools[0]["parameters"]["enum"].append("mutated")
-            return list(candidate)
+            return prepared
 
         def observe_request_projection(
             self,
@@ -600,7 +635,7 @@ async def test_request_preparer_cannot_mutate_runner_messages_or_provider_tools(
     gateway.schemas = [{"name": "work", "parameters": {"type": "string", "enum": ["original"]}}]
     initial_messages = [{"role": "user", "content": {"nested": ["original"]}}]
 
-    await AgentRunner(ScriptedFakeRouter(provider), MutatingPreparer()).run(
+    await AgentRunner(ScriptedFakeRouter(provider), MutatingPreparer(initial_messages)).run(
         initial_messages,
         model="chat",
         tool_gateway=gateway,  # type: ignore[arg-type]
@@ -625,22 +660,6 @@ async def test_request_projection_observer_failure_stops_before_provider(
     failure_type: type[BaseException],
 ) -> None:
     class FailingObserverPreparer(DetachedRequestPreparer):
-        @property
-        def recounts_retained_tool_calls(self) -> bool:
-            return False
-
-        async def prepare(
-            self,
-            candidate: Sequence[dict[str, Any]],
-            *,
-            increment: Sequence[dict[str, Any]],
-            latest_cycle_start: int | None,
-            tools: Sequence[dict[str, Any]],
-            continuation_revision: int,
-        ) -> list[dict[str, Any]]:
-            del increment, latest_cycle_start, tools, continuation_revision
-            return deepcopy(list(candidate))
-
         def observe_request_projection(
             self,
             messages: Sequence[dict[str, Any]],
@@ -665,10 +684,14 @@ async def test_request_projection_observer_failure_stops_before_provider(
             ),
         )
     )
+    initial_messages = [{"role": "user", "content": "request"}]
 
     with pytest.raises(failure_type, match="observer failed"):
-        await AgentRunner(ScriptedFakeRouter(provider), FailingObserverPreparer()).run(
-            [{"role": "user", "content": "request"}],
+        await AgentRunner(
+            ScriptedFakeRouter(provider),
+            FailingObserverPreparer(initial_messages),
+        ).run(
+            initial_messages,
             model="chat",
             tool_gateway=None,
             on_output=_ignore_output,
@@ -832,10 +855,11 @@ async def test_runner_emits_completed_content_when_provider_omits_text_deltas() 
 @pytest.mark.asyncio
 async def test_router_internal_retry_consumes_one_runner_model_call() -> None:
     router = _RetryingRouter()
-    preparer = _RecordingRequestPreparer()
+    initial_messages = [{"role": "user", "content": "Retry."}]
+    preparer = _RecordingRequestPreparer(initial_messages)
 
     result = await AgentRunner(router, preparer).run(
-        [{"role": "user", "content": "Retry."}],
+        initial_messages,
         model="chat",
         tool_gateway=None,
         on_output=_ignore_output,
@@ -977,7 +1001,7 @@ async def test_runner_passes_confirmation_requester_directly_before_tool_call() 
     result = await _runner(ScriptedFakeRouter(provider)).run(
         [{"role": "user", "content": "Run work."}],
         model="chat",
-        tool_gateway=gateway,  # type: ignore[arg-type]
+        tool_gateway=gateway,
         on_output=observe,
         confirmation=requester,
         externalize_result=None,
@@ -1034,7 +1058,7 @@ async def test_runner_continues_after_provider_valid_tool_result_status(
     result = await _runner(ScriptedFakeRouter(provider)).run(
         [{"role": "user", "content": "Continue."}],
         model="chat",
-        tool_gateway=gateway,  # type: ignore[arg-type]
+        tool_gateway=gateway,
         on_output=lambda event: _observe(observed, event),
         confirmation=None,
         externalize_result=None,
@@ -1506,7 +1530,7 @@ async def test_runner_normalizes_externalizer_failure_to_safe_tool_error() -> No
     result = await _runner(ScriptedFakeRouter(provider)).run(
         [{"role": "user", "content": "Externalizer failure."}],
         model="chat",
-        tool_gateway=gateway,  # type: ignore[arg-type]
+        tool_gateway=gateway,
         on_output=_ignore_output,
         confirmation=None,
         externalize_result=externalize,
@@ -1559,7 +1583,7 @@ async def test_runner_micro_compresses_only_stale_tool_results_after_eleventh_ca
     gateway = _MicroCompressionGateway([], tool_results)
     initial_messages = [{"role": "user", "content": "Keep working."}]
     original_initial_messages = [dict(message) for message in initial_messages]
-    preparer = _RecordingRequestPreparer()
+    preparer = _RecordingRequestPreparer(initial_messages)
 
     result = await AgentRunner(ScriptedFakeRouter(provider), preparer).run(
         initial_messages,
@@ -1587,7 +1611,7 @@ async def test_runner_micro_compresses_only_stale_tool_results_after_eleventh_ca
     )
     assert request_tool_messages[-1]["content"] == large_content
     preparer_tool_messages = [
-        message for message in preparer.requests[-1]["candidate"] if message.get("role") == "tool"
+        message for message in preparer.requests[-1]["prepared"] if message.get("role") == "tool"
     ]
     preparer_increment_tools = [
         message for message in preparer.requests[-1]["increment"] if message.get("role") == "tool"
@@ -1669,7 +1693,7 @@ async def test_runner_micro_compression_includes_eligible_history_but_keeps_rece
     result = await _runner(ScriptedFakeRouter(provider)).run(
         history,
         model="chat",
-        tool_gateway=gateway,  # type: ignore[arg-type]
+        tool_gateway=gateway,
         on_output=_ignore_output,
         confirmation=None,
         externalize_result=None,
@@ -1707,22 +1731,6 @@ async def test_runner_micro_compression_includes_eligible_history_but_keeps_rece
 @pytest.mark.asyncio
 async def test_runner_micro_compression_recounts_retained_history_before_provider_request() -> None:
     class RetainedProjectionPreparer(DetachedRequestPreparer):
-        @property
-        def recounts_retained_tool_calls(self) -> bool:
-            return True
-
-        async def prepare(
-            self,
-            candidate: Sequence[dict[str, Any]],
-            *,
-            increment: Sequence[dict[str, Any]],
-            latest_cycle_start: int | None,
-            tools: Sequence[dict[str, Any]],
-            continuation_revision: int,
-        ) -> list[dict[str, Any]]:
-            del increment, latest_cycle_start, tools, continuation_revision
-            return deepcopy(list(candidate))
-
         def observe_request_projection(
             self,
             messages: Sequence[dict[str, Any]],
@@ -1773,7 +1781,10 @@ async def test_runner_micro_compression_recounts_retained_history_before_provide
     )
     gateway = _MicroCompressionGateway([])
 
-    await AgentRunner(ScriptedFakeRouter(provider), RetainedProjectionPreparer()).run(
+    await AgentRunner(
+        ScriptedFakeRouter(provider),
+        RetainedProjectionPreparer(history),
+    ).run(
         history,
         model="chat",
         tool_gateway=gateway,  # type: ignore[arg-type]
@@ -1796,21 +1807,23 @@ async def test_runner_micro_compression_recounts_retained_history_before_provide
 @pytest.mark.asyncio
 async def test_runner_recomputes_latest_cycle_after_preparer_removes_history() -> None:
     class PrefixDroppingPreparer(DetachedRequestPreparer):
-        @property
-        def recounts_retained_tool_calls(self) -> bool:
-            return True
-
         async def prepare(
             self,
-            candidate: Sequence[dict[str, Any]],
             *,
             increment: Sequence[dict[str, Any]],
             latest_cycle_start: int | None,
             tools: Sequence[dict[str, Any]],
+            continuation: ModelContinuation | None,
             continuation_revision: int,
         ) -> list[dict[str, Any]]:
-            del increment, latest_cycle_start, tools, continuation_revision
-            return deepcopy(list(candidate[4:]))
+            prepared = await super().prepare(
+                increment=increment,
+                latest_cycle_start=latest_cycle_start,
+                tools=tools,
+                continuation=continuation,
+                continuation_revision=continuation_revision,
+            )
+            return prepared[4:]
 
         def observe_request_projection(
             self,
@@ -1853,7 +1866,10 @@ async def test_runner_recomputes_latest_cycle_after_preparer_removes_history() -
         ),
     )
 
-    result = await AgentRunner(ScriptedFakeRouter(provider), PrefixDroppingPreparer()).run(
+    result = await AgentRunner(
+        ScriptedFakeRouter(provider),
+        PrefixDroppingPreparer(history),
+    ).run(
         history,
         model="chat",
         tool_gateway=gateway,  # type: ignore[arg-type]
@@ -1892,7 +1908,7 @@ async def test_runner_rejects_invalid_max_iterations(value: object) -> None:
             confirmation=None,
             externalize_result=None,
             cancel_requested=None,
-            max_iterations=value,  # type: ignore[arg-type]
+            max_iterations=value,
         )
 
 
@@ -2073,7 +2089,7 @@ async def test_tool_start_callback_failure_does_not_start_gateway_call() -> None
         await _runner(ScriptedFakeRouter(provider)).run(
             [{"role": "user", "content": "Fail before Tool."}],
             model="chat",
-            tool_gateway=gateway,  # type: ignore[arg-type]
+            tool_gateway=gateway,
             on_output=fail,
             confirmation=None,
             externalize_result=None,
@@ -2134,7 +2150,7 @@ async def test_task_cancellation_closes_tool_operation_and_confirmation_future()
         _runner(ScriptedFakeRouter(provider)).run(
             [{"role": "user", "content": "Cancel confirmation."}],
             model="chat",
-            tool_gateway=BlockingGateway([]),  # type: ignore[arg-type]
+            tool_gateway=BlockingGateway([]),
             on_output=_ignore_output,
             confirmation=confirm,
             externalize_result=None,

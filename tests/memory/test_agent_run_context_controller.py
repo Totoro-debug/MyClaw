@@ -39,6 +39,7 @@ from myclaw.provider.models import (
     ModelCompleted,
     ModelContinuation,
     ModelResponse,
+    ModelRoute,
     ModelUsage,
 )
 from tests.fixtures import FakeClock, ScriptedFakeProvider, ScriptedFakeRouter, StreamScript
@@ -325,16 +326,41 @@ async def _prepare_controller(
     provider_id: str = "",
     model: str = "",
 ) -> tuple[dict[str, Any], ...]:
+    route_status = _chat_status(
+        context_window=context_window,
+        max_output=max_output,
+        provider_id=provider_id,
+        model=model,
+    )
     return await controller.prepare_run_start(
         project_messages=_project_messages,
         current_user={"role": "user", "content": current_user},
-        route_context_window=context_window,
-        route_max_output=max_output,
+        route_status=route_status,
         compact_ratio=compact_ratio,
         tools=tools,
-        memory_route_status=memory_route_status,
+        memory_route_status=memory_route_status
+        or _memory_status(
+            context_window=context_window,
+            max_output=max_output,
+        ),
+    )
+
+
+def _chat_status(
+    *,
+    context_window: int,
+    max_output: int = 100,
+    provider_id: str = "",
+    model: str = "",
+) -> ModelRouteStatus:
+    return ModelRouteStatus(
+        requested_route="chat",
+        selected_route="chat",
         provider_id=provider_id,
         model=model,
+        context_window=context_window,
+        max_output=max_output,
+        used_default=False,
     )
 
 
@@ -348,6 +374,25 @@ def _memory_status(*, context_window: int, max_output: int = 100) -> ModelRouteS
         max_output=max_output,
         used_default=False,
     )
+
+
+def _context_router(
+    provider: ScriptedFakeProvider,
+    *,
+    chat_status: ModelRouteStatus | None = None,
+    memory_status: ModelRouteStatus | None = None,
+) -> AgentRunContextRouterAdapter:
+    statuses: dict[ModelRoute, ModelRouteStatus] = {
+        "chat": chat_status
+        or _chat_status(
+            context_window=16_384,
+            max_output=1_024,
+            provider_id="test-provider",
+            model="test-model",
+        ),
+        "memory": memory_status or _memory_status(context_window=16_384, max_output=1_024),
+    }
+    return AgentRunContextRouterAdapter(ScriptedFakeRouter(provider, route_statuses=statuses))
 
 
 def _project_messages(
@@ -417,8 +462,8 @@ async def test_controller_stages_run_start_compaction_from_detached_snapshot(
     result = await manager.prepare_run_start(
         project_messages=_project_messages,
         current_user={"role": "user", "content": "New user must stay out"},
-        route_context_window=1200,
-        route_max_output=100,
+        route_status=_chat_status(context_window=1200, max_output=100),
+        memory_route_status=_memory_status(context_window=1200, max_output=100),
         compact_ratio=0.5,
         tools=(),
     )
@@ -496,8 +541,8 @@ async def test_prepare_run_start_returns_a_detached_message_tuple(workspace: Pat
     controller = _controller(workspace, session, provider)
     kwargs: dict[str, Any] = {
         "project_messages": _project_messages_with_tool_calls,
-        "route_context_window": 10_000,
-        "route_max_output": 100,
+        "route_status": _chat_status(context_window=10_000, max_output=100),
+        "memory_route_status": _memory_status(context_window=10_000, max_output=100),
     }
 
     first = await controller.prepare_run_start(**kwargs)
@@ -526,8 +571,8 @@ async def test_prepare_react_returns_a_detached_message_tuple(workspace: Path) -
         "project_messages": _project_messages_with_tool_calls,
         "increment": increment,
         "latest_cycle_start": 0,
-        "route_context_window": 10_000,
-        "route_max_output": 100,
+        "route_status": _chat_status(context_window=10_000, max_output=100),
+        "memory_route_status": _memory_status(context_window=10_000, max_output=100),
         "current_user": {"role": "user", "content": "current request"},
     }
 
@@ -667,8 +712,7 @@ async def test_react_current_run_at_exactly_fifty_percent_keeps_current_run_and_
         project_messages=_project_messages,
         increment=increment,
         latest_cycle_start=0,
-        route_context_window=available + 100,
-        route_max_output=100,
+        route_status=_chat_status(context_window=available + 100, max_output=100),
         current_user=current_user,
         compact_ratio=0.5,
         memory_route_status=_memory_status(context_window=10_000),
@@ -699,8 +743,7 @@ async def test_react_sole_current_run_may_compact_at_or_below_fifty_percent(
         project_messages=_project_messages,
         increment=increment,
         latest_cycle_start=0,
-        route_context_window=available + 100,
-        route_max_output=100,
+        route_status=_chat_status(context_window=available + 100, max_output=100),
         current_user=current_user,
         compact_ratio=0.5,
         memory_route_status=_memory_status(context_window=10_000),
@@ -718,13 +761,12 @@ async def test_react_sole_current_run_may_compact_at_or_below_fifty_percent(
         tools=(),
         response=response,
         increment=[*increment, response_message],
-        route_status=None,
-        requested_route="chat",
-        selected_route="chat",
-        provider_id="provider",
-        model="model",
-        route_context_window=available + 100,
-        route_max_output=100,
+        route_status=_chat_status(
+            context_window=available + 100,
+            max_output=100,
+            provider_id="provider",
+            model="model",
+        ),
         estimator_version="utf8-bytes-div4-v1",
     )
 
@@ -749,8 +791,7 @@ async def test_react_current_run_just_above_fifty_percent_may_select_early_curre
         project_messages=_project_messages,
         increment=increment,
         latest_cycle_start=0,
-        route_context_window=available + 100,
-        route_max_output=100,
+        route_status=_chat_status(context_window=available + 100, max_output=100),
         current_user=current_user,
         compact_ratio=0.5,
         memory_route_status=_memory_status(context_window=10_000),
@@ -798,8 +839,7 @@ async def test_react_compaction_consumes_only_new_batch_after_current_user_is_co
     ]
     kwargs: dict[str, Any] = {
         "project_messages": _project_messages,
-        "route_context_window": 4_000,
-        "route_max_output": 100,
+        "route_status": _chat_status(context_window=4_000, max_output=100),
         "current_user": current_user,
         "compact_ratio": 0.5,
         "memory_route_status": _memory_status(context_window=10_000),
@@ -990,15 +1030,16 @@ async def test_controller_preparer_rebuilds_runner_requests_and_preserves_opaque
     state = _state(workspace)
     session = Session.create(state)
     controller = _controller(workspace, session, provider)
+    router = _context_router(provider)
     preparer = AgentRunContextRequestPreparer(
         controller,
+        router=router,
+        requested_route="chat",
         project_messages=_project_messages,
         current_user={"role": "user", "content": "canonical task"},
-        route_context_window=10_000,
-        route_max_output=100,
     )
 
-    result = await AgentRunner(ScriptedFakeRouter(provider), preparer).run(
+    result = await AgentRunner(router, preparer).run(
         [{"role": "system", "content": "stale"}, {"role": "user", "content": "stale"}],
         model="chat",
         tool_gateway=Gateway(),  # type: ignore[arg-type]
@@ -1044,8 +1085,7 @@ async def test_react_action_failure_keeps_fact_and_retries_only_the_pending_acti
         "project_messages": _project_messages,
         "increment": increment,
         "latest_cycle_start": 0,
-        "route_context_window": 4_000,
-        "route_max_output": 100,
+        "route_status": _chat_status(context_window=4_000, max_output=100),
         "current_user": current_user,
         "compact_ratio": 0.5,
         "memory_route_status": _memory_status(context_window=10_000),
@@ -1543,11 +1583,14 @@ async def test_main_response_provenance_anchors_completed_response_and_then_uses
     preparation = await controller.prepare_run_start(
         project_messages=_project_messages,
         current_user=current_user,
-        route_context_window=1_600,
-        route_max_output=200,
+        route_status=_chat_status(
+            context_window=1_600,
+            max_output=200,
+            provider_id="provider",
+            model="model",
+        ),
+        memory_route_status=_memory_status(context_window=1_600, max_output=200),
         tools=tools,
-        provider_id="provider",
-        model="model",
     )
     first = _response("first answer", input_tokens=20, output_tokens=5)
     first_message = first.message.to_dict()
@@ -1557,13 +1600,12 @@ async def test_main_response_provenance_anchors_completed_response_and_then_uses
         tools=tools,
         response=first,
         increment=[first_message],
-        route_status=None,
-        requested_route="chat",
-        selected_route="chat",
-        provider_id="provider",
-        model="model",
-        route_context_window=1_600,
-        route_max_output=200,
+        route_status=_chat_status(
+            context_window=1_600,
+            max_output=200,
+            provider_id="provider",
+            model="model",
+        ),
         estimator_version="utf8-bytes-div4-v1",
     )
 
@@ -1586,13 +1628,12 @@ async def test_main_response_provenance_anchors_completed_response_and_then_uses
         tools=tools,
         response=second,
         increment=[first_message, tool_message, second_message],
-        route_status=None,
-        requested_route="chat",
-        selected_route="chat",
-        provider_id="provider",
-        model="model",
-        route_context_window=1_600,
-        route_max_output=200,
+        route_status=_chat_status(
+            context_window=1_600,
+            max_output=200,
+            provider_id="provider",
+            model="model",
+        ),
         estimator_version="utf8-bytes-div4-v1",
     )
 
@@ -1684,29 +1725,34 @@ async def test_request_preparer_reuses_run_start_revision_without_duplicate_summ
     _add_run(session, "old", size=800)
     provider = ScriptedFakeProvider(completions=(_response("facts"), _response("action")))
     controller = _controller(workspace, session, provider)
+    route_status = _chat_status(context_window=1_000, max_output=200)
+    memory_route_status = _memory_status(context_window=4_000)
+    router = _context_router(
+        provider,
+        chat_status=route_status,
+        memory_status=memory_route_status,
+    )
     preparer = AgentRunContextRequestPreparer(
         controller,
+        router=router,
+        requested_route="chat",
         project_messages=_project_messages,
         current_user={"role": "user", "content": "current request"},
-        route_context_window=1_000,
-        route_max_output=200,
         compact_ratio=0.5,
-        memory_route_status=_memory_status(context_window=4_000),
     )
 
     await controller.prepare_run_start(
         project_messages=_project_messages,
         current_user={"role": "user", "content": "current request"},
-        route_context_window=1_000,
-        route_max_output=200,
+        route_status=route_status,
         compact_ratio=0.5,
-        memory_route_status=_memory_status(context_window=4_000),
+        memory_route_status=memory_route_status,
     )
     prepared = await preparer.prepare(
-        [{"role": "system", "content": "stale candidate"}],
         increment=(),
         latest_cycle_start=None,
         tools=(),
+        continuation=None,
         continuation_revision=0,
     )
 
@@ -1722,20 +1768,25 @@ async def test_runner_final_projection_is_stable_across_repeated_preparation(
 ) -> None:
     state = _state(workspace)
     session = Session.create(state)
-    controller = _controller(workspace, session, ScriptedFakeProvider())
+    provider = ScriptedFakeProvider()
+    controller = _controller(workspace, session, provider)
     preparer = AgentRunContextRequestPreparer(
         controller,
+        router=_context_router(
+            provider,
+            chat_status=_chat_status(context_window=4_000, max_output=100),
+            memory_status=_memory_status(context_window=4_000, max_output=100),
+        ),
+        requested_route="chat",
         project_messages=_project_messages,
         current_user={"role": "user", "content": "current request"},
-        route_context_window=4_000,
-        route_max_output=100,
     )
 
     first = await preparer.prepare(
-        [],
         increment=(),
         latest_cycle_start=None,
         tools=(),
+        continuation=None,
         continuation_revision=0,
     )
     provider_projection = deepcopy(first)
@@ -1745,10 +1796,10 @@ async def test_runner_final_projection_is_stable_across_repeated_preparation(
         micro_compression_enabled=True,
     )
     second = await preparer.prepare(
-        [],
         increment=(),
         latest_cycle_start=None,
         tools=(),
+        continuation=None,
         continuation_revision=0,
     )
     preparer.observe_request_projection(
@@ -1788,8 +1839,6 @@ async def test_react_revision_changes_for_each_model_visible_input_source(
         "project_messages": _project_messages,
         "increment": (),
         "latest_cycle_start": None,
-        "route_context_window": 1_000,
-        "route_max_output": 200,
         "current_user": {"role": "user", "content": "current request"},
         "tools": (),
         "compact_ratio": 0.5,
@@ -1846,61 +1895,68 @@ async def test_react_revision_changes_for_each_model_visible_input_source(
 
 
 @pytest.mark.asyncio
-async def test_request_preparer_refreshes_route_identity_for_each_request(
+async def test_request_preparer_uses_configured_capacity_after_previous_fallback(
     workspace: Path,
 ) -> None:
     state = _state(workspace)
     session = Session.create(state)
-    controller = _controller(workspace, session, ScriptedFakeProvider())
-    statuses = iter(
-        (
-            ModelRouteStatus(
-                requested_route="chat",
-                selected_route="chat",
-                provider_id="provider-one",
-                model="model-one",
-                context_window=4_000,
-                max_output=100,
-                used_default=False,
-            ),
-            ModelRouteStatus(
-                requested_route="chat",
-                selected_route="default",
-                provider_id="provider-two",
-                model="model-two",
-                context_window=20,
-                max_output=10,
-                used_default=True,
-            ),
+    configuration = _router_configuration(
+        chat_context_window=4_000,
+        default_context_window=500,
+        max_output=10,
+    )
+    chat_provider = ScriptedFakeProvider(
+        streams=(StreamScript(events=(ModelCompleted(response=_response("done")),)),),
+        completions=(ModelCallError(ErrorInfo("route_unavailable", "chat unavailable")),),
+    )
+    default_provider = ScriptedFakeProvider(completions=(_response("fallback"),))
+    providers = {
+        "chat-provider": chat_provider,
+        "default-provider": default_provider,
+    }
+    router = AgentRunContextRouterAdapter(
+        ModelRouter(
+            configuration=configuration,
+            provider_factory=lambda provider: providers[provider.provider_id],
         )
     )
+    controller = AgentRunContextController(
+        snapshot=AgentRunContextSnapshot.from_session(session),
+        provider=router,
+        memory_manager=MemoryManager(state),
+        now=lambda: NOW,
+    )
+    await router.complete(
+        "chat",
+        messages=[{"role": "user", "content": "warmup"}],
+        tools=(),
+    )
+    fallback_status = router.current_call_status("chat")
+    assert fallback_status is not None
+    assert fallback_status.selected_route == "default"
+
     preparer = AgentRunContextRequestPreparer(
         controller,
+        router=router,
+        requested_route="chat",
         project_messages=_project_messages,
-        current_user={"role": "user", "content": "request"},
-        route_context_window=4_000,
-        route_max_output=100,
-        route_status=lambda: next(statuses),
+        current_user={"role": "user", "content": "request " + "x" * 2_500},
     )
 
-    first = await preparer.prepare(
+    result = await AgentRunner(router, preparer).run(
         [],
-        increment=(),
-        latest_cycle_start=None,
-        tools=(),
-        continuation_revision=0,
+        model="chat",
+        tool_gateway=None,
+        on_output=None,
+        confirmation=None,
+        externalize_result=None,
+        cancel_requested=None,
+        max_iterations=50,
     )
-    with pytest.raises(ModelCallError) as raised:
-        await preparer.prepare(
-            [],
-            increment=(),
-            latest_cycle_start=None,
-            tools=(),
-            continuation_revision=1,
-        )
 
-    assert sum(message.get("content") == "request" for message in first) == 1
-    assert raised.value.error.code == "model_context_overflow"
+    assert result.finish_reason == "completed"
+    assert len(chat_provider.stream_requests) == 1
+    assert default_provider.stream_requests == []
 
 
 @pytest.mark.asyncio
@@ -1913,8 +1969,8 @@ async def test_action_summary_is_part_of_the_model_visible_revision(workspace: P
         project_messages=_project_messages,
         increment=(),
         latest_cycle_start=None,
-        route_context_window=4_000,
-        route_max_output=100,
+        route_status=_chat_status(context_window=4_000, max_output=100),
+        memory_route_status=_memory_status(context_window=4_000, max_output=100),
         current_user={"role": "user", "content": "request"},
     )
 
@@ -1924,8 +1980,8 @@ async def test_action_summary_is_part_of_the_model_visible_revision(workspace: P
         project_messages=_project_messages,
         increment=(),
         latest_cycle_start=None,
-        route_context_window=4_000,
-        route_max_output=100,
+        route_status=_chat_status(context_window=4_000, max_output=100),
+        memory_route_status=_memory_status(context_window=4_000, max_output=100),
         current_user={"role": "user", "content": "request"},
     )
 
@@ -1982,8 +2038,7 @@ async def test_react_preparer_compacts_early_sole_run_and_preserves_latest_cycle
         project_messages=_project_messages,
         increment=increment,
         latest_cycle_start=2,
-        route_context_window=4_000,
-        route_max_output=100,
+        route_status=_chat_status(context_window=4_000, max_output=100),
         current_user=current_user,
         compact_ratio=0.5,
         memory_route_status=_memory_status(context_window=10_000),
@@ -2013,8 +2068,7 @@ async def test_react_preparer_compacts_early_sole_run_and_preserves_latest_cycle
         project_messages=_project_messages,
         increment=increment,
         latest_cycle_start=2,
-        route_context_window=4_000,
-        route_max_output=100,
+        route_status=_chat_status(context_window=4_000, max_output=100),
         current_user=current_user,
         compact_ratio=0.5,
         memory_route_status=_memory_status(context_window=10_000),
