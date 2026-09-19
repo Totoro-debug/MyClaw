@@ -432,7 +432,7 @@ class AgentLoop:
                 history=(),
                 session_id=self._session.session_id,
                 tool_schemas=tool_schemas,
-                summary=_session_action_summary(self._session),
+                summary=_action_summary_from_metadata(self._session.metadata),
             )
         budget = ContextBudget(
             context_window=chat_route.context_window,
@@ -1729,10 +1729,6 @@ def _foreground_runtime_status_input(
         latest_reported_usage=latest_reported_usage,
         generation_started_at=generation_started_at,
     )
-
-
-def _session_action_summary(session: Session) -> str:
-    return _action_summary_from_metadata(session.metadata)
 
 
 def _action_summary_from_metadata(metadata: dict[str, Any]) -> str:
