@@ -42,12 +42,11 @@ async def test_real_idle_stdio_eof_reconnects_on_first_generation_and_ignores_ol
     tasks_before = asyncio.all_tasks()
     try:
         initial = await manager.start({"remote": configuration})
-        assert initial.connected_servers == ("remote",)
+        assert [tool.server_name for tool in initial.snapshot] == ["remote"]
         original_schemas = [tool.to_schema() for tool in initial.snapshot]
         assert all(r["method"] != "tools/call" for r in stdio_requests(tmp_path))
         await observed.stop(0)
         candidate = await manager.prepare_generation()
-        assert candidate.retried_servers == ("remote",)
         assert candidate.failed_servers == ()
         assert [tool.to_schema() for tool in initial.snapshot] == original_schemas
         assert candidate.snapshot[0] is not initial.snapshot[0]
@@ -58,8 +57,7 @@ async def test_real_idle_stdio_eof_reconnects_on_first_generation_and_ignores_ol
         assert old_result.content == "MCP Server connection is unavailable."
         manager.activate_generation(candidate)
         next_candidate = await manager.prepare_generation()
-        assert next_candidate.retried_servers == ()
-        assert next_candidate.reused_servers == ("remote",)
+        assert next_candidate.snapshot[0] is candidate.snapshot[0]
         assert await next_candidate.snapshot[0].execute_prepared({}) == "wire text"
         methods = [r["method"] for r in stdio_requests(tmp_path)]
         assert methods.count("initialize") == methods.count("tools/list") == 2
@@ -67,7 +65,6 @@ async def test_real_idle_stdio_eof_reconnects_on_first_generation_and_ignores_ol
         async with asyncio.timeout(10):
             await manager.close()
     observed.assert_closed()
-    assert manager.failed_servers == ()
     assert asyncio.all_tasks() - tasks_before == set()
 
 
@@ -96,14 +93,12 @@ async def test_real_reconnect_reuses_healthy_server_and_preserves_old_snapshot(
                     "healthy": healthy_configuration,
                 }
             )
-            assert initial.connected_servers == ("healthy", "remote")
+            assert {tool.server_name for tool in initial.snapshot} == {"healthy", "remote"}
             schemas = [tool.to_schema() for tool in initial.snapshot]
             if fail_reconnect:
                 (tmp_path / "remote.json").write_text(json.dumps({"pages": {"": {}}}))
             await observed.stop(0)
             candidate = await manager.prepare_generation()
-            assert candidate.retried_servers == ("remote",)
-            assert candidate.reused_servers == ("healthy",)
             assert candidate.failed_servers == (("remote",) if fail_reconnect else ())
             assert candidate.snapshot[0] is initial.snapshot[0]
             assert [tool.to_schema() for tool in initial.snapshot] == schemas
@@ -137,7 +132,6 @@ async def test_real_wire_envelope_failure_is_isolated_to_one_server(
                     ),
                 }
             )
-            assert report.connected_servers == ("remote",)
             assert report.failed_servers == ("broken",)
             assert len(report.failures) == 1
             assert report.skipped_tool_counts == ()
@@ -191,8 +185,6 @@ async def test_real_sdk_call_failures_do_not_reconnect_healthy_http_session(
                     task.cancel()
                 await asyncio.gather(task, return_exceptions=True)
             candidate = await manager.prepare_generation()
-            assert candidate.retried_servers == ()
-            assert candidate.reused_servers == ("remote",)
             assert candidate.snapshot == report.snapshot
             assert not tool.unavailable
             assert [r["method"] for r in server.requests].count("initialize") == 1
@@ -457,7 +449,6 @@ async def test_runtime_connects_two_servers_without_waiting_for_a_third_server_t
     timeout_release.set()
     report = await start_task
 
-    assert report.connected_servers == ("alpha", "beta")
     assert report.failed_servers == ("zulu",)
     assert all(connection.connect_calls == 1 for connection in connections.values())
 
@@ -515,14 +506,11 @@ async def test_default_connection_discovers_provider_safe_names_and_reuses_tools
     try:
         report = await manager.start({"alpha": configuration})
 
-        assert report.connected_servers == ("alpha",)
         assert [tool.name for tool in report.snapshot] == (
             [] if expected_name is None else [expected_name]
         )
         assert report.skipped_tool_counts == ((("alpha", 1),) if expected_name is None else ())
         candidate = await manager.prepare_generation()
-        assert candidate.reused_servers == ("alpha",)
-        assert candidate.retried_servers == ()
         assert candidate.snapshot == report.snapshot
         if expected_name is not None:
             assert candidate.snapshot[0] is report.snapshot[0]
@@ -660,8 +648,6 @@ async def test_prepare_generation_reuses_healthy_connection_and_discovered_tools
     assert candidate.snapshot == initial.snapshot
     assert candidate.snapshot[0] is initial.snapshot[0]
     assert initial.snapshot[0] is tool
-    assert candidate.reused_servers == ("alpha",)
-    assert candidate.retried_servers == ()
     assert manager.activate_generation(candidate) is candidate.snapshot
 
 
@@ -687,7 +673,6 @@ async def test_timeout_and_is_error_results_do_not_enter_failed_server_set(resul
 
     assert outcome.status == "error"
     assert connection.connect_calls == 1
-    assert manager.failed_servers == ()
     assert candidate.failed_servers == ()
 
 
@@ -708,7 +693,6 @@ async def test_timeout_does_not_enter_failed_server_set() -> None:
 
     assert outcome.status == "error"
     assert connection.connect_calls == 1
-    assert manager.failed_servers == ()
 
 
 @pytest.mark.asyncio
@@ -738,8 +722,6 @@ async def test_closed_session_enters_failed_set_and_is_retried_for_next_generati
 
     assert outcome.status == "error"
     assert connection.connect_calls == 2
-    assert manager.failed_servers == ()
-    assert candidate.retried_servers == ("alpha",)
     assert [tool.name for tool in candidate.snapshot] == ["mcp_alpha_echo"]
 
 
@@ -764,7 +746,6 @@ async def test_failed_candidate_keeps_previous_snapshot_unchanged() -> None:
     assert manager.snapshot == initial.snapshot
     assert [tool.name for tool in candidate.snapshot] == ["mcp_alpha_alpha-tool"]
     assert candidate.failed_servers == ("beta",)
-    assert manager.failed_servers == ("beta",)
 
 
 @pytest.mark.asyncio

@@ -55,10 +55,9 @@ class _ConnectionAttempt:
 
 @dataclass(frozen=True, slots=True)
 class MCPStartupReport:
-    """The initial generation's connected Servers and MCP Tool Snapshot."""
+    """The initial generation's MCP Tool Snapshot and failure metadata."""
 
     snapshot: MCPToolSnapshot
-    connected_servers: tuple[str, ...]
     failed_servers: tuple[str, ...]
     failures: tuple[MCPServerFailure, ...] = ()
     skipped_tool_counts: tuple[tuple[str, int], ...] = ()
@@ -69,8 +68,6 @@ class MCPSnapshotReport:
     """A candidate MCP Tool Snapshot prepared for a later generation."""
 
     snapshot: MCPToolSnapshot
-    reused_servers: tuple[str, ...]
-    retried_servers: tuple[str, ...]
     failed_servers: tuple[str, ...]
     failures: tuple[MCPServerFailure, ...] = ()
     skipped_tool_counts: tuple[tuple[str, int], ...] = ()
@@ -157,18 +154,12 @@ class MCPRuntimeManager:
         self._configuration: dict[str, MCPServerConfiguration] = {}
         self._connections: dict[str, MCPConnectionAdapter] = {}
         self._discovered_tools: dict[str, tuple[MCPTool, ...]] = {}
-        self._connected_servers: set[str] = set()
         self._failed_servers: set[str] = set()
         self._failures: dict[str, MCPServerFailure] = {}
         self._skipped_tool_counts: dict[str, int] = {}
         self._snapshot: MCPToolSnapshot = ()
         self._pending_report: MCPSnapshotReport | None = None
         self._started = False
-
-    @property
-    def failed_servers(self) -> tuple[str, ...]:
-        """Return Servers selected for retry, in deterministic order."""
-        return tuple(sorted(self._failed_servers))
 
     async def start(
         self,
@@ -208,7 +199,6 @@ class MCPRuntimeManager:
             raise
 
         discovered: dict[str, tuple[MCPTool, ...]] = {}
-        connected: set[str] = set()
         for mcp_name, attempt in attempts.items():
             if attempt.tools is None:
                 failed.add(mcp_name)
@@ -216,20 +206,17 @@ class MCPRuntimeManager:
                     failures[mcp_name] = attempt.failure
                 continue
             discovered[mcp_name] = attempt.tools
-            connected.add(mcp_name)
 
         self._configuration = normalized
         self._connections = connections
         self._discovered_tools = discovered
-        self._connected_servers = connected
         self._failed_servers = failed
         self._failures = failures
         self._started = True
         self._snapshot = self._build_snapshot()
         return MCPStartupReport(
             snapshot=self._snapshot,
-            connected_servers=tuple(sorted(connected)),
-            failed_servers=self.failed_servers,
+            failed_servers=tuple(sorted(self._failed_servers)),
             failures=self._failure_report(),
             skipped_tool_counts=self._skipped_tool_report(),
         )
@@ -284,22 +271,12 @@ class MCPRuntimeManager:
                 continue
             self._failed_servers.discard(mcp_name)
             self._failures.pop(mcp_name, None)
-            self._connected_servers.add(mcp_name)
             self._discovered_tools[mcp_name] = attempt.tools
 
         candidate = self._build_snapshot()
-        reused = tuple(
-            sorted(
-                mcp_name
-                for mcp_name in self._connected_servers - self._failed_servers
-                if mcp_name not in retry_names
-            )
-        )
         report = MCPSnapshotReport(
             snapshot=candidate,
-            reused_servers=reused,
-            retried_servers=retry_names,
-            failed_servers=self.failed_servers,
+            failed_servers=tuple(sorted(self._failed_servers)),
             failures=self._failure_report(),
             skipped_tool_counts=tuple(
                 (mcp_name, count)
@@ -331,7 +308,6 @@ class MCPRuntimeManager:
         self._configuration = {}
         self._connections = {}
         self._discovered_tools = {}
-        self._connected_servers = set()
         self._failed_servers = set()
         self._failures = {}
         self._skipped_tool_counts = {}

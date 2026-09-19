@@ -64,7 +64,6 @@ def test_cli_reports_one_safe_notice_for_each_failure_and_one_aggregate_skip_not
     cli._report_mcp_generation(
         MCPStartupReport(
             snapshot=(),
-            connected_servers=(),
             failed_servers=("fallback", "broken"),
             failures=(
                 MCPServerFailure(
@@ -310,7 +309,12 @@ async def test_cli_keeps_old_generation_when_mcp_candidate_preparation_fails(
 
         async def start(self, configuration: object) -> object:
             del configuration
-            return SimpleNamespace(snapshot=(), failed_servers=(), failures=())
+            return SimpleNamespace(
+                snapshot=(),
+                failed_servers=(),
+                failures=(),
+                skipped_tool_counts=(),
+            )
 
         async def prepare_generation(self) -> object:
             events.append("mcp_prepare")
@@ -488,8 +492,6 @@ async def test_cli_uses_failed_mcp_candidate_without_mutating_old_generation(
             events.append("mcp_prepare")
             return SimpleNamespace(
                 snapshot=(),
-                reused_servers=("healthy",),
-                retried_servers=(failed_name,),
                 failed_servers=(failed_name,),
                 failures=(
                     MCPServerFailure(
@@ -1028,7 +1030,7 @@ async def test_cli_real_wire_discovery_emits_one_aggregate_notice(
     manager = mcp_runtime.MCPRuntimeManager(tmp_path)
     try:
         report = await manager.start({"remote": stdio_wire_configuration(tmp_path, scenario)})
-        assert report.connected_servers == ("remote",)
+        assert [tool.server_name for tool in report.snapshot] == ["remote"]
         cli._report_mcp_generation(report)
         assert notices == ["MCP Server 'remote' skipped 3 invalid MCP Tools."]
         assert await report.snapshot[0].execute_prepared({}) == "wire text"

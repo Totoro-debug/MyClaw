@@ -108,8 +108,8 @@ def _report_mcp_generation(
     report: MCPStartupReport | MCPSnapshotReport,
 ) -> None:
     """Present only safe MCP lifecycle metadata to the terminal."""
-    failures_by_server = {failure.mcp_name: failure for failure in getattr(report, "failures", ())}
-    for mcp_name in getattr(report, "failed_servers", ()):
+    failures_by_server = {failure.mcp_name: failure for failure in report.failures}
+    for mcp_name in report.failed_servers:
         failures_by_server.setdefault(
             mcp_name,
             MCPServerFailure(
@@ -124,7 +124,7 @@ def _report_mcp_generation(
             f"({failure.exception_type})."
         )
 
-    for mcp_name, count in getattr(report, "skipped_tool_counts", ()):
+    for mcp_name, count in report.skipped_tool_counts:
         if count < 1:
             continue
         noun = "Tool" if count == 1 else "Tools"
