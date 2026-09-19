@@ -9,7 +9,11 @@ from myclaw.errors import (
     ErrorCode,
     ErrorInfo,
 )
-from myclaw.provider.errors import ModelCallError, model_context_overflow_error
+from myclaw.provider.errors import (
+    ModelCallError,
+    model_context_overflow_error,
+    parse_retry_after_seconds,
+)
 
 
 def test_turn_cancelled_message_is_the_stable_user_visible_contract() -> None:
@@ -26,6 +30,25 @@ def test_model_context_overflow_error_returns_fresh_normalized_failures() -> Non
     assert first.error is not second.error
     assert first.error.code == second.error.code == "model_context_overflow"
     assert first.error.message == second.error.message == MODEL_CONTEXT_OVERFLOW_MESSAGE
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        (None, None),
+        (5, 5.0),
+        ("4.25", 4.25),
+        (-1, None),
+        ("NaN", None),
+        ("Infinity", None),
+        ("not-a-number", None),
+    ],
+)
+def test_parse_retry_after_seconds_accepts_only_finite_nonnegative_values(
+    value: object,
+    expected: float | None,
+) -> None:
+    assert parse_retry_after_seconds(value) == expected
 
 
 def test_error_info_uses_the_frozen_structure_and_code_vocabulary() -> None:

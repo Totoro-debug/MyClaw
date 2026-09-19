@@ -5,14 +5,17 @@ from __future__ import annotations
 from collections.abc import AsyncIterator, Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from importlib import import_module
-from math import isfinite
 from types import MappingProxyType
 from typing import Any, Final, Protocol, cast
 
 from myclaw.agent.tools.tool_gateway import ModelToolCall
 from myclaw.config.config import ProviderConfiguration
 from myclaw.errors import ErrorCode, ErrorInfo
-from myclaw.provider.errors import EmptyModelResponseError, ModelCallError
+from myclaw.provider.errors import (
+    EmptyModelResponseError,
+    ModelCallError,
+    parse_retry_after_seconds,
+)
 from myclaw.provider.models import (
     AssistantModelMessage,
     FinishReason,
@@ -609,8 +612,4 @@ def _retry_after_seconds(failure: Exception) -> float | None:
         (value for key, value in headers.items() if str(key).lower() == "retry-after"),
         None,
     )
-    try:
-        seconds = float(str(raw_value))
-    except (TypeError, ValueError):
-        return None
-    return seconds if seconds >= 0 and isfinite(seconds) else None
+    return parse_retry_after_seconds(raw_value)

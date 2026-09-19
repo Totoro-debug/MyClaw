@@ -5,7 +5,6 @@ from __future__ import annotations
 import json
 from collections.abc import AsyncIterator, Mapping, Sequence
 from dataclasses import dataclass, field
-from math import isfinite
 from types import MappingProxyType
 from typing import Any, Final, Protocol, cast
 
@@ -20,7 +19,11 @@ from anthropic import (
 from myclaw.agent.tools.tool_gateway import ModelToolCall
 from myclaw.config.config import ProviderConfiguration
 from myclaw.errors import ErrorInfo
-from myclaw.provider.errors import EmptyModelResponseError, ModelCallError
+from myclaw.provider.errors import (
+    EmptyModelResponseError,
+    ModelCallError,
+    parse_retry_after_seconds,
+)
 from myclaw.provider.models import (
     AssistantModelMessage,
     FinishReason,
@@ -728,14 +731,7 @@ def _empty_response_error() -> ModelCallError:
 
 
 def _retry_after_seconds(error: APIStatusError) -> float | None:
-    raw_value = error.response.headers.get("retry-after")
-    if raw_value is None:
-        return None
-    try:
-        value = float(raw_value)
-    except ValueError:
-        return None
-    return value if value >= 0 and isfinite(value) else None
+    return parse_retry_after_seconds(error.response.headers.get("retry-after"))
 
 
 def _provider_error_message(error: APIStatusError) -> str:
