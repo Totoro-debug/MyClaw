@@ -1,6 +1,6 @@
 """Normalized Model Provider failures."""
 
-from myclaw.errors import ErrorInfo
+from myclaw.errors import MODEL_CONTEXT_OVERFLOW_MESSAGE, ErrorInfo
 
 
 class EmptyModelResponseError(ValueError):
@@ -13,3 +13,12 @@ class ModelCallError(Exception):
     def __init__(self, error: ErrorInfo) -> None:
         self.error = error
         super().__init__(error.message)
+
+
+def model_context_overflow_error() -> ModelCallError:
+    return ModelCallError(
+        ErrorInfo(
+            code="model_context_overflow",
+            message=MODEL_CONTEXT_OVERFLOW_MESSAGE,
+        )
+    )

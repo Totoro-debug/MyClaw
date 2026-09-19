@@ -22,8 +22,8 @@ from myclaw.agent.context_budget import (
 )
 from myclaw.agent.memory.manager import MemoryManager
 from myclaw.agent.session.session import Session
-from myclaw.errors import MODEL_CONTEXT_OVERFLOW_MESSAGE, TURN_CANCELLED_MESSAGE, ErrorInfo
-from myclaw.provider.errors import ModelCallError
+from myclaw.errors import TURN_CANCELLED_MESSAGE, ErrorInfo
+from myclaw.provider.errors import ModelCallError, model_context_overflow_error
 from myclaw.provider.model_router import ModelAttemptGuard, ModelRouteStatus
 from myclaw.provider.models import (
     ModelContinuation,
@@ -320,7 +320,7 @@ class AgentRunContextController:
             estimator_version=estimator_version,
         )
         if protected_projection.projected_tokens >= budget.available_context:
-            overflow_error = _model_context_overflow()
+            overflow_error = model_context_overflow_error()
             self._record_failure(revision, overflow_error)
             raise overflow_error
         if self._pending_fact is None and not budget.should_compact(projection.projected_tokens):
@@ -356,18 +356,18 @@ class AgentRunContextController:
                     if all_projection.projected_tokens < budget.available_context:
                         batch, cutoff = all_batch, all_cutoff
                     else:
-                        overflow_error = _model_context_overflow()
+                        overflow_error = model_context_overflow_error()
                         self._record_failure(revision, overflow_error)
                         raise overflow_error
                 else:
-                    overflow_error = _model_context_overflow()
+                    overflow_error = model_context_overflow_error()
                     self._record_failure(revision, overflow_error)
                     raise overflow_error
         else:
             if not batch:
                 self._checked_preparation_revision = revision
                 if projection.projected_tokens >= budget.available_context:
-                    overflow_error = _model_context_overflow()
+                    overflow_error = model_context_overflow_error()
                     self._record_failure(revision, overflow_error)
                     raise overflow_error
                 return tuple(deepcopy(projected))
@@ -388,7 +388,7 @@ class AgentRunContextController:
                 selected_payload=selected_payload,
             )
             if estimate_request_tokens(fact_messages) >= memory_context_window - memory_max_output:
-                overflow_error = _model_context_overflow()
+                overflow_error = model_context_overflow_error()
                 self._record_failure(revision, overflow_error)
                 raise overflow_error
 
@@ -435,7 +435,7 @@ class AgentRunContextController:
             ),
         )
         if estimate_request_tokens(action_messages) >= memory_context_window - memory_max_output:
-            overflow_error = _model_context_overflow()
+            overflow_error = model_context_overflow_error()
             self._record_failure(revision, overflow_error)
             raise overflow_error
         try:
@@ -478,7 +478,7 @@ class AgentRunContextController:
         )
         self._checked_preparation_revision = final_revision
         if final_projection.projected_tokens >= budget.available_context:
-            overflow_error = _model_context_overflow()
+            overflow_error = model_context_overflow_error()
             self._record_failure(final_revision, overflow_error)
             raise overflow_error
         return tuple(deepcopy(final_projected))
@@ -658,7 +658,7 @@ class AgentRunContextController:
             estimator_version=estimator_version,
         )
         if protected.projected_tokens >= budget.available_context:
-            overflow_error = _model_context_overflow()
+            overflow_error = model_context_overflow_error()
             self._record_failure(revision, overflow_error)
             raise overflow_error
         if self._pending_fact is None and not budget.should_compact(projection.projected_tokens):
@@ -701,7 +701,7 @@ class AgentRunContextController:
                 selected_payload=selected_payload,
             )
             if estimate_request_tokens(fact_messages) >= memory_context_window - memory_max_output:
-                overflow_error = _model_context_overflow()
+                overflow_error = model_context_overflow_error()
                 self._record_failure(revision, overflow_error)
                 raise overflow_error
             try:
@@ -747,7 +747,7 @@ class AgentRunContextController:
             ),
         )
         if estimate_request_tokens(action_messages) >= memory_context_window - memory_max_output:
-            overflow_error = _model_context_overflow()
+            overflow_error = model_context_overflow_error()
             self._record_failure(revision, overflow_error)
             raise overflow_error
         try:
@@ -1579,15 +1579,6 @@ def _summary_request_messages(*, template_name: str, selected_payload: str) -> M
         {"role": "system", "content": render_template(template_name)},
         {"role": "user", "content": selected_payload},
     ]
-
-
-def _model_context_overflow() -> ModelCallError:
-    return ModelCallError(
-        ErrorInfo(
-            code="model_context_overflow",
-            message=MODEL_CONTEXT_OVERFLOW_MESSAGE,
-        )
-    )
 
 
 def _project_compaction_message(message: dict[str, Any]) -> dict[str, Any] | None:

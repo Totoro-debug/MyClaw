@@ -9,8 +9,7 @@ from typing import Any, Protocol, cast
 from loguru import logger
 
 from myclaw.config.config import ProviderConfiguration, ResolvedModelRoute, UserConfiguration
-from myclaw.errors import MODEL_CONTEXT_OVERFLOW_MESSAGE, ErrorInfo
-from myclaw.provider.errors import ModelCallError
+from myclaw.provider.errors import ModelCallError, model_context_overflow_error
 from myclaw.provider.models import (
     REASONING_EFFORT_LEVELS,
     ModelContinuation,
@@ -249,7 +248,7 @@ class ModelRouter:
             return
         status = _route_status(cast(ModelRoute, resolved.requested_route), resolved)
         if guard(status, messages, tools) is False:
-            raise _model_context_overflow()
+            raise model_context_overflow_error()
 
     async def close(self) -> None:
         if self._aborted:
@@ -514,13 +513,4 @@ def _route_status(
         context_window=resolved.route.context_window,
         max_output=resolved.route.max_output,
         used_default=resolved.used_default,
-    )
-
-
-def _model_context_overflow() -> ModelCallError:
-    return ModelCallError(
-        ErrorInfo(
-            code="model_context_overflow",
-            message=MODEL_CONTEXT_OVERFLOW_MESSAGE,
-        )
     )

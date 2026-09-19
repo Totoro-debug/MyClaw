@@ -22,9 +22,9 @@ from myclaw.agent.memory.manager import (
 )
 from myclaw.agent.tools.base import BaseTool, ToolError, ToolParam
 from myclaw.agent.tools.tool_gateway import ToolGateway
-from myclaw.errors import MODEL_CONTEXT_OVERFLOW_MESSAGE, TURN_CANCELLED_MESSAGE, ErrorInfo
+from myclaw.errors import TURN_CANCELLED_MESSAGE, ErrorInfo
 from myclaw.logging.session import without_session_log
-from myclaw.provider.errors import ModelCallError
+from myclaw.provider.errors import ModelCallError, model_context_overflow_error
 from myclaw.provider.model_router import ModelAttemptGuard, ModelRouteStatus
 from myclaw.provider.models import ModelMessages, ModelResponse
 from myclaw.templates import render_template
@@ -268,7 +268,7 @@ class Dream:
         ]
         tools = tuple(self._tool_gateway.schemas)
         if not _request_fits(self._memory_route_status, messages=messages, tools=tools):
-            overflow = _model_context_overflow()
+            overflow = model_context_overflow_error()
             self._capture_terminal_failure(overflow)
             return _model_failure(cursor=claim.cursor, error=overflow.error)
 
@@ -365,15 +365,6 @@ def _request_fits(
         compact_ratio=0.9,
     )
     return not budget.exceeds_available_context(estimate_request_tokens(messages, tools))
-
-
-def _model_context_overflow() -> ModelCallError:
-    return ModelCallError(
-        ErrorInfo(
-            code="model_context_overflow",
-            message=MODEL_CONTEXT_OVERFLOW_MESSAGE,
-        )
-    )
 
 
 def _finish_reason_error(finish_reason: Literal["length", "cancelled"]) -> ErrorInfo:

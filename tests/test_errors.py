@@ -9,10 +9,23 @@ from myclaw.errors import (
     ErrorCode,
     ErrorInfo,
 )
+from myclaw.provider.errors import ModelCallError, model_context_overflow_error
 
 
 def test_turn_cancelled_message_is_the_stable_user_visible_contract() -> None:
     assert TURN_CANCELLED_MESSAGE == "MyClaw 已取消本轮对话。"
+
+
+def test_model_context_overflow_error_returns_fresh_normalized_failures() -> None:
+    first = model_context_overflow_error()
+    second = model_context_overflow_error()
+
+    assert isinstance(first, ModelCallError)
+    assert isinstance(second, ModelCallError)
+    assert first is not second
+    assert first.error is not second.error
+    assert first.error.code == second.error.code == "model_context_overflow"
+    assert first.error.message == second.error.message == MODEL_CONTEXT_OVERFLOW_MESSAGE
 
 
 def test_error_info_uses_the_frozen_structure_and_code_vocabulary() -> None:
