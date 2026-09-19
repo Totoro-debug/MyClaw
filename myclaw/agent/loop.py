@@ -19,6 +19,7 @@ from myclaw.agent.context import ContextBuilder
 from myclaw.agent.context_budget import ContextBudget, ContextUsageSnapshot, estimate_request_tokens
 from myclaw.agent.memory.conversation_compactor import (
     AgentRunContextController,
+    AgentRunContextRequestPreparer,
     AgentRunContextRouterAdapter,
     AgentRunRouter,
     latest_main_agent_usage_anchor,
@@ -807,7 +808,8 @@ class AgentLoop:
             memory_manager=self._memory_manager,
             now=self._now,
         )
-        request_preparer = controller.as_request_preparer(
+        request_preparer = AgentRunContextRequestPreparer(
+            controller,
             project_messages=project_messages,
             route_context_window=configured_route.context_window,
             route_max_output=configured_route.max_output,

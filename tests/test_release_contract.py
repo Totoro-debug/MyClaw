@@ -1364,6 +1364,7 @@ def test_issue_234_controller_migration_scaffolding_is_absent() -> None:
 
     controller = _issue_202_class(compactor_tree, "AgentRunContextController")
     controller_methods = _issue_202_method_names(controller)
+    assert "as_request_preparer" not in controller_methods
     assert {
         "base_context_revision",
         "checked_context_revision",
@@ -1381,8 +1382,47 @@ def test_issue_234_controller_migration_scaffolding_is_absent() -> None:
         "_latest_usage_context",
     }.isdisjoint(node.attr for node in ast.walk(controller) if isinstance(node, ast.Attribute))
 
+    loop_tree = _issue_202_ast(ROOT / "myclaw" / "agent" / "loop.py")
+    agent_loop = _issue_202_class(loop_tree, "AgentLoop")
+    new_agent_run_context = _issue_202_direct_method(agent_loop, "_new_agent_run_context")
+    assert (
+        len(
+            _issue_202_named_call_lines(
+                new_agent_run_context,
+                {"AgentRunContextRequestPreparer"},
+            )
+        )
+        == 1
+    )
+
+    production_constructor_calls: list[tuple[str, int]] = []
+    removed_preparer_findings: list[tuple[str, int, str]] = []
+    for path in sorted((ROOT / "myclaw").rglob("*.py")):
+        tree = _issue_202_ast(path)
+        relative = path.relative_to(ROOT).as_posix()
+        production_constructor_calls.extend(
+            (relative, line)
+            for line in _issue_202_named_call_lines(
+                tree,
+                {"AgentRunContextRequestPreparer"},
+            )
+        )
+        for node in ast.walk(tree):
+            if (
+                isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+                and node.name == "as_request_preparer"
+            ):
+                removed_preparer_findings.append((relative, node.lineno, "definition"))
+            if isinstance(node, ast.Name) and node.id == "as_request_preparer":
+                removed_preparer_findings.append((relative, node.lineno, "name"))
+            if isinstance(node, ast.Attribute) and node.attr == "as_request_preparer":
+                removed_preparer_findings.append((relative, node.lineno, "attribute"))
+
+    assert len(production_constructor_calls) == 1
+    assert removed_preparer_findings == []
+
     run_context = _issue_202_class(
-        _issue_202_ast(ROOT / "myclaw" / "agent" / "loop.py"),
+        loop_tree,
         "_AgentRunContext",
     )
     run_context_fields = {

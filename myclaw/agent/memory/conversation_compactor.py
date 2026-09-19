@@ -207,39 +207,6 @@ class AgentRunContextController:
             now=now,
         )
 
-    def as_request_preparer(
-        self,
-        *,
-        project_messages: CompactionProjection,
-        route_context_window: int,
-        route_max_output: int,
-        current_user: dict[str, Any] | None = None,
-        compact_ratio: float = 0.9,
-        memory_route_status: RouteStatusSource = None,
-        route_status: RouteStatusSource = None,
-        requested_route: str = "chat",
-        selected_route: str | None = None,
-        provider_id: str = "",
-        model: str = "",
-        estimator_version: str = CONTEXT_ESTIMATOR_VERSION,
-    ) -> AgentRunContextRequestPreparer:
-        """Compose this staged controller with the Runner request seam."""
-        return AgentRunContextRequestPreparer(
-            self,
-            project_messages=project_messages,
-            route_context_window=route_context_window,
-            route_max_output=route_max_output,
-            current_user=current_user,
-            compact_ratio=compact_ratio,
-            memory_route_status=memory_route_status,
-            route_status=route_status,
-            requested_route=requested_route,
-            selected_route=selected_route,
-            provider_id=provider_id,
-            model=model,
-            estimator_version=estimator_version,
-        )
-
     def terminal_commit_values(self) -> AgentRunTerminalCommitValues:
         """Return values accepted by the terminal Session commit."""
         return AgentRunTerminalCommitValues(

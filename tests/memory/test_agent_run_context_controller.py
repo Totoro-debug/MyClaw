@@ -12,6 +12,7 @@ import pytest
 from myclaw.agent.context_budget import estimate_request_tokens, estimate_run_slice_tokens
 from myclaw.agent.memory.conversation_compactor import (
     AgentRunContextController,
+    AgentRunContextRequestPreparer,
     AgentRunContextRouterAdapter,
     AgentRunContextSnapshot,
     latest_main_agent_usage_anchor,
@@ -988,7 +989,8 @@ async def test_controller_preparer_rebuilds_runner_requests_and_preserves_opaque
     state = _state(workspace)
     session = Session.create(state)
     controller = _controller(workspace, session, provider)
-    preparer = controller.as_request_preparer(
+    preparer = AgentRunContextRequestPreparer(
+        controller,
         project_messages=_project_messages,
         current_user={"role": "user", "content": "canonical task"},
         route_context_window=10_000,
@@ -1668,7 +1670,8 @@ async def test_request_preparer_reuses_run_start_revision_without_duplicate_summ
     _add_run(session, "old", size=800)
     provider = ScriptedFakeProvider(completions=(_response("facts"), _response("action")))
     controller = _controller(workspace, session, provider)
-    preparer = controller.as_request_preparer(
+    preparer = AgentRunContextRequestPreparer(
+        controller,
         project_messages=_project_messages,
         current_user={"role": "user", "content": "current request"},
         route_context_window=1_000,
@@ -1706,7 +1709,8 @@ async def test_runner_final_projection_is_stable_across_repeated_preparation(
     state = _state(workspace)
     session = Session.create(state)
     controller = _controller(workspace, session, ScriptedFakeProvider())
-    preparer = controller.as_request_preparer(
+    preparer = AgentRunContextRequestPreparer(
+        controller,
         project_messages=_project_messages,
         current_user={"role": "user", "content": "current request"},
         route_context_window=4_000,
@@ -1854,7 +1858,8 @@ async def test_request_preparer_refreshes_route_identity_for_each_request(
             ),
         )
     )
-    preparer = controller.as_request_preparer(
+    preparer = AgentRunContextRequestPreparer(
+        controller,
         project_messages=_project_messages,
         current_user={"role": "user", "content": "request"},
         route_context_window=4_000,
