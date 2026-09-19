@@ -29,11 +29,11 @@ class DetachedRequestPreparer:
 
     def observe_request_projection(
         self,
-        messages: Sequence[dict[str, Any]],
+        _messages: Sequence[dict[str, Any]],
         *,
         micro_compression_enabled: bool,
     ) -> None:
-        del messages, micro_compression_enabled
+        del micro_compression_enabled
 
     def record_response(
         self,

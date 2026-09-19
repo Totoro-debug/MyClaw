@@ -2200,7 +2200,7 @@ async def test_request_preparer_reuses_run_start_revision_without_duplicate_summ
 
 
 @pytest.mark.asyncio
-async def test_runner_final_projection_is_stable_across_repeated_preparation(
+async def test_runner_final_projection_changes_revision_and_repeats_stably(
     workspace: Path,
 ) -> None:
     state = _state(workspace)
@@ -2239,13 +2239,32 @@ async def test_runner_final_projection_is_stable_across_repeated_preparation(
         continuation=None,
         continuation_revision=0,
     )
+    prepared_revision = controller._checked_preparation_revision
     preparer.observe_request_projection(
         provider_projection,
         micro_compression_enabled=True,
     )
+    omitted_revision = controller._checked_preparation_revision
+    third = await preparer.prepare(
+        increment=(),
+        latest_cycle_start=None,
+        tools=(),
+        continuation=None,
+        continuation_revision=0,
+    )
+    preparer.observe_request_projection(
+        provider_projection,
+        micro_compression_enabled=True,
+    )
+    repeated_omitted_revision = controller._checked_preparation_revision
 
-    assert second == first
-    assert sum(message.get("content") == "current request" for message in second) == 1
+    assert second == third == first
+    assert prepared_revision is not None
+    assert omitted_revision is not None
+    assert prepared_revision != omitted_revision
+    assert repeated_omitted_revision == omitted_revision
+    assert provider.complete_requests == []
+    assert sum(message.get("content") == "current request" for message in third) == 1
 
 
 @pytest.mark.asyncio

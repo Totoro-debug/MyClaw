@@ -143,7 +143,6 @@ class _PendingFactBatch:
 
 @dataclass(frozen=True, slots=True)
 class _ReactRevisionObservation:
-    prepared_messages: tuple[dict[str, Any], ...]
     current_user: dict[str, Any] | None
     tools: tuple[dict[str, Any], ...]
     route_values: _RouteProjectionValues
@@ -742,7 +741,7 @@ class AgentRunContextController:
         preparation_revision = self._context_revision(
             current_user=observation.current_user,
             tools=observation.tools,
-            projected=observation.prepared_messages,
+            projected=tuple(deepcopy(list(messages))),
             route_values=observation.route_values,
             memory_route_status=observation.memory_route_status,
             compact_ratio=observation.compact_ratio,
@@ -752,7 +751,6 @@ class AgentRunContextController:
             continuation_revision=observation.continuation_revision,
             micro_compression_enabled=micro_compression_enabled,
         )
-        del messages
         self._checked_preparation_revision = preparation_revision
 
     def _react_virtual_messages(
@@ -1132,7 +1130,6 @@ class AgentRunContextRequestPreparer:
         )
         prepared_messages = tuple(deepcopy(list(prepared_messages)))
         self._pending_observation = _ReactRevisionObservation(
-            prepared_messages=prepared_messages,
             current_user=None if self._current_user is None else deepcopy(self._current_user),
             tools=tuple(deepcopy(list(tools))),
             route_values=route_values,

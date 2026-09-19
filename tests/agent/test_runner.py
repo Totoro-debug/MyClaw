@@ -188,11 +188,11 @@ async def test_runner_uses_run_local_router_and_request_provenance_recorder() ->
 
         def observe_request_projection(
             self,
-            messages: Sequence[dict[str, Any]],
+            _messages: Sequence[dict[str, Any]],
             *,
             micro_compression_enabled: bool,
         ) -> None:
-            del messages, micro_compression_enabled
+            del micro_compression_enabled
 
         def record_response(
             self,
@@ -547,7 +547,7 @@ async def test_runner_prepares_each_logical_request_with_run_local_context() -> 
     )
 
     assert result.finish_reason == "completed"
-    assert len(preparer.requests) == 3
+    assert len(provider.stream_requests) == len(preparer.requests) == 3
     assert [request["latest_cycle_start"] for request in preparer.requests] == [None, 0, 2]
     assert [request["continuation_revision"] for request in preparer.requests] == [0, 1, 2]
     assert [
@@ -556,7 +556,14 @@ async def test_runner_prepares_each_logical_request_with_run_local_context() -> 
     ] == [None, "test-provider", None]
     assert all(request["tools"] == tuple(gateway.schemas) for request in preparer.requests)
     assert [len(request["increment"]) for request in preparer.requests] == [0, 2, 4]
-    assert len(preparer.observations) == len(preparer.requests)
+    assert [observation["messages"] for observation in preparer.observations] == [
+        request.messages for request in provider.stream_requests
+    ]
+    assert [observation["micro_compression_enabled"] for observation in preparer.observations] == [
+        False,
+        False,
+        False,
+    ]
     assert all(
         message["role"] in {"assistant", "tool"}
         for request in preparer.requests
@@ -662,11 +669,11 @@ async def test_request_projection_observer_failure_stops_before_provider(
     class FailingObserverPreparer(DetachedRequestPreparer):
         def observe_request_projection(
             self,
-            messages: Sequence[dict[str, Any]],
+            _messages: Sequence[dict[str, Any]],
             *,
             micro_compression_enabled: bool,
         ) -> None:
-            del messages, micro_compression_enabled
+            del micro_compression_enabled
             raise failure_type("observer failed")
 
     provider = ScriptedFakeProvider(
@@ -1596,6 +1603,16 @@ async def test_runner_micro_compresses_only_stale_tool_results_after_eleventh_ca
         max_iterations=50,
     )
 
+    assert len(provider.stream_requests) == len(preparer.requests) == iterations + 1
+    assert [request["continuation_revision"] for request in preparer.requests] == list(
+        range(iterations + 1)
+    )
+    assert [observation["messages"] for observation in preparer.observations] == [
+        request.messages for request in provider.stream_requests
+    ]
+    assert [observation["micro_compression_enabled"] for observation in preparer.observations] == [
+        False
+    ] * 11 + [True] * max(0, iterations - 10)
     request_tool_messages = [
         message
         for message in provider.stream_requests[-1].messages
@@ -1689,11 +1706,12 @@ async def test_runner_micro_compression_includes_eligible_history_but_keeps_rece
         ),
     )
     original_history = [dict(message) for message in history]
+    preparer = _RecordingRequestPreparer(history)
 
-    result = await _runner(ScriptedFakeRouter(provider)).run(
+    result = await AgentRunner(ScriptedFakeRouter(provider), preparer).run(
         history,
         model="chat",
-        tool_gateway=gateway,
+        tool_gateway=gateway,  # type: ignore[arg-type]
         on_output=_ignore_output,
         confirmation=None,
         externalize_result=None,
@@ -1701,6 +1719,14 @@ async def test_runner_micro_compression_includes_eligible_history_but_keeps_rece
         max_iterations=50,
     )
 
+    assert len(provider.stream_requests) == len(preparer.requests) == 12
+    assert [request["continuation_revision"] for request in preparer.requests] == list(range(12))
+    assert [observation["messages"] for observation in preparer.observations] == [
+        request.messages for request in provider.stream_requests
+    ]
+    assert [observation["micro_compression_enabled"] for observation in preparer.observations] == [
+        False
+    ] * 9 + [True] * 3
     final_request = provider.stream_requests[-1].messages
     old_tool = next(
         message for message in final_request if message.get("tool_call_id") == "old-call"
@@ -1733,11 +1759,11 @@ async def test_runner_micro_compression_recounts_retained_history_before_provide
     class RetainedProjectionPreparer(DetachedRequestPreparer):
         def observe_request_projection(
             self,
-            messages: Sequence[dict[str, Any]],
+            _messages: Sequence[dict[str, Any]],
             *,
             micro_compression_enabled: bool,
         ) -> None:
-            del messages, micro_compression_enabled
+            del micro_compression_enabled
 
     large_content = "h" * 513
     history: list[dict[str, Any]] = [
@@ -1827,11 +1853,11 @@ async def test_runner_recomputes_latest_cycle_after_preparer_removes_history() -
 
         def observe_request_projection(
             self,
-            messages: Sequence[dict[str, Any]],
+            _messages: Sequence[dict[str, Any]],
             *,
             micro_compression_enabled: bool,
         ) -> None:
-            del messages, micro_compression_enabled
+            del micro_compression_enabled
 
     large_content = "x" * 513
     history: list[dict[str, Any]] = [
