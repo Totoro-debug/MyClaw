@@ -7,9 +7,9 @@ import math
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from decimal import Decimal
-from typing import Any, Literal, Self
+from typing import Any, Literal, Self, cast
 
-from myclaw.utils.validation import require_nonnegative_int
+from myclaw.utils.validation import require_nonnegative_int, token_usage_validation_issue
 
 CONTEXT_ESTIMATOR_VERSION = "utf8-bytes-div4-v1"
 type ProjectionSource = Literal["estimated", "reported_delta"]
@@ -18,7 +18,6 @@ type RetentionPercentage = Literal[10, 50]
 _MODEL_ROUTES = frozenset({"default", "chat", "memory", "schedule"})
 _PROJECTION_SOURCES = frozenset({"estimated", "reported_delta"})
 _RUN_MESSAGE_ROLES = frozenset({"user", "assistant", "tool"})
-_REPORTED_USAGE_FIELDS = frozenset({"model_calls", "input_tokens", "output_tokens", "total_tokens"})
 _CONTEXT_USAGE_FIELDS = frozenset(
     {
         "requested_route",
@@ -44,6 +43,7 @@ __all__ = [
     "estimate_request_tokens",
     "estimate_run_slice_tokens",
     "project_next_request_tokens",
+    "reported_model_usage_total",
 ]
 
 
@@ -246,7 +246,7 @@ def project_next_request_tokens(
     ):
         return ContextProjection(estimated_tokens, "estimated")
 
-    reported_total = _reported_total(reported_usage)
+    reported_total = reported_model_usage_total(reported_usage)
     if reported_total is None:
         return ContextProjection(estimated_tokens, "estimated")
 
@@ -276,26 +276,13 @@ def _snapshot_matches(
     )
 
 
-def _reported_total(usage: Mapping[str, object] | None) -> int | None:
-    if usage is None or set(usage) != _REPORTED_USAGE_FIELDS:
+def reported_model_usage_total(value: Mapping[str, object] | None) -> int | None:
+    """Return one response's validated usage total, including a legitimate zero."""
+    if value is None or token_usage_validation_issue(value) is not None:
         return None
-    model_calls = usage.get("model_calls")
-    input_tokens = usage.get("input_tokens")
-    output_tokens = usage.get("output_tokens")
-    total_tokens = usage.get("total_tokens")
-    if any(
-        type(value) is not int for value in (model_calls, input_tokens, output_tokens, total_tokens)
-    ):
+    if value["model_calls"] != 1:
         return None
-    assert isinstance(model_calls, int)
-    assert isinstance(input_tokens, int)
-    assert isinstance(output_tokens, int)
-    assert isinstance(total_tokens, int)
-    if model_calls != 1 or input_tokens <= 0 or output_tokens <= 0:
-        return None
-    if total_tokens != input_tokens + output_tokens:
-        return None
-    return total_tokens
+    return cast(int, value["total_tokens"])
 
 
 def _canonical_json(value: dict[str, Any]) -> str:

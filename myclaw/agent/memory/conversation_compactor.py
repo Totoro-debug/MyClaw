@@ -8,7 +8,7 @@ from copy import deepcopy
 from dataclasses import dataclass
 from datetime import datetime
 from hashlib import sha256
-from typing import Any, Literal, NoReturn, Protocol, cast
+from typing import Any, Literal, NoReturn, Protocol
 
 from myclaw.agent.context_budget import (
     CONTEXT_ESTIMATOR_VERSION,
@@ -19,6 +19,7 @@ from myclaw.agent.context_budget import (
     estimate_request_tokens,
     estimate_run_slice_tokens,
     project_next_request_tokens,
+    reported_model_usage_total,
 )
 from myclaw.agent.memory.manager import MemoryManager
 from myclaw.agent.run_errors import CommittableAgentRunError
@@ -477,7 +478,7 @@ class AgentRunContextController:
             and self._run_anchor_non_target == non_target
             and not self._current_user_compacted
             and _usage_context_matches(baseline, route_values, estimator_version)
-            and _valid_main_agent_usage(baseline_usage)
+            and reported_model_usage_total(baseline_usage) is not None
         ):
             run_projected_tokens = max(
                 0,
@@ -1343,7 +1344,11 @@ def latest_main_agent_usage_anchor(
             continue
         context_value = message.get("context_usage")
         usage_value = message.get("token_usage")
-        if context_value is None or not _valid_main_agent_usage(usage_value):
+        if (
+            context_value is None
+            or not isinstance(usage_value, dict)
+            or reported_model_usage_total(usage_value) is None
+        ):
             return None
         try:
             context = ContextUsageSnapshot.from_dict(context_value)
@@ -1351,31 +1356,8 @@ def latest_main_agent_usage_anchor(
             return None
         if context.requested_route not in {"chat", "schedule"}:
             return None
-        assert isinstance(usage_value, dict)
         return context, deepcopy(usage_value)
     return None
-
-
-def _valid_main_agent_usage(value: object) -> bool:
-    if not isinstance(value, dict):
-        return False
-    if set(value) != {"model_calls", "input_tokens", "output_tokens", "total_tokens"}:
-        return False
-    values = tuple(
-        value[field] for field in ("model_calls", "input_tokens", "output_tokens", "total_tokens")
-    )
-    if any(type(item) is not int or item < 0 for item in values):
-        return False
-    model_calls = cast(int, values[0])
-    input_tokens = cast(int, values[1])
-    output_tokens = cast(int, values[2])
-    total_tokens = cast(int, values[3])
-    return (
-        model_calls == 1
-        and input_tokens > 0
-        and output_tokens > 0
-        and total_tokens == input_tokens + output_tokens
-    )
 
 
 def _usage_context_matches(

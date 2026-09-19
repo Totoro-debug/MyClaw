@@ -9,6 +9,7 @@ from myclaw.agent.context_budget import (
     ContextUsageSnapshot,
     estimate_request_tokens,
     project_next_request_tokens,
+    reported_model_usage_total,
 )
 
 
@@ -165,6 +166,42 @@ def test_compatible_reported_usage_projects_from_one_response_anchor() -> None:
     assert projection == ContextProjection(90, "reported_delta")
 
 
+@pytest.mark.parametrize(
+    ("reported_usage", "expected_total", "expected_projection"),
+    (
+        pytest.param(
+            {"model_calls": 1, "input_tokens": 0, "output_tokens": 10, "total_tokens": 10},
+            10,
+            30,
+            id="zero-input",
+        ),
+        pytest.param(
+            {"model_calls": 1, "input_tokens": 60, "output_tokens": 0, "total_tokens": 60},
+            60,
+            80,
+            id="zero-output",
+        ),
+        pytest.param(
+            {"model_calls": 1, "input_tokens": 0, "output_tokens": 0, "total_tokens": 0},
+            0,
+            20,
+            id="zero-total",
+        ),
+    ),
+)
+def test_zero_reported_usage_values_remain_compatible(
+    reported_usage: dict[str, object],
+    expected_total: int,
+    expected_projection: int,
+) -> None:
+    assert reported_model_usage_total(reported_usage) == expected_total
+    assert _project(
+        estimated_tokens=100,
+        snapshot=_snapshot(anchor_estimated_tokens=80),
+        reported_usage=reported_usage,
+    ) == ContextProjection(expected_projection, "reported_delta")
+
+
 def test_reported_delta_does_not_recount_the_same_user_or_tool_input() -> None:
     projection = _project(
         estimated_tokens=100,
@@ -212,24 +249,44 @@ def test_negative_reported_delta_clamps_at_zero() -> None:
 
 @pytest.mark.parametrize(
     "reported_usage",
-    [
-        None,
-        {"input_tokens": 60, "output_tokens": 10},
-        {"input_tokens": 60, "output_tokens": 10, "total_tokens": 70},
-        {"model_calls": 1, "input_tokens": 60, "output_tokens": 10, "total_tokens": 71},
-        {"model_calls": True, "input_tokens": 60, "output_tokens": 10, "total_tokens": 70},
-        {
-            "model_calls": 1,
-            "input_tokens": 60,
-            "output_tokens": 10,
-            "total_tokens": 70,
-            "unexpected": 1,
-        },
-    ],
+    (
+        pytest.param(None, id="absent"),
+        pytest.param(
+            {"model_calls": 1, "input_tokens": 60, "output_tokens": 10},
+            id="missing-field",
+        ),
+        pytest.param(
+            {"model_calls": 1, "input_tokens": 60, "output_tokens": 10, "total_tokens": 71},
+            id="total-mismatch",
+        ),
+        pytest.param(
+            {"model_calls": True, "input_tokens": 60, "output_tokens": 10, "total_tokens": 70},
+            id="boolean",
+        ),
+        pytest.param(
+            {"model_calls": 1, "input_tokens": -1, "output_tokens": 10, "total_tokens": 9},
+            id="negative",
+        ),
+        pytest.param(
+            {"model_calls": 2, "input_tokens": 60, "output_tokens": 10, "total_tokens": 70},
+            id="multiple-model-calls",
+        ),
+        pytest.param(
+            {
+                "model_calls": 1,
+                "input_tokens": 60,
+                "output_tokens": 10,
+                "total_tokens": 70,
+                "unexpected": 1,
+            },
+            id="extra-field",
+        ),
+    ),
 )
-def test_missing_or_incomplete_reported_usage_falls_back_to_estimate(
+def test_invalid_reported_usage_falls_back_to_estimate(
     reported_usage: dict[str, object] | None,
 ) -> None:
+    assert reported_model_usage_total(reported_usage) is None
     projection = _project(estimated_tokens=123, snapshot=_snapshot(), reported_usage=reported_usage)
 
     assert projection == ContextProjection(123, "estimated")

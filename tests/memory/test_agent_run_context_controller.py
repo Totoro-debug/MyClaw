@@ -194,6 +194,31 @@ def test_latest_main_agent_usage_anchor_returns_a_detached_latest_assistant_anch
 
 
 @pytest.mark.parametrize(
+    "usage",
+    (
+        pytest.param(_usage(0, 5), id="zero-input"),
+        pytest.param(_usage(5, 0), id="zero-output"),
+        pytest.param(_usage(0, 0), id="zero-total"),
+    ),
+)
+def test_latest_main_agent_usage_anchor_accepts_zero_usage_values(
+    usage: dict[str, int],
+) -> None:
+    anchor = latest_main_agent_usage_anchor(
+        [
+            _assistant_with_usage(
+                "answer",
+                context_usage=_context_usage(),
+                token_usage=usage,
+            )
+        ]
+    )
+
+    assert anchor is not None
+    assert anchor[1] == usage
+
+
+@pytest.mark.parametrize(
     "latest",
     (
         pytest.param(
@@ -218,7 +243,39 @@ def test_latest_main_agent_usage_anchor_returns_a_detached_latest_assistant_anch
                 context_usage=_context_usage(),
                 token_usage={**_usage(), "total_tokens": 999},
             ),
-            id="usage-malformed",
+            id="usage-total-mismatch",
+        ),
+        pytest.param(
+            _assistant_with_usage(
+                "boolean usage",
+                context_usage=_context_usage(),
+                token_usage={**_usage(), "input_tokens": True},
+            ),
+            id="usage-boolean",
+        ),
+        pytest.param(
+            _assistant_with_usage(
+                "negative usage",
+                context_usage=_context_usage(),
+                token_usage=_usage(-1, 2),
+            ),
+            id="usage-negative",
+        ),
+        pytest.param(
+            _assistant_with_usage(
+                "incomplete usage",
+                context_usage=_context_usage(),
+                token_usage={"model_calls": 1, "input_tokens": 4, "output_tokens": 2},
+            ),
+            id="usage-missing-field",
+        ),
+        pytest.param(
+            _assistant_with_usage(
+                "cumulative usage",
+                context_usage=_context_usage(),
+                token_usage={**_usage(), "model_calls": 2},
+            ),
+            id="usage-multiple-model-calls",
         ),
         pytest.param(
             _assistant_with_usage(
@@ -1961,8 +2018,19 @@ async def test_latest_assistant_without_provenance_forces_run_start_local_estima
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("first_usage", "second_usage"),
+    (
+        pytest.param((20, 5), (24, 6), id="positive"),
+        pytest.param((0, 5), (4, 6), id="zero-input"),
+        pytest.param((5, 0), (9, 1), id="zero-output"),
+        pytest.param((0, 0), (4, 1), id="zero-total"),
+    ),
+)
 async def test_main_response_provenance_anchors_completed_response_and_then_uses_reported_delta(
     workspace: Path,
+    first_usage: tuple[int, int],
+    second_usage: tuple[int, int],
 ) -> None:
     state = _state(workspace)
     session = Session.create(state)
@@ -1981,7 +2049,11 @@ async def test_main_response_provenance_anchors_completed_response_and_then_uses
         memory_route_status=_memory_status(context_window=1_600, max_output=200),
         tools=tools,
     )
-    first = _response("first answer", input_tokens=20, output_tokens=5)
+    first = _response(
+        "first answer",
+        input_tokens=first_usage[0],
+        output_tokens=first_usage[1],
+    )
     first_message = first.message.to_dict()
 
     first_context = controller.record_main_agent_response(
@@ -2010,7 +2082,11 @@ async def test_main_response_provenance_anchors_completed_response_and_then_uses
         "content": "tool result",
     }
     second_request = [*preparation, first_message, tool_message]
-    second = _response("second answer", input_tokens=24, output_tokens=6)
+    second = _response(
+        "second answer",
+        input_tokens=second_usage[0],
+        output_tokens=second_usage[1],
+    )
     second_message = second.message.to_dict()
     second_context = controller.record_main_agent_response(
         request_messages=second_request,
