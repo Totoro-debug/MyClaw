@@ -206,32 +206,10 @@ class AgentLoop:
         mcp_tools: Sequence[BaseTool] = (),
         mcp_keywords: Mapping[str, Sequence[str]] | None = None,
     ) -> None:
-        if not isinstance(workspace_path, Path):
-            raise TypeError("Agent Loop requires a Workspace Path")
-        if not isinstance(workspace_state, WorkspaceState):
-            raise TypeError("Agent Loop requires a Workspace State")
         if workspace_state.workspace_path != workspace_path:
             raise ValueError("Agent Loop Workspace State must belong to the Workspace")
-        if not isinstance(agent_home, AgentHome):
-            raise TypeError("Agent Loop requires an Agent Home")
-        if not isinstance(configuration, UserConfiguration):
-            raise TypeError("Agent Loop requires User Configuration")
-        if not isinstance(bus, MessageBus):
-            raise TypeError("Agent Loop requires a Message Bus")
-        if not isinstance(schedule_service, ScheduleService):
-            raise TypeError("Agent Loop requires a Schedule Service")
-        if not isinstance(memory_manager, MemoryManager):
-            raise TypeError("Agent Loop requires a Memory Manager")
         if memory_manager.workspace_state is not workspace_state:
             raise ValueError("Agent Loop Memory Manager must belong to the Workspace State")
-        if not callable(now):
-            raise TypeError("Agent Loop requires a clock")
-        if not callable(new_uuid):
-            raise TypeError("Agent Loop requires a UUID allocator")
-        if not callable(monotonic_now):
-            raise TypeError("Agent Loop requires a monotonic clock")
-        if session_id is not None and not isinstance(session_id, str):
-            raise TypeError("Agent Loop Session ID must be a string or None")
 
         # Build every generation-local collaborator before publishing any Loop field.
         skill_loader = SkillLoader(

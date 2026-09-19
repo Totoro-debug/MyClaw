@@ -774,6 +774,41 @@ async def test_prepare_react_returns_a_detached_message_tuple(workspace: Path) -
 
 
 @pytest.mark.asyncio
+async def test_prepare_react_rejects_an_invalid_increment_role(workspace: Path) -> None:
+    state = _state(workspace)
+    controller = _controller(workspace, Session.create(state), ScriptedFakeProvider())
+
+    with pytest.raises(ValueError, match="ReAct increment message 0 must be assistant or tool"):
+        await controller.prepare_react(
+            project_messages=_project_messages,
+            increment=({"role": "user", "content": "invalid"},),
+            latest_cycle_start=None,
+            route_status=_chat_status(context_window=10_000, max_output=100),
+            memory_route_status=_memory_status(context_window=10_000, max_output=100),
+        )
+
+
+@pytest.mark.asyncio
+async def test_prepare_react_rejects_latest_cycle_start_at_a_tool_message(
+    workspace: Path,
+) -> None:
+    state = _state(workspace)
+    controller = _controller(workspace, Session.create(state), ScriptedFakeProvider())
+
+    with pytest.raises(
+        ValueError,
+        match="latest_cycle_start must identify an assistant in the increment",
+    ):
+        await controller.prepare_react(
+            project_messages=_project_messages,
+            increment=_react_cycle("current", size=20),
+            latest_cycle_start=1,
+            route_status=_chat_status(context_window=10_000, max_output=100),
+            memory_route_status=_memory_status(context_window=10_000, max_output=100),
+        )
+
+
+@pytest.mark.asyncio
 async def test_multiple_runs_under_ten_percent_keep_latest_run(
     workspace: Path,
 ) -> None:

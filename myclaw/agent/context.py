@@ -69,14 +69,6 @@ class ContextBuilder:
         memory_manager: MemoryManager,
         skill_loader: SkillLoader,
     ) -> None:
-        if not isinstance(workspace, Path):
-            raise TypeError("Context Builder requires a Path")
-        if not isinstance(agent_home, Path):
-            raise TypeError("Context Builder requires an Agent Home Path")
-        if not isinstance(memory_manager, MemoryManager):
-            raise TypeError("Context Builder requires a Memory Manager")
-        if not isinstance(skill_loader, SkillLoader):
-            raise TypeError("Context Builder requires a Skill Loader")
         self._workspace = workspace
         self._agent_home = agent_home
         self._timezone = ZoneInfo(timezone_name)

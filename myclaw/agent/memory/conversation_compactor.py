@@ -168,10 +168,6 @@ class AgentRunContextController:
         memory_manager: MemoryManager,
         now: Callable[[], datetime],
     ) -> None:
-        if not isinstance(snapshot, AgentRunContextSnapshot):
-            raise TypeError("Agent Run controller requires a detached snapshot")
-        if not callable(now):
-            raise TypeError("Agent Run controller requires a clock")
         self._snapshot = AgentRunContextSnapshot(
             messages=snapshot.messages,
             metadata=snapshot.metadata,
@@ -459,14 +455,6 @@ class AgentRunContextController:
         copied_increment = tuple(deepcopy(list(increment)))
         _validate_react_increment(copied_increment)
         _validate_latest_cycle_start(latest_cycle_start, copied_increment)
-        if (
-            isinstance(continuation_revision, bool)
-            or not isinstance(continuation_revision, int)
-            or continuation_revision < 0
-        ):
-            raise ValueError("continuation_revision must be a nonnegative integer")
-        if not isinstance(micro_compression_enabled, bool):
-            raise TypeError("micro_compression_enabled must be a boolean")
         projected = self._react_project_candidate(
             copied_increment,
             current_user=copied_user,
@@ -573,8 +561,6 @@ class AgentRunContextController:
         micro_compression_enabled: bool,
     ) -> None:
         """Record the final Runner-owned projection before the Provider call."""
-        if not isinstance(micro_compression_enabled, bool):
-            raise TypeError("micro_compression_enabled must be a boolean")
         preparation_revision = self._context_revision(
             current_user=observation.current_user,
             tools=observation.tools,
@@ -999,14 +985,6 @@ class AgentRunContextRequestPreparer:
         compact_ratio: float = 0.9,
         estimator_version: str = CONTEXT_ESTIMATOR_VERSION,
     ) -> None:
-        if not isinstance(controller, AgentRunContextController):
-            raise TypeError("request preparer requires an Agent Run context controller")
-        if not isinstance(router, AgentRunContextRouterAdapter):
-            raise TypeError("request preparer requires an Agent Run context router")
-        if requested_route not in {"chat", "schedule"}:
-            raise ValueError("request preparer route must be chat or schedule")
-        if not callable(project_messages):
-            raise TypeError("request preparer requires a projection callback")
         self._controller = controller
         self._router = router
         self._requested_route = requested_route
@@ -1066,8 +1044,6 @@ class AgentRunContextRequestPreparer:
         micro_compression_enabled: bool,
     ) -> None:
         """Record Runner-owned request state for the next model-visible revision."""
-        if not isinstance(micro_compression_enabled, bool):
-            raise TypeError("micro_compression_enabled must be a boolean")
         observation = self._pending_observation
         if observation is None:
             raise RuntimeError("request projection observation requires one completed preparation")

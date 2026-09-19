@@ -360,6 +360,44 @@ def test_agent_loop_constructor_is_the_generation_composition_boundary() -> None
     assert tuple(inspect.signature(AgentLoop.close).parameters) == ("self",)
 
 
+def test_agent_loop_rejects_workspace_state_owned_by_another_workspace(
+    tmp_path: Path,
+) -> None:
+    other_workspace = tmp_path / "other-workspace"
+    other_workspace.mkdir()
+
+    with pytest.raises(
+        ValueError,
+        match="Agent Loop Workspace State must belong to the Workspace",
+    ):
+        _runtime(
+            tmp_path,
+            _Router(()),
+            constructor_workspace_path=other_workspace,
+        )
+
+
+def test_agent_loop_rejects_memory_manager_owned_by_another_workspace_state(
+    tmp_path: Path,
+) -> None:
+    agent_home = AgentHome(tmp_path / "agent-home")
+    agent_home.initialize()
+    other_workspace = tmp_path / "other-workspace"
+    other_workspace.mkdir()
+    other_state = WorkspaceState(other_workspace)
+    other_state.initialize(agent_home_root=agent_home.path)
+
+    with pytest.raises(
+        ValueError,
+        match="Agent Loop Memory Manager must belong to the Workspace State",
+    ):
+        _runtime(
+            tmp_path,
+            _Router(()),
+            constructor_memory_manager=MemoryManager(other_state),
+        )
+
+
 @pytest.mark.asyncio
 async def test_agent_loop_constructs_each_generation_collaborator_once_without_side_effects(
     tmp_path: Path,
@@ -518,6 +556,8 @@ def _runtime(
     config_text: str | None = None,
     mcp_tools: Sequence[BaseTool] = (),
     prepare_session: Callable[[WorkspaceState], str] | None = None,
+    constructor_workspace_path: Path | None = None,
+    constructor_memory_manager: MemoryManager | None = None,
 ) -> tuple[AgentLoop, Session, MessageBus]:
     agent_home = AgentHome(tmp_path / "agent-home")
     agent_home.initialize()
@@ -552,14 +592,20 @@ def _runtime(
     )
     model_router.bind_configuration(configuration)
     loop = AgentLoop(
-        workspace_path=workspace,
+        workspace_path=(
+            workspace if constructor_workspace_path is None else constructor_workspace_path
+        ),
         workspace_state=state,
         agent_home=agent_home,
         configuration=configuration,
         bus=bus,
         schedule_service=schedule,
         model_router=model_router,
-        memory_manager=MemoryManager(state),
+        memory_manager=(
+            MemoryManager(state)
+            if constructor_memory_manager is None
+            else constructor_memory_manager
+        ),
         session_id=selected_session_id,
         now=_Clock().now,
         new_uuid=uuid4,
