@@ -25,7 +25,6 @@ from myclaw.errors import ErrorInfo
 from myclaw.provider.models import REASONING_EFFORT_LEVELS, ReasoningEffort
 from myclaw.skills.catalog import SkillMetadata
 from myclaw.utils.host_filesystem import HOST_FILESYSTEM
-from myclaw.utils.time import format_rfc3339_milliseconds
 from myclaw.utils.validation import require_nonnegative_int, require_nonnegative_number
 
 
@@ -69,15 +68,6 @@ class SessionListingEntry:
         if self.updated_at.tzinfo is None or self.updated_at.utcoffset() is None:
             raise ValueError("updated_at must be timezone-aware")
         require_nonnegative_int(self.message_count, field="message_count")
-
-    def to_dict(self) -> dict[str, object]:
-        return {
-            "id": self.id,
-            "title": self.title,
-            "created_at": format_rfc3339_milliseconds(self.created_at),
-            "updated_at": format_rfc3339_milliseconds(self.updated_at),
-            "message_count": self.message_count,
-        }
 
 
 @dataclass(frozen=True, slots=True)
