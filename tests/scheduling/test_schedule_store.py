@@ -246,6 +246,31 @@ def test_strict_load_rejects_duplicate_nested_keys(workspace: Path) -> None:
 @pytest.mark.parametrize(
     "content",
     [
+        '[{"key":1,"key":2}]',
+        '[{"nested":{"key":1,"key":2}}]',
+        "[NaN]",
+        "[Infinity]",
+        "[-Infinity]",
+    ],
+)
+def test_strict_json_violations_keep_the_schedule_domain_error(
+    workspace: Path,
+    content: str,
+) -> None:
+    state = _state(workspace)
+    state.schedule_path.write_text(content, encoding="utf-8")
+
+    with pytest.raises(ScheduleStateError) as raised:
+        WorkspaceScheduleStore(state)
+
+    cause = raised.value.__cause__
+    assert isinstance(cause, ValueError)
+    assert str(cause) == "Schedule state is not valid strict JSON"
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
         "",
         "{}",
         "null",

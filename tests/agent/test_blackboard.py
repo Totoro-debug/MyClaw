@@ -556,6 +556,8 @@ async def test_balanced_scan_does_not_skip_an_earlier_braced_prose_fragment() ->
         '{"action":"replace","task_goal":"goal","completion_boundary":-Infinity}',
         '{"action":"replace","task_goal":"first","task_goal":"second",'
         '"completion_boundary":"boundary"}',
+        '{"action":"replace","task_goal":"goal","completion_boundary":"boundary",'
+        '"nested":{"key":1,"key":2}}',
         '{"action":"replace","task_goal":"goal"}',
         '{"action":"replace","task_goal":"goal","completion_boundary":"boundary","extra":true}',
         '{"task":"replace","task_goal":"goal","completion_boundary":"boundary"}',

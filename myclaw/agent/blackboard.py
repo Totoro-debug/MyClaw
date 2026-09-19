@@ -9,6 +9,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Literal
 
 from myclaw.templates import render_template
+from myclaw.utils.json import strict_json_loads
 from myclaw.utils.validation import token_usage_validation_issue
 
 if TYPE_CHECKING:
@@ -212,26 +213,9 @@ def _loads_json(content: str) -> object:
     if not content:
         return _NOT_PARSED
     try:
-        return json.loads(
-            content,
-            object_pairs_hook=_reject_duplicate_keys,
-            parse_constant=_reject_json_constant,
-        )
+        return strict_json_loads(content)
     except (json.JSONDecodeError, ValueError):
         return _NOT_PARSED
-
-
-def _reject_json_constant(value: str) -> object:
-    raise ValueError(f"unsupported JSON constant: {value}")
-
-
-def _reject_duplicate_keys(pairs: list[tuple[str, object]]) -> dict[str, object]:
-    result: dict[str, object] = {}
-    for key, value in pairs:
-        if key in result:
-            raise ValueError(f"duplicate JSON key: {key}")
-        result[key] = value
-    return result
 
 
 def _fenced_json(content: str) -> object:

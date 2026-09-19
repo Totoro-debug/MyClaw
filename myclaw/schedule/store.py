@@ -8,12 +8,13 @@ import json
 from collections.abc import Callable
 from dataclasses import replace
 from pathlib import Path
-from typing import Literal, NoReturn
+from typing import Literal
 
 from myclaw.agent.workspace_state import WorkspaceState, WorkspaceStateError
 from myclaw.errors import ErrorInfo
 from myclaw.schedule.model import DREAM_JOB_ID, JobStatus, ScheduleJob, ScheduleJobState
 from myclaw.utils.host_filesystem import HOST_FILESYSTEM
+from myclaw.utils.json import strict_json_loads
 from myclaw.utils.validation import require_nonnegative_int, require_uuid4_string
 
 StoreHealth = Literal["available", "faulted"]
@@ -325,11 +326,7 @@ class WorkspaceScheduleStore:
 
 def _parse_document(content: str) -> tuple[ScheduleJob, ...]:
     try:
-        loaded: object = json.loads(
-            content,
-            object_pairs_hook=_object_from_pairs,
-            parse_constant=_reject_json_constant,
-        )
+        loaded = strict_json_loads(content)
     except (json.JSONDecodeError, RecursionError, UnicodeError, ValueError) as error:
         raise ValueError("Schedule state is not valid strict JSON") from error
     if not isinstance(loaded, list):
@@ -355,19 +352,6 @@ def _serialize_document(jobs: tuple[ScheduleJob, ...]) -> str:
         ensure_ascii=False,
         separators=(",", ":"),
     )
-
-
-def _object_from_pairs(pairs: list[tuple[str, object]]) -> dict[str, object]:
-    result: dict[str, object] = {}
-    for key, value in pairs:
-        if key in result:
-            raise ValueError("Schedule state contains duplicate object keys")
-        result[key] = value
-    return result
-
-
-def _reject_json_constant(value: str) -> NoReturn:
-    raise ValueError(f"non-standard JSON constant {value}")
 
 
 def _public_job_key(job: ScheduleJob) -> tuple[object, ...]:
