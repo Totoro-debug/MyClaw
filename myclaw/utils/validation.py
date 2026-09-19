@@ -11,6 +11,16 @@ _TOKEN_USAGE_FIELDS = frozenset({"model_calls", "input_tokens", "output_tokens",
 type TokenUsageValidationIssue = Literal["fields", "values", "total"]
 
 
+def empty_token_usage() -> dict[str, int]:
+    """Return a fresh zero value for the shared token usage contract."""
+    return {
+        "model_calls": 0,
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "total_tokens": 0,
+    }
+
+
 def token_usage_validation_issue(
     value: Mapping[str, object],
 ) -> TokenUsageValidationIssue | None:

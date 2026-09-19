@@ -36,6 +36,7 @@ from myclaw.provider.models import (
     ModelStreamEvent,
 )
 from myclaw.templates import render_template
+from myclaw.utils.validation import empty_token_usage
 
 type CompactionProjection = Callable[
     [Sequence[dict[str, Any]]],
@@ -183,7 +184,7 @@ class AgentRunContextController:
         self._pending_action_summary = _normalized_staged_action_summary(
             snapshot.metadata.get("summary")
         )
-        self._pending_compaction_usage = _empty_usage()
+        self._pending_compaction_usage = empty_token_usage()
         self._current_user_compacted = False
         usage_anchor = latest_main_agent_usage_anchor(snapshot.messages)
         self._usage_history = [] if usage_anchor is None else [usage_anchor]
@@ -1307,15 +1308,6 @@ def _usage_context_matches(
         and context.max_output == route_values.max_output
         and context.estimator_version == estimator_version
     )
-
-
-def _empty_usage() -> dict[str, int]:
-    return {
-        "model_calls": 0,
-        "input_tokens": 0,
-        "output_tokens": 0,
-        "total_tokens": 0,
-    }
 
 
 def _add_pending_usage(target: dict[str, int], response: ModelResponse) -> None:

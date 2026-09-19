@@ -28,7 +28,7 @@ from myclaw.provider.models import (
     ReasoningDelta,
     TextDelta,
 )
-from myclaw.utils.validation import token_usage_validation_issue
+from myclaw.utils.validation import empty_token_usage, token_usage_validation_issue
 
 type AgentRunnerRoute = Literal["chat", "schedule"]
 type AgentRunnerSegment = Literal["reasoning", "response"]
@@ -131,15 +131,6 @@ class AgentRunRequestPreparer(Protocol):
     ) -> dict[str, object] | None: ...
 
 
-def _empty_usage() -> dict[str, int]:
-    return {
-        "model_calls": 0,
-        "input_tokens": 0,
-        "output_tokens": 0,
-        "total_tokens": 0,
-    }
-
-
 def _project_for_model_request(
     messages: Sequence[dict[str, Any]],
     *,
@@ -200,7 +191,7 @@ def _latest_completed_cycle_start(messages: Sequence[dict[str, Any]]) -> int | N
 class AgentRunnerResult:
     messages: list[dict[str, Any]]
     final_content: str
-    usage: dict[str, int] = field(default_factory=_empty_usage)
+    usage: dict[str, int] = field(default_factory=empty_token_usage)
     finish_reason: AgentRunnerFinishReason = "completed"
     error: ErrorInfo | None = None
 
@@ -277,7 +268,7 @@ class AgentRunner:
         increment: list[dict[str, Any]] = []
         pending_tool_calls: list[ModelToolCall] = []
         partial_content: list[str] = []
-        usage = _empty_usage()
+        usage = empty_token_usage()
         continuation: ModelContinuation | None = None
         segment: AgentRunnerSegment | None = None
         events: AsyncIterator[ModelStreamEvent] | None = None

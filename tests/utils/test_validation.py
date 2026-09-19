@@ -2,8 +2,29 @@ import pytest
 
 from myclaw.utils.validation import (
     TokenUsageValidationIssue,
+    empty_token_usage,
     token_usage_validation_issue,
 )
+
+
+def test_empty_token_usage_returns_independent_zeroed_contracts() -> None:
+    first = empty_token_usage()
+    second = empty_token_usage()
+    expected = {
+        "model_calls": 0,
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "total_tokens": 0,
+    }
+
+    assert first == second == expected
+    assert first is not second
+
+    first["model_calls"] = 1
+    second["input_tokens"] = 2
+
+    assert first == {**expected, "model_calls": 1}
+    assert second == {**expected, "input_tokens": 2}
 
 
 @pytest.mark.parametrize(
