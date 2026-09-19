@@ -484,6 +484,45 @@ def test_context_builder_does_not_import_model_request_runtime_boundaries() -> N
     assert violations == []
 
 
+def test_agent_loop_control_interface_is_consolidated() -> None:
+    path = PACKAGE_ROOT / "agent" / "loop.py"
+    tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+    classes = [node for node in tree.body if isinstance(node, ast.ClassDef)]
+
+    assert [node for node in classes if node.name == "AgentLoopControl"] == []
+
+    terminal_controls = [node for node in classes if node.name == "TerminalAgentLoopControl"]
+    assert len(terminal_controls) == 1
+    terminal_control = terminal_controls[0]
+    assert len(terminal_control.bases) == 1
+    assert isinstance(terminal_control.bases[0], ast.Name)
+    assert terminal_control.bases[0].id == "Protocol"
+    assert {
+        node.name
+        for node in terminal_control.body
+        if isinstance(node, (ast.AsyncFunctionDef, ast.FunctionDef))
+    } == {
+        "has_active_run",
+        "cancel_active_run",
+        "bind_confirmation_callback",
+        "respond_to_confirmation",
+        "project_foreground_conversation",
+    }
+
+    exports = next(
+        node.value
+        for node in tree.body
+        if isinstance(node, ast.Assign)
+        and any(isinstance(target, ast.Name) and target.id == "__all__" for target in node.targets)
+    )
+    assert isinstance(exports, (ast.List, ast.Tuple))
+    assert "AgentLoopControl" not in {
+        element.value
+        for element in exports.elts
+        if isinstance(element, ast.Constant) and isinstance(element.value, str)
+    }
+
+
 def test_agent_loop_does_not_retain_a_title_prompt_outside_context_builder() -> None:
     path = PACKAGE_ROOT / "agent" / "loop.py"
     tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))

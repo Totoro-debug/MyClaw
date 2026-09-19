@@ -110,8 +110,8 @@ class ForegroundConversationProjection:
     messages: tuple[dict[str, Any], ...]
 
 
-class AgentLoopControl(Protocol):
-    """The independent foreground control surface owned by AgentLoop."""
+class TerminalAgentLoopControl(Protocol):
+    """Foreground control surface including Terminal history projection."""
 
     @property
     def has_active_run(self) -> bool: ...
@@ -125,10 +125,6 @@ class AgentLoopControl(Protocol):
         confirmation_id: UUID,
         decision: ConfirmationDecision,
     ) -> None: ...
-
-
-class TerminalAgentLoopControl(AgentLoopControl, Protocol):
-    """Foreground control surface including Terminal history projection."""
 
     def project_foreground_conversation(self) -> ForegroundConversationProjection: ...
 
@@ -1582,7 +1578,6 @@ class AgentLoop:
 
 __all__ = [
     "AgentLoop",
-    "AgentLoopControl",
     "ConfirmationCallback",
     "ConfirmationRequestView",
     "ModelContextOverflowError",
