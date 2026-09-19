@@ -302,7 +302,7 @@ class AgentRunContextController:
                 estimator_version=estimator_version,
             )
             if budget.exceeds_available_context(retained_projection.projected_tokens):
-                all_batch, all_cutoff = self._all_eligible_batch()
+                all_batch, all_cutoff = self._batch_from_runs(self._eligible_runs())
                 if all_batch and all_cutoff != cutoff:
                     all_projection = self._projected_tokens(
                         project_messages,
@@ -331,93 +331,12 @@ class AgentRunContextController:
                     raise overflow_error
                 return tuple(deepcopy(projected))
 
-        selected_payload = (
-            _compaction_user_context(list(batch))
-            if pending_fact is None
-            else pending_fact.selected_payload
+        await self._stage_summary_pair(
+            revision=revision,
+            batch=batch,
+            cutoff=cutoff,
+            memory_route_status=memory_route_status,
         )
-        memory_budget = ContextBudget(
-            context_window=memory_route_status.context_window,
-            max_output=memory_route_status.max_output,
-            compact_ratio=0.9,
-        )
-        if pending_fact is None:
-            fact_messages = _summary_request_messages(
-                template_name="conversation-compaction-system-prompt.md",
-                selected_payload=selected_payload,
-            )
-            if memory_budget.exceeds_available_context(estimate_request_tokens(fact_messages)):
-                overflow_error = model_context_overflow_error()
-                self._raise_summary_failure(revision, overflow_error)
-
-            try:
-                fact_response = await self._provider.complete(
-                    "memory",
-                    messages=fact_messages,
-                    tools=(),
-                    guard=_request_hard_guard,
-                )
-            except ModelCallError as provider_error:
-                self._raise_summary_failure(revision, provider_error)
-            except Exception as provider_error:
-                self._record_failure(revision, provider_error)
-                raise
-            _add_pending_usage(self._pending_compaction_usage, fact_response)
-            response_error = _summary_response_error(fact_response)
-            if response_error is not None:
-                self._raise_summary_failure(revision, response_error)
-            try:
-                await self._memory_manager.append_summary(
-                    content=fact_response.message.content,
-                    timestamp=self._persisted_now(),
-                )
-            except (OSError, UnicodeError, ValueError) as persistence_cause:
-                persistence_error = ModelCallError(
-                    ErrorInfo(
-                        code="persistence_error",
-                        message="Conversation Summary could not be persisted.",
-                    )
-                )
-                self._raise_summary_failure(
-                    revision,
-                    persistence_error,
-                    cause=persistence_cause,
-                )
-            self._pending_fact = _PendingFactBatch(
-                batch=tuple(deepcopy(list(batch))),
-                cutoff=cutoff,
-                selected_payload=selected_payload,
-            )
-
-        action_messages = _summary_request_messages(
-            template_name="conversation-summary-system-prompt.md",
-            selected_payload=_action_summary_user_context(
-                self._pending_action_summary,
-                selected_payload,
-            ),
-        )
-        if memory_budget.exceeds_available_context(estimate_request_tokens(action_messages)):
-            overflow_error = model_context_overflow_error()
-            self._raise_summary_failure(revision, overflow_error)
-        try:
-            action_response = await self._provider.complete(
-                "memory",
-                messages=action_messages,
-                tools=(),
-                guard=_request_hard_guard,
-            )
-        except ModelCallError as provider_error:
-            self._raise_summary_failure(revision, provider_error)
-        except Exception as provider_error:
-            self._record_failure(revision, provider_error)
-            raise
-        _add_pending_usage(self._pending_compaction_usage, action_response)
-        response_error = _summary_response_error(action_response)
-        if response_error is not None:
-            self._raise_summary_failure(revision, response_error)
-        self._pending_action_summary = _normalize_action_summary(action_response.message.content)
-        self._pending_last_compacted = cutoff
-        self._pending_fact = None
         final_projected = self._project_candidate(
             project_messages,
             current_user=copied_user,
@@ -619,93 +538,12 @@ class AgentRunContextController:
             and not self._current_user_compacted
             and self._pending_last_compacted <= len(self._snapshot.messages) < cutoff
         )
-        selected_payload = (
-            _compaction_user_context(list(batch))
-            if pending_fact is None
-            else pending_fact.selected_payload
+        await self._stage_summary_pair(
+            revision=revision,
+            batch=batch,
+            cutoff=cutoff,
+            memory_route_status=memory_route_status,
         )
-        memory_budget = ContextBudget(
-            context_window=memory_route_status.context_window,
-            max_output=memory_route_status.max_output,
-            compact_ratio=0.9,
-        )
-        if pending_fact is None:
-            fact_messages = _summary_request_messages(
-                template_name="conversation-compaction-system-prompt.md",
-                selected_payload=selected_payload,
-            )
-            if memory_budget.exceeds_available_context(estimate_request_tokens(fact_messages)):
-                overflow_error = model_context_overflow_error()
-                self._raise_summary_failure(revision, overflow_error)
-            try:
-                fact_response = await self._provider.complete(
-                    "memory",
-                    messages=fact_messages,
-                    tools=(),
-                    guard=_request_hard_guard,
-                )
-            except ModelCallError as provider_error:
-                self._raise_summary_failure(revision, provider_error)
-            except Exception as provider_error:
-                self._record_failure(revision, provider_error)
-                raise
-            _add_pending_usage(self._pending_compaction_usage, fact_response)
-            response_error = _summary_response_error(fact_response)
-            if response_error is not None:
-                self._raise_summary_failure(revision, response_error)
-            try:
-                await self._memory_manager.append_summary(
-                    content=fact_response.message.content,
-                    timestamp=self._persisted_now(),
-                )
-            except (OSError, UnicodeError, ValueError) as persistence_cause:
-                persistence_error = ModelCallError(
-                    ErrorInfo(
-                        code="persistence_error",
-                        message="Conversation Summary could not be persisted.",
-                    )
-                )
-                self._raise_summary_failure(
-                    revision,
-                    persistence_error,
-                    cause=persistence_cause,
-                )
-            self._pending_fact = _PendingFactBatch(
-                batch=tuple(deepcopy(list(batch))),
-                cutoff=cutoff,
-                selected_payload=selected_payload,
-            )
-
-        action_messages = _summary_request_messages(
-            template_name="conversation-summary-system-prompt.md",
-            selected_payload=_action_summary_user_context(
-                self._pending_action_summary,
-                selected_payload,
-            ),
-        )
-        if memory_budget.exceeds_available_context(estimate_request_tokens(action_messages)):
-            overflow_error = model_context_overflow_error()
-            self._raise_summary_failure(revision, overflow_error)
-        try:
-            action_response = await self._provider.complete(
-                "memory",
-                messages=action_messages,
-                tools=(),
-                guard=_request_hard_guard,
-            )
-        except ModelCallError as provider_error:
-            self._raise_summary_failure(revision, provider_error)
-        except Exception as provider_error:
-            self._record_failure(revision, provider_error)
-            raise
-        _add_pending_usage(self._pending_compaction_usage, action_response)
-        response_error = _summary_response_error(action_response)
-        if response_error is not None:
-            self._raise_summary_failure(revision, response_error)
-
-        self._pending_action_summary = _normalize_action_summary(action_response.message.content)
-        self._pending_last_compacted = cutoff
-        self._pending_fact = None
         if selected_user:
             self._current_user_compacted = True
         final_projected = self._react_project_candidate(
@@ -920,6 +758,103 @@ class AgentRunContextController:
             estimator_version=estimator_version,
         )
 
+    async def _stage_summary_pair(
+        self,
+        *,
+        batch: Sequence[dict[str, Any]],
+        cutoff: int,
+        revision: str,
+        memory_route_status: ModelRouteStatus,
+    ) -> None:
+        pending_fact = self._pending_fact
+        selected_payload = (
+            _compaction_user_context(list(batch))
+            if pending_fact is None
+            else pending_fact.selected_payload
+        )
+        memory_budget = ContextBudget(
+            context_window=memory_route_status.context_window,
+            max_output=memory_route_status.max_output,
+            compact_ratio=0.9,
+        )
+        if pending_fact is None:
+            fact_messages = _summary_request_messages(
+                template_name="conversation-compaction-system-prompt.md",
+                selected_payload=selected_payload,
+            )
+            if memory_budget.exceeds_available_context(estimate_request_tokens(fact_messages)):
+                overflow_error = model_context_overflow_error()
+                self._raise_summary_failure(revision, overflow_error)
+            try:
+                fact_response = await self._provider.complete(
+                    "memory",
+                    messages=fact_messages,
+                    tools=(),
+                    guard=_request_hard_guard,
+                )
+            except ModelCallError as provider_error:
+                self._raise_summary_failure(revision, provider_error)
+            except Exception as provider_error:
+                self._record_failure(revision, provider_error)
+                raise
+            _add_pending_usage(self._pending_compaction_usage, fact_response)
+            response_error = _summary_response_error(fact_response)
+            if response_error is not None:
+                self._raise_summary_failure(revision, response_error)
+            try:
+                await self._memory_manager.append_summary(
+                    content=fact_response.message.content,
+                    timestamp=self._persisted_now(),
+                )
+            except (OSError, UnicodeError, ValueError) as persistence_cause:
+                persistence_error = ModelCallError(
+                    ErrorInfo(
+                        code="persistence_error",
+                        message="Conversation Summary could not be persisted.",
+                    )
+                )
+                self._raise_summary_failure(
+                    revision,
+                    persistence_error,
+                    cause=persistence_cause,
+                )
+            self._pending_fact = _PendingFactBatch(
+                batch=tuple(deepcopy(list(batch))),
+                cutoff=cutoff,
+                selected_payload=selected_payload,
+            )
+
+        action_messages = _summary_request_messages(
+            template_name="conversation-summary-system-prompt.md",
+            selected_payload=_action_summary_user_context(
+                self._pending_action_summary,
+                selected_payload,
+            ),
+        )
+        if memory_budget.exceeds_available_context(estimate_request_tokens(action_messages)):
+            overflow_error = model_context_overflow_error()
+            self._raise_summary_failure(revision, overflow_error)
+        try:
+            action_response = await self._provider.complete(
+                "memory",
+                messages=action_messages,
+                tools=(),
+                guard=_request_hard_guard,
+            )
+        except ModelCallError as provider_error:
+            self._raise_summary_failure(revision, provider_error)
+        except Exception as provider_error:
+            self._record_failure(revision, provider_error)
+            raise
+        _add_pending_usage(self._pending_compaction_usage, action_response)
+        response_error = _summary_response_error(action_response)
+        if response_error is not None:
+            self._raise_summary_failure(revision, response_error)
+
+        self._pending_action_summary = _normalize_action_summary(action_response.message.content)
+        self._pending_last_compacted = cutoff
+        self._pending_fact = None
+
     def _record_failure(self, revision: str, error: Exception) -> None:
         self._checked_preparation_revision = revision
         self._failed_context_revision = revision
@@ -958,9 +893,6 @@ class AgentRunContextController:
                 else eligible
             )
         return self._batch_from_runs(selected)
-
-    def _all_eligible_batch(self) -> tuple[tuple[dict[str, Any], ...], int]:
-        return self._batch_from_runs(self._eligible_runs())
 
     def _batch_from_runs(
         self,
