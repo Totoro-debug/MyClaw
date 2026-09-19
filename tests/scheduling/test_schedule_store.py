@@ -210,14 +210,12 @@ def test_strict_load_rejects_duplicate_keys_and_duplicate_job_ids(workspace: Pat
     with pytest.raises(ScheduleStateError) as raised:
         WorkspaceScheduleStore(state)
     assert raised.value.path == state.schedule_path
-    assert raised.value.error.to_dict() == {
-        "code": "schedule_state_error",
-        "message": (
-            "Schedule state could not be loaded. Repair or move the file, then start MyClaw again."
-        ),
-        "retryable": False,
-        "retry_after_seconds": None,
-    }
+    assert raised.value.error.code == "schedule_state_error"
+    assert raised.value.error.message == (
+        "Schedule state could not be loaded. Repair or move the file, then start MyClaw again."
+    )
+    assert raised.value.error.retryable is False
+    assert raised.value.error.retry_after_seconds is None
 
     state.schedule_path.write_text(
         json.dumps([_job().to_dict(), _job().to_dict()], separators=(",", ":")),

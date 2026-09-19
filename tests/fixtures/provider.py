@@ -25,6 +25,25 @@ def unexpected_provider_factory(configuration: ProviderConfiguration) -> ModelPr
     raise AssertionError("Provider factory was unexpectedly called")
 
 
+def error_info_fields(error: ErrorInfo) -> dict[str, object]:
+    """Project ErrorInfo fields for adapter contract assertions."""
+    return {
+        "code": error.code,
+        "message": error.message,
+        "retryable": error.retryable,
+        "retry_after_seconds": error.retry_after_seconds,
+    }
+
+
+def model_response_fields(response: ModelResponse) -> dict[str, object]:
+    """Project ModelResponse fields for adapter contract assertions."""
+    return {
+        "message": response.message.to_dict(),
+        "usage": response.usage.to_dict(),
+        "finish_reason": response.finish_reason,
+    }
+
+
 @dataclass(frozen=True, slots=True)
 class StreamScript:
     """Events yielded by one provider stream call."""

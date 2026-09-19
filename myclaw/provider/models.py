@@ -107,13 +107,6 @@ class ModelResponse:
         if not self.message.content.strip() and not self.message.tool_calls:
             raise EmptyModelResponseError("model response requires content or tool calls")
 
-    def to_dict(self) -> dict[str, object]:
-        return {
-            "message": self.message.to_dict(),
-            "usage": self.usage.to_dict(),
-            "finish_reason": self.finish_reason,
-        }
-
 
 @dataclass(frozen=True, slots=True)
 class TextDelta:
@@ -126,9 +119,6 @@ class TextDelta:
         if not self.delta:
             msg = "delta must not be empty"
             raise ValueError(msg)
-
-    def to_dict(self) -> dict[str, object]:
-        return {"type": self.type, "delta": self.delta}
 
 
 @dataclass(frozen=True, slots=True)
@@ -143,9 +133,6 @@ class ReasoningDelta:
             msg = "delta must not be empty"
             raise ValueError(msg)
 
-    def to_dict(self) -> dict[str, object]:
-        return {"type": self.type, "delta": self.delta}
-
 
 @dataclass(frozen=True, slots=True)
 class ModelCompleted:
@@ -153,9 +140,6 @@ class ModelCompleted:
 
     type: ClassVar[Literal["completed"]] = "completed"
     response: ModelResponse
-
-    def to_dict(self) -> dict[str, object]:
-        return {"type": self.type, "response": self.response.to_dict()}
 
 
 type ModelStreamEvent = ReasoningDelta | TextDelta | ModelCompleted

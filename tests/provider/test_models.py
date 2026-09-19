@@ -63,7 +63,7 @@ def test_model_usage_rejects_values_outside_the_counter_contract(
         )
 
 
-def test_normalized_response_serializes_without_request_metadata() -> None:
+def test_normalized_response_exposes_provider_neutral_fields() -> None:
     tool_call = ModelToolCall(
         id="call_123",
         name="read_file",
@@ -78,21 +78,11 @@ def test_normalized_response_serializes_without_request_metadata() -> None:
         finish_reason="tool_calls",
     )
 
-    assert response.to_dict() == {
-        "message": {
-            "role": "assistant",
-            "content": "I will inspect it.",
-            "tool_calls": [
-                {
-                    "id": "call_123",
-                    "name": "read_file",
-                    "arguments": '{"path":"CONTEXT.md"}',
-                }
-            ],
-        },
-        "usage": {"input_tokens": 120, "output_tokens": 24, "total_tokens": 144},
-        "finish_reason": "tool_calls",
-    }
+    assert response.message.content == "I will inspect it."
+    assert response.message.tool_calls == (tool_call,)
+    assert response.usage == ModelUsage(input_tokens=120, output_tokens=24, total_tokens=144)
+    assert response.finish_reason == "tool_calls"
+    assert response.continuation is None
     messages: list[dict[str, object]] = [
         {"role": "user", "content": "Inspect the project."},
         response.message.to_dict(),
@@ -139,24 +129,24 @@ def test_stream_events_preserve_the_normalized_response_contract() -> None:
         finish_reason="stop",
     )
 
-    assert TextDelta(delta="I will").to_dict() == {"type": "text_delta", "delta": "I will"}
-    assert ModelCompleted(response=response).to_dict() == {
-        "type": "completed",
-        "response": response.to_dict(),
-    }
+    text_delta = TextDelta(delta="I will")
+    assert text_delta.type == "text_delta"
+    assert text_delta.delta == "I will"
+    completed = ModelCompleted(response=response)
+    assert completed.type == "completed"
+    assert completed.response is response
 
 
 def test_reasoning_delta_is_distinct_from_text_and_rejects_empty_content() -> None:
-    assert ReasoningDelta(delta="Thinking...").to_dict() == {
-        "type": "reasoning_delta",
-        "delta": "Thinking...",
-    }
+    reasoning_delta = ReasoningDelta(delta="Thinking...")
+    assert reasoning_delta.type == "reasoning_delta"
+    assert reasoning_delta.delta == "Thinking..."
 
     with pytest.raises(ValueError, match="delta must not be empty"):
         ReasoningDelta(delta="")
 
 
-def test_model_response_retains_opaque_continuation_without_serializing_it() -> None:
+def test_model_response_retains_opaque_continuation() -> None:
     continuation = ModelContinuation(
         provider_id="anthropic-default",
         payload=({"type": "thinking", "thinking": "private", "signature": "sig"},),
@@ -169,11 +159,6 @@ def test_model_response_retains_opaque_continuation_without_serializing_it() -> 
     )
 
     assert response.continuation is continuation
-    assert response.to_dict() == {
-        "message": {"role": "assistant", "content": "Answer", "tool_calls": []},
-        "usage": {"input_tokens": 1, "output_tokens": 2, "total_tokens": 3},
-        "finish_reason": "stop",
-    }
 
 
 def test_model_response_accepts_tool_call_without_text() -> None:

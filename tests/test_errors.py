@@ -89,12 +89,10 @@ def test_error_info_uses_the_frozen_structure_and_code_vocabulary() -> None:
         retry_after_seconds=1.5,
     )
 
-    assert error.to_dict() == {
-        "code": "provider_rate_limited",
-        "message": "Provider rate limit reached.",
-        "retryable": True,
-        "retry_after_seconds": 1.5,
-    }
+    assert error.code == "provider_rate_limited"
+    assert error.message == "Provider rate limit reached."
+    assert error.retryable is True
+    assert error.retry_after_seconds == 1.5
     with pytest.raises(ValueError, match="stable error code"):
         ErrorInfo(code=cast(ErrorCode, "new_unaccepted_code"), message="Not accepted.")
 

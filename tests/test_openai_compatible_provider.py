@@ -20,6 +20,7 @@ from myclaw.provider.models import (
     TextDelta,
 )
 from myclaw.provider.openai_compatible import OpenAICompatibleProvider
+from tests.fixtures.provider import error_info_fields, model_response_fields
 
 READ_FILE_SCHEMA: dict[str, Any] = {
     "type": "function",
@@ -178,7 +179,7 @@ async def test_stream_translates_text_and_usage_through_official_sdk_boundary() 
     completed = events[-1]
     assert isinstance(completed, ModelCompleted)
     assert completed.response.continuation is None
-    assert completed.response.to_dict() == {
+    assert model_response_fields(completed.response) == {
         "message": {"role": "assistant", "content": "Hello", "tool_calls": []},
         "usage": {"input_tokens": 7, "output_tokens": 2, "total_tokens": 9},
         "finish_reason": "stop",
@@ -360,7 +361,7 @@ async def test_stream_aggregates_fragmented_tool_calls_with_mixed_content() -> N
     assert events[:2] == [TextDelta(delta="I can "), TextDelta(delta="inspect.")]
     completed = events[-1]
     assert isinstance(completed, ModelCompleted)
-    assert completed.response.to_dict() == {
+    assert model_response_fields(completed.response) == {
         "message": {
             "role": "assistant",
             "content": "I can inspect.",
@@ -472,7 +473,6 @@ async def test_stream_preserves_interleaved_reasoning_and_replays_latest_assista
         provider_id="openai-local",
         payload="Plan more",
     )
-    assert "continuation" not in first_completed.response.to_dict()
 
     second_request = request()
     second_request["messages"] = [
@@ -575,7 +575,6 @@ async def test_complete_retains_reasoning_continuation_without_stream_event() ->
         provider_id="openai-local",
         payload="Plan",
     )
-    assert "continuation" not in observed.to_dict()
 
 
 @pytest.mark.asyncio
@@ -619,7 +618,7 @@ async def test_complete_normalizes_memory_and_schedule_responses(route: str) -> 
 
     observed = await provider.complete(**completion_request(route))
 
-    assert observed.to_dict() == {
+    assert model_response_fields(observed) == {
         "message": {"role": "assistant", "content": "Concise summary", "tool_calls": []},
         "usage": {"input_tokens": 19, "output_tokens": 3, "total_tokens": 22},
         "finish_reason": "stop",
@@ -667,7 +666,7 @@ async def test_complete_rejects_an_empty_success_response(response: object) -> N
     with pytest.raises(ModelCallError) as raised:
         await provider.complete(**completion_request("memory"))
 
-    assert raised.value.error.to_dict() == {
+    assert error_info_fields(raised.value.error) == {
         "code": "model_failed",
         "message": (
             "OpenAI-compatible provider returned an empty response. "
@@ -731,7 +730,7 @@ async def test_complete_translates_tool_history_and_mixed_tool_response() -> Non
 
     observed = await provider.complete(**model_request)
 
-    assert observed.to_dict() == {
+    assert model_response_fields(observed) == {
         "message": {
             "role": "assistant",
             "content": "I will update memory.",
@@ -868,7 +867,7 @@ async def test_complete_maps_sdk_failures_once(
     with pytest.raises(ModelCallError) as raised:
         await provider.complete(**completion_request("memory"))
 
-    assert raised.value.error.to_dict() == expected
+    assert error_info_fields(raised.value.error) == expected
     assert raised.value.__cause__ is failure
     assert len(client.chat.completions.calls) == 1
 
@@ -886,7 +885,7 @@ async def test_stream_maps_iteration_timeout_without_retrying() -> None:
         async for _event in provider.stream(**request()):
             pass
 
-    assert raised.value.error.to_dict() == {
+    assert error_info_fields(raised.value.error) == {
         "code": "provider_timeout",
         "message": "OpenAI-compatible provider request timed out.",
         "retryable": True,
@@ -909,7 +908,7 @@ async def test_stream_maps_creation_error_without_retrying() -> None:
         async for _event in provider.stream(**request()):
             pass
 
-    assert raised.value.error.to_dict() == {
+    assert error_info_fields(raised.value.error) == {
         "code": "provider_auth_error",
         "message": "OpenAI-compatible provider authentication failed.",
         "retryable": False,
@@ -931,7 +930,7 @@ async def test_stream_rejects_an_empty_success_response() -> None:
         async for _event in provider.stream(**request()):
             pass
 
-    assert raised.value.error.to_dict() == {
+    assert error_info_fields(raised.value.error) == {
         "code": "model_failed",
         "message": (
             "OpenAI-compatible provider returned an empty response. "

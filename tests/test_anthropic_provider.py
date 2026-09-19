@@ -31,6 +31,7 @@ from myclaw.provider.models import (
     ReasoningDelta,
     TextDelta,
 )
+from tests.fixtures.provider import error_info_fields, model_response_fields
 
 READ_FILE_SCHEMA: dict[str, Any] = {
     "type": "function",
@@ -156,7 +157,7 @@ async def test_stream_translates_text_and_usage_through_official_sdk_boundary() 
     assert len(events) == 3
     completed = events[-1]
     assert isinstance(completed, ModelCompleted)
-    assert completed.response.to_dict() == {
+    assert model_response_fields(completed.response) == {
         "message": {"role": "assistant", "content": "Hello", "tool_calls": []},
         "usage": {"input_tokens": 7, "output_tokens": 2, "total_tokens": 9},
         "finish_reason": "stop",
@@ -266,7 +267,7 @@ async def test_stream_rejects_an_empty_success_response() -> None:
         async for _event in provider.stream(**request()):
             pass
 
-    assert captured.value.error.to_dict() == {
+    assert error_info_fields(captured.value.error) == {
         "code": "model_failed",
         "message": "Anthropic provider returned an empty response. Check its model configuration.",
         "retryable": False,
@@ -456,7 +457,6 @@ async def test_stream_preserves_interleaved_thinking_blocks_and_replays_continua
             },
         ),
     )
-    assert "continuation" not in first_completed.response.to_dict()
 
     second_request = request()
     second_request["messages"] = [
@@ -548,7 +548,6 @@ async def test_complete_retains_redacted_and_signature_only_continuation_without
             {"type": "text", "text": "Done"},
         ),
     )
-    assert "continuation" not in response.to_dict()
 
 
 @pytest.mark.asyncio
@@ -611,7 +610,7 @@ async def test_complete_translates_mixed_history_and_full_message() -> None:
 
     response = await provider.complete(**complete_request)
 
-    assert response.to_dict() == {
+    assert model_response_fields(response) == {
         "message": {
             "role": "assistant",
             "content": "I found it.",
@@ -687,7 +686,7 @@ async def test_complete_rejects_an_empty_success_response() -> None:
     with pytest.raises(ModelCallError) as captured:
         await provider.complete(**request(stream=False))
 
-    assert captured.value.error.to_dict() == {
+    assert error_info_fields(captured.value.error) == {
         "code": "model_failed",
         "message": "Anthropic provider returned an empty response. Check its model configuration.",
         "retryable": False,
@@ -707,7 +706,7 @@ async def test_complete_normalizes_timeout_without_adapter_retry() -> None:
     with pytest.raises(ModelCallError) as captured:
         await provider.complete(**request(stream=False))
 
-    assert captured.value.error.to_dict() == {
+    assert error_info_fields(captured.value.error) == {
         "code": "provider_timeout",
         "message": "Anthropic request timed out.",
         "retryable": True,
@@ -735,7 +734,7 @@ async def test_complete_preserves_numeric_retry_after_for_rate_limit() -> None:
     with pytest.raises(ModelCallError) as captured:
         await provider.complete(**request(stream=False))
 
-    assert captured.value.error.to_dict() == {
+    assert error_info_fields(captured.value.error) == {
         "code": "provider_rate_limited",
         "message": "Anthropic rate limit was reached.",
         "retryable": True,
@@ -762,7 +761,7 @@ async def test_complete_normalizes_authentication_as_permanent() -> None:
     with pytest.raises(ModelCallError) as captured:
         await provider.complete(**request(stream=False))
 
-    assert captured.value.error.to_dict() == {
+    assert error_info_fields(captured.value.error) == {
         "code": "provider_auth_error",
         "message": "Anthropic authentication failed.",
         "retryable": False,
@@ -794,7 +793,7 @@ async def test_complete_normalizes_temporary_unavailability(sdk_error: Exception
     with pytest.raises(ModelCallError) as captured:
         await provider.complete(**request(stream=False))
 
-    assert captured.value.error.to_dict() == {
+    assert error_info_fields(captured.value.error) == {
         "code": "provider_unavailable",
         "message": "Anthropic is temporarily unavailable.",
         "retryable": True,
@@ -820,7 +819,7 @@ async def test_complete_preserves_retry_after_for_temporary_unavailability() -> 
     with pytest.raises(ModelCallError) as captured:
         await provider.complete(**request(stream=False))
 
-    assert captured.value.error.to_dict() == {
+    assert error_info_fields(captured.value.error) == {
         "code": "provider_unavailable",
         "message": "Anthropic is temporarily unavailable.",
         "retryable": True,
@@ -941,7 +940,7 @@ async def test_complete_normalizes_permanent_provider_errors(
     with pytest.raises(ModelCallError) as captured:
         await provider.complete(**request(stream=False))
 
-    assert captured.value.error.to_dict() == expected
+    assert error_info_fields(captured.value.error) == expected
     assert len(client.messages.calls) == 1
 
 
@@ -1015,7 +1014,7 @@ async def test_complete_normalizes_unclassified_sdk_failure() -> None:
     with pytest.raises(ModelCallError) as captured:
         await provider.complete(**request(stream=False))
 
-    assert captured.value.error.to_dict() == {
+    assert error_info_fields(captured.value.error) == {
         "code": "model_failed",
         "message": "Anthropic model call failed.",
         "retryable": False,
@@ -1066,7 +1065,7 @@ async def test_stream_normalizes_malformed_tool_arguments_as_model_failure() -> 
         async for _event in provider.stream(**request()):
             pass
 
-    assert captured.value.error.to_dict() == {
+    assert error_info_fields(captured.value.error) == {
         "code": "model_failed",
         "message": "Anthropic model call failed.",
         "retryable": False,
@@ -1096,7 +1095,7 @@ async def test_complete_normalizes_malformed_tool_arguments_as_model_failure() -
     with pytest.raises(ModelCallError) as captured:
         await provider.complete(**request(stream=False))
 
-    assert captured.value.error.to_dict() == {
+    assert error_info_fields(captured.value.error) == {
         "code": "model_failed",
         "message": "Anthropic model call failed.",
         "retryable": False,

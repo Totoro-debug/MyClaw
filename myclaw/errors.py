@@ -88,11 +88,3 @@ class ErrorInfo:
                 self.retry_after_seconds,
                 field="retry_after_seconds",
             )
-
-    def to_dict(self) -> dict[str, object]:
-        return {
-            "code": self.code,
-            "message": self.message,
-            "retryable": self.retryable,
-            "retry_after_seconds": self.retry_after_seconds,
-        }
