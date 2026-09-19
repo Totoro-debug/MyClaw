@@ -97,7 +97,12 @@ async def test_cli_async_root_owns_lifetime_components_and_async_shutdown(
         async def start(self, configuration: object) -> object:
             del configuration
             events.append("mcp_start")
-            return SimpleNamespace(snapshot=())
+            return SimpleNamespace(
+                snapshot=(),
+                failed_servers=(),
+                failures=(),
+                skipped_tool_counts=(),
+            )
 
         async def close(self) -> None:
             events.append("mcp_close")
