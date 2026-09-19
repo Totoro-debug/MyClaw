@@ -44,6 +44,7 @@ __all__ = [
     "estimate_run_slice_tokens",
     "project_next_request_tokens",
     "reported_model_usage_total",
+    "request_fits_model_context",
 ]
 
 
@@ -210,6 +211,22 @@ def estimate_request_tokens(
     components.extend(_canonical_json(tool) for tool in tools)
     byte_count = sum(len(component.encode("utf-8")) for component in components)
     return (byte_count + 3) // 4
+
+
+def request_fits_model_context(
+    messages: Sequence[dict[str, Any]],
+    tools: Sequence[dict[str, Any]],
+    *,
+    context_window: int,
+    max_output: int,
+) -> bool:
+    """Return whether one request is strictly below the hard input boundary."""
+    budget = ContextBudget(
+        context_window=context_window,
+        max_output=max_output,
+        compact_ratio=0.9,
+    )
+    return not budget.exceeds_available_context(estimate_request_tokens(messages, tools))
 
 
 def estimate_run_slice_tokens(messages: Sequence[dict[str, Any]]) -> int:

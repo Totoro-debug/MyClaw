@@ -11,7 +11,7 @@ from typing import Annotated, Any, Literal, Protocol
 
 from loguru import logger
 
-from myclaw.agent.context_budget import ContextBudget, estimate_request_tokens
+from myclaw.agent.context_budget import request_fits_model_context
 from myclaw.agent.memory.manager import (
     MemoryEditMismatchError,
     MemoryEditReadError,
@@ -267,7 +267,12 @@ class Dream:
             },
         ]
         tools = tuple(self._tool_gateway.schemas)
-        if not _request_fits(self._memory_route_status, messages, tools):
+        if not request_fits_model_context(
+            messages,
+            tools,
+            context_window=self._memory_route_status.context_window,
+            max_output=self._memory_route_status.max_output,
+        ):
             overflow = model_context_overflow_error()
             self._capture_terminal_failure(overflow)
             return _model_failure(cursor=claim.cursor, error=overflow.error)
@@ -277,7 +282,12 @@ class Dream:
                 "memory",
                 messages=messages,
                 tools=tools,
-                guard=_request_fits,
+                guard=lambda status, attempt_messages, attempt_tools: request_fits_model_context(
+                    attempt_messages,
+                    attempt_tools,
+                    context_window=status.context_window,
+                    max_output=status.max_output,
+                ),
             )
         except asyncio.CancelledError:
             raise
@@ -343,19 +353,6 @@ class Dream:
 def _require_long_term_path(path: str, *, expected: Path) -> None:
     if Path(path) != expected:
         raise ToolError("Memory Tasks may access only Long-term Memory.")
-
-
-def _request_fits(
-    route_status: ModelRouteStatus,
-    messages: ModelMessages,
-    tools: Sequence[dict[str, Any]],
-) -> bool:
-    budget = ContextBudget(
-        context_window=route_status.context_window,
-        max_output=route_status.max_output,
-        compact_ratio=0.9,
-    )
-    return not budget.exceeds_available_context(estimate_request_tokens(messages, tools))
 
 
 def _finish_reason_error(finish_reason: Literal["length", "cancelled"]) -> ErrorInfo:

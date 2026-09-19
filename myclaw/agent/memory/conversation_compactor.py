@@ -20,6 +20,7 @@ from myclaw.agent.context_budget import (
     estimate_run_slice_tokens,
     project_next_request_tokens,
     reported_model_usage_total,
+    request_fits_model_context,
 )
 from myclaw.agent.memory.manager import MemoryManager
 from myclaw.agent.run_errors import CommittableAgentRunError
@@ -1339,8 +1340,12 @@ def _request_hard_guard(
     messages: ModelMessages,
     tools: Sequence[dict[str, Any]],
 ) -> bool:
-    budget = ContextBudget(status.context_window, status.max_output, 0.9)
-    return not budget.exceeds_available_context(estimate_request_tokens(messages, tools))
+    return request_fits_model_context(
+        messages,
+        tools,
+        context_window=status.context_window,
+        max_output=status.max_output,
+    )
 
 
 def _normalize_action_summary(content: str) -> str | None:

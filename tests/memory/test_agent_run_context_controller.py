@@ -9,12 +9,17 @@ from typing import Any, Literal, cast
 
 import pytest
 
-from myclaw.agent.context_budget import estimate_request_tokens, estimate_run_slice_tokens
+from myclaw.agent.context_budget import (
+    estimate_request_tokens,
+    estimate_run_slice_tokens,
+    request_fits_model_context,
+)
 from myclaw.agent.memory.conversation_compactor import (
     AgentRunContextController,
     AgentRunContextRequestPreparer,
     AgentRunContextRouterAdapter,
     AgentRunContextSnapshot,
+    _request_hard_guard,
     latest_main_agent_usage_anchor,
 )
 from myclaw.agent.memory.manager import MemoryManager
@@ -1162,6 +1167,27 @@ async def test_explicit_router_adapter_blocks_an_over_budget_attempt_before_prov
 
     assert raised.value.error.code == "model_context_overflow"
     assert provider.complete_requests == []
+
+
+@pytest.mark.parametrize("available_delta", (1, 0, -1))
+def test_compactor_request_guard_matches_the_shared_context_predicate(
+    available_delta: int,
+) -> None:
+    messages = [{"role": "user", "content": "request"}]
+    tools = ({"type": "function", "function": {"name": "work", "parameters": {}}},)
+    estimated = estimate_request_tokens(messages, tools)
+    max_output = 10
+    status = _memory_status(
+        context_window=estimated + max_output + available_delta,
+        max_output=max_output,
+    )
+
+    assert _request_hard_guard(status, messages, tools) is request_fits_model_context(
+        messages,
+        tools,
+        context_window=status.context_window,
+        max_output=status.max_output,
+    )
 
 
 @pytest.mark.asyncio

@@ -10,6 +10,7 @@ from myclaw.agent.context_budget import (
     estimate_request_tokens,
     project_next_request_tokens,
     reported_model_usage_total,
+    request_fits_model_context,
 )
 
 
@@ -140,6 +141,62 @@ def test_request_estimate_is_stable_for_equivalent_tool_schema_key_orders() -> N
     }
 
     assert estimate_request_tokens([], [first]) == estimate_request_tokens([], [reordered])
+
+
+@pytest.mark.parametrize(
+    ("available_delta", "expected"),
+    (
+        pytest.param(1, True, id="below"),
+        pytest.param(0, False, id="equal"),
+        pytest.param(-1, False, id="above"),
+    ),
+)
+def test_request_fit_uses_a_strict_hard_context_boundary(
+    available_delta: int,
+    expected: bool,
+) -> None:
+    messages = [
+        {"role": "system", "content": "fixed"},
+        {"role": "user", "content": "request"},
+    ]
+    estimated = estimate_request_tokens(messages)
+    max_output = 8
+
+    assert (
+        request_fits_model_context(
+            messages,
+            (),
+            context_window=estimated + max_output + available_delta,
+            max_output=max_output,
+        )
+        is expected
+    )
+
+
+def test_request_fit_counts_tools_at_the_hard_context_boundary() -> None:
+    messages = [{"role": "user", "content": "request"}]
+    tools = [{"type": "function", "function": {"name": "work", "parameters": {}}}]
+    estimated_with_tools = estimate_request_tokens(messages, tools)
+    max_output = 8
+
+    assert request_fits_model_context(
+        messages,
+        (),
+        context_window=estimated_with_tools + max_output,
+        max_output=max_output,
+    )
+    assert not request_fits_model_context(
+        messages,
+        tools,
+        context_window=estimated_with_tools + max_output,
+        max_output=max_output,
+    )
+    assert request_fits_model_context(
+        messages,
+        tools,
+        context_window=estimated_with_tools + max_output + 1,
+        max_output=max_output,
+    )
 
 
 def test_context_usage_snapshot_round_trips_exact_shape() -> None:
