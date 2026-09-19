@@ -233,6 +233,38 @@ async def test_router_close_settles_every_cached_provider_when_one_close_fails()
 
 
 @pytest.mark.asyncio
+async def test_router_close_aggregates_multiple_provider_failures() -> None:
+    class FailingCloseProvider(ScriptedFakeProvider):
+        def __init__(self, name: str) -> None:
+            super().__init__(completions=(response(name),))
+            self._name = name
+
+        async def close(self) -> None:
+            raise RuntimeError(f"{self._name} close failed")
+
+    providers = {
+        "default-provider": FailingCloseProvider("default"),
+        "memory-provider": FailingCloseProvider("memory"),
+    }
+    router = ModelRouter(
+        configuration=memory_configuration(),
+        provider_factory=lambda provider: providers[provider.provider_id],
+        clock=FakeClock(NOW),
+    )
+    await router.complete("default", **request())
+    await router.complete("memory", **request())
+
+    with pytest.raises(BaseExceptionGroup) as raised:
+        await router.close()
+
+    assert str(raised.value) == "Model Provider shutdown failed (2 sub-exceptions)"
+    assert [str(error) for error in raised.value.exceptions] == [
+        "default close failed",
+        "memory close failed",
+    ]
+
+
+@pytest.mark.asyncio
 async def test_router_close_settles_every_provider_when_one_close_is_cancelled() -> None:
     close_order: list[str] = []
 
@@ -331,6 +363,29 @@ async def test_concurrent_router_close_waits_for_the_same_provider_shutdown() ->
     finally:
         release.set()
         await asyncio.gather(first, second)
+
+    assert close_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_router_closes_shared_provider_instance_once() -> None:
+    close_calls = 0
+
+    class CloseTrackingProvider(ScriptedFakeProvider):
+        async def close(self) -> None:
+            nonlocal close_calls
+            close_calls += 1
+
+    provider = CloseTrackingProvider(completions=(response("default"), response("memory")))
+    router = ModelRouter(
+        configuration=memory_configuration(),
+        provider_factory=lambda _configuration: provider,
+        clock=FakeClock(NOW),
+    )
+    await router.complete("default", **request())
+    await router.complete("memory", **request())
+
+    await router.close()
 
     assert close_calls == 1
 
@@ -1188,49 +1243,6 @@ async def test_model_router_closes_each_provider_adapter_it_constructed() -> Non
 
     assert chat_provider.closed is True
     assert default_provider.closed is True
-
-
-@pytest.mark.asyncio
-async def test_model_router_abort_owns_and_safely_consumes_detached_provider_cleanup() -> None:
-    close_started = asyncio.Event()
-    release_close = asyncio.Event()
-    close_finished = asyncio.Event()
-
-    class FailingCloseProvider(ScriptedFakeProvider):
-        async def close(self) -> None:
-            close_started.set()
-            try:
-                await release_close.wait()
-            finally:
-                close_finished.set()
-            raise RuntimeError("PRIVATE DETACHED PROVIDER FAILURE")
-
-    provider = FailingCloseProvider(streams=(StreamScript(events=(completed(),)),))
-    router = ModelRouter(
-        configuration=configuration(),
-        provider_factory=lambda _configuration: provider,
-        clock=FakeClock(NOW),
-        jitter=None,
-    )
-    await collect(router.stream("default", **request()))
-    capture = capture_diagnostics()
-
-    router.abort()
-    await close_started.wait()
-    owned = getattr(router, "_detached_cleanup_tasks", None)
-    cleanup_consumed = asyncio.Event()
-    try:
-        assert owned is not None and len(owned) == 1
-        next(iter(owned)).add_done_callback(lambda _task: cleanup_consumed.set())
-    finally:
-        release_close.set()
-        await close_finished.wait()
-        await cleanup_consumed.wait()
-        capture.close()
-
-    assert owned == set()
-    assert "Detached Model Provider cleanup failed" in capture.event_text
-    assert "PRIVATE DETACHED PROVIDER FAILURE" not in capture.text
 
 
 @pytest.mark.asyncio

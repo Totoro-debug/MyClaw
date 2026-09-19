@@ -75,8 +75,6 @@ class ModelRouter:
         )
         self._reasoning_effort_override: ReasoningEffort | None = None
         self._close_task: asyncio.Task[None] | None = None
-        self._detached_cleanup_tasks: set[asyncio.Task[None]] = set()
-        self._aborted = False
 
     def route_status(self, requested_route: ModelRoute) -> ModelRouteStatus:
         """Return the current concrete route identity without provider credentials."""
@@ -251,31 +249,11 @@ class ModelRouter:
             raise model_context_overflow_error()
 
     async def close(self) -> None:
-        if self._aborted:
-            return
         task = self._close_task
         if task is None:
             task = asyncio.create_task(self._close_providers())
             self._close_task = task
         await asyncio.shield(task)
-
-    def abort(self) -> None:
-        """Detach providers synchronously and close them as a best-effort task."""
-        if self._aborted:
-            return
-        self._aborted = True
-        providers = _unique_providers(tuple(self._providers.values()))
-        self._providers.clear()
-        if not providers:
-            return
-        try:
-            loop = asyncio.get_running_loop()
-        except RuntimeError:
-            logger.warning("Detached Model Provider cleanup skipped without an event loop")
-            return
-        task = loop.create_task(self._close_detached_providers(providers))
-        self._detached_cleanup_tasks.add(task)
-        task.add_done_callback(self._detached_cleanup_finished)
 
     async def _close_providers(self) -> None:
         providers = tuple(self._providers.values())
@@ -290,33 +268,6 @@ class ModelRouter:
             raise failures[0]
         if failures:
             raise BaseExceptionGroup("Model Provider shutdown failed", failures)
-
-    async def _close_detached_providers(
-        self,
-        providers: tuple[ProviderImplementation, ...],
-    ) -> None:
-        results = await asyncio.gather(
-            *(provider.close() for provider in providers),
-            return_exceptions=True,
-        )
-        for result in results:
-            if isinstance(result, BaseException):
-                logger.warning(
-                    "Detached Model Provider cleanup failed type={}",
-                    type(result).__name__,
-                )
-
-    def _detached_cleanup_finished(self, task: asyncio.Task[None]) -> None:
-        self._detached_cleanup_tasks.discard(task)
-        try:
-            task.result()
-        except asyncio.CancelledError:
-            return
-        except BaseException as error:
-            logger.warning(
-                "Detached Model Provider cleanup task failed type={}",
-                type(error).__name__,
-            )
 
     async def _recover_attempt(
         self,
@@ -366,7 +317,7 @@ class ModelRouter:
         return fallback
 
     def _provider(self, configuration: ProviderConfiguration) -> ProviderImplementation:
-        if self._close_task is not None or self._aborted:
+        if self._close_task is not None:
             raise RuntimeError("Model Router is closed")
         provider = self._providers.get(configuration.provider_id)
         if provider is None:
