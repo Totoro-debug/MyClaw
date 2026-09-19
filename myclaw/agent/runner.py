@@ -222,16 +222,10 @@ class AgentRunnerResult:
                 )
 
 
-class _CallbackFailure(Exception):
-    def __init__(self, error: BaseException) -> None:
+class _PropagatedFailure(Exception):
+    def __init__(self, error: BaseException, message: str) -> None:
         self.error = error
-        super().__init__("Agent Runner output callback failed")
-
-
-class _RequestPreparationFailure(Exception):
-    def __init__(self, error: BaseException) -> None:
-        self.error = error
-        super().__init__("Agent Runner request preparation failed")
+        super().__init__(message)
 
 
 class AgentRunner:
@@ -289,9 +283,15 @@ class AgentRunner:
                 task = asyncio.current_task()
                 if task is not None and task.cancelling():
                     raise
-                raise _CallbackFailure(error) from error
+                raise _PropagatedFailure(
+                    error,
+                    "Agent Runner output callback failed",
+                ) from error
             except BaseException as error:
-                raise _CallbackFailure(error) from error
+                raise _PropagatedFailure(
+                    error,
+                    "Agent Runner output callback failed",
+                ) from error
 
         async def close_segment() -> None:
             nonlocal segment
@@ -304,7 +304,7 @@ class AgentRunner:
         async def close_segment_for_error() -> None:
             try:
                 await close_segment()
-            except _CallbackFailure as failure:
+            except _PropagatedFailure as failure:
                 raise failure.error from failure
 
         async def start_segment(next_segment: AgentRunnerSegment) -> None:
@@ -346,7 +346,10 @@ class AgentRunner:
                 except (asyncio.CancelledError, ModelCallError):
                     raise
                 except BaseException as error:
-                    raise _RequestPreparationFailure(error) from error
+                    raise _PropagatedFailure(
+                        error,
+                        "Agent Runner request preparation failed",
+                    ) from error
                 request_messages: Sequence[dict[str, Any]]
                 if tool_gateway is not None:
                     retained_eligible_count = _micro_compression_eligible_count(
@@ -372,7 +375,10 @@ class AgentRunner:
                 except (asyncio.CancelledError, ModelCallError):
                     raise
                 except BaseException as error:
-                    raise _RequestPreparationFailure(error) from error
+                    raise _PropagatedFailure(
+                        error,
+                        "Agent Runner request preparation failed",
+                    ) from error
                 model_call_started = True
                 usage["model_calls"] += 1
                 if model == "chat":
@@ -436,7 +442,10 @@ class AgentRunner:
                 except (asyncio.CancelledError, ModelCallError):
                     raise
                 except BaseException as error:
-                    raise _RequestPreparationFailure(error) from error
+                    raise _PropagatedFailure(
+                        error,
+                        "Agent Runner request preparation failed",
+                    ) from error
                 if context_usage is not None:
                     assistant_message["context_usage"] = deepcopy(context_usage)
                 _append_run_message(runtime_messages, increment, assistant_message)
@@ -555,9 +564,7 @@ class AgentRunner:
                     )
 
                 continuation = continuation_for_next_call
-        except _CallbackFailure as failure:
-            raise failure.error from failure
-        except _RequestPreparationFailure as failure:
+        except _PropagatedFailure as failure:
             raise failure.error from failure
         except ModelCallError as failure:
             await close_segment_for_error()

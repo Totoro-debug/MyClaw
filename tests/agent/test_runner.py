@@ -662,10 +662,50 @@ async def test_request_preparer_cannot_mutate_runner_messages_or_provider_tools(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("failure_type", (RuntimeError, asyncio.CancelledError))
-async def test_request_projection_observer_failure_stops_before_provider(
-    failure_type: type[BaseException],
-) -> None:
+async def test_request_prepare_failure_propagates_original_without_provider_call() -> None:
+    failure = RuntimeError("prepare failed")
+
+    class FailingPreparer(DetachedRequestPreparer):
+        async def prepare(
+            self,
+            *,
+            increment: Sequence[dict[str, Any]],
+            latest_cycle_start: int | None,
+            tools: Sequence[dict[str, Any]],
+            continuation: ModelContinuation | None,
+            continuation_revision: int,
+        ) -> list[dict[str, Any]]:
+            del self, increment, latest_cycle_start, tools, continuation, continuation_revision
+            raise failure
+
+    provider = ScriptedFakeProvider()
+    initial_messages = [{"role": "user", "content": "request"}]
+
+    with pytest.raises(RuntimeError) as captured:
+        await AgentRunner(
+            ScriptedFakeRouter(provider),
+            FailingPreparer(initial_messages),
+        ).run(
+            initial_messages,
+            model="chat",
+            tool_gateway=None,
+            on_output=_ignore_output,
+            confirmation=None,
+            externalize_result=None,
+            cancel_requested=None,
+            max_iterations=50,
+            propagate_unexpected_errors=True,
+        )
+
+    assert captured.value is failure
+    assert str(captured.value.__cause__) == "Agent Runner request preparation failed"
+    assert provider.stream_requests == []
+
+
+@pytest.mark.asyncio
+async def test_request_projection_observer_failure_stops_before_provider() -> None:
+    failure = RuntimeError("observer failed")
+
     class FailingObserverPreparer(DetachedRequestPreparer):
         def observe_request_projection(
             self,
@@ -674,7 +714,7 @@ async def test_request_projection_observer_failure_stops_before_provider(
             micro_compression_enabled: bool,
         ) -> None:
             del micro_compression_enabled
-            raise failure_type("observer failed")
+            raise failure
 
     provider = ScriptedFakeProvider(
         streams=(
@@ -693,7 +733,7 @@ async def test_request_projection_observer_failure_stops_before_provider(
     )
     initial_messages = [{"role": "user", "content": "request"}]
 
-    with pytest.raises(failure_type, match="observer failed"):
+    with pytest.raises(RuntimeError) as captured:
         await AgentRunner(
             ScriptedFakeRouter(provider),
             FailingObserverPreparer(initial_messages),
@@ -709,7 +749,100 @@ async def test_request_projection_observer_failure_stops_before_provider(
             propagate_unexpected_errors=True,
         )
 
+    assert captured.value is failure
+    assert str(captured.value.__cause__) == "Agent Runner request preparation failed"
     assert provider.stream_requests == []
+
+
+@pytest.mark.asyncio
+async def test_request_projection_observer_cancelled_error_stops_before_provider() -> None:
+    failure = asyncio.CancelledError("observer cancelled")
+
+    class CancellingObserverPreparer(DetachedRequestPreparer):
+        def observe_request_projection(
+            self,
+            _messages: Sequence[dict[str, Any]],
+            *,
+            micro_compression_enabled: bool,
+        ) -> None:
+            del micro_compression_enabled
+            raise failure
+
+    provider = ScriptedFakeProvider()
+    initial_messages = [{"role": "user", "content": "request"}]
+
+    with pytest.raises(asyncio.CancelledError) as captured:
+        await AgentRunner(
+            ScriptedFakeRouter(provider),
+            CancellingObserverPreparer(initial_messages),
+        ).run(
+            initial_messages,
+            model="chat",
+            tool_gateway=None,
+            on_output=_ignore_output,
+            confirmation=None,
+            externalize_result=None,
+            cancel_requested=None,
+            max_iterations=50,
+            propagate_unexpected_errors=True,
+        )
+
+    assert captured.value is failure
+    assert provider.stream_requests == []
+
+
+@pytest.mark.asyncio
+async def test_record_response_failure_propagates_original_after_one_provider_call() -> None:
+    failure = RuntimeError("record failed")
+
+    class FailingRecorderPreparer(DetachedRequestPreparer):
+        def record_response(
+            self,
+            *,
+            request_messages: Sequence[dict[str, Any]],
+            tools: Sequence[dict[str, Any]],
+            response: ModelResponse,
+            increment: Sequence[dict[str, Any]],
+        ) -> dict[str, object] | None:
+            del self, request_messages, tools, response, increment
+            raise failure
+
+    provider = ScriptedFakeProvider(
+        streams=(
+            StreamScript(
+                events=(
+                    ModelCompleted(
+                        response=ModelResponse(
+                            message=AssistantModelMessage(content="done"),
+                            usage=ModelUsage(input_tokens=1, output_tokens=1, total_tokens=2),
+                            finish_reason="stop",
+                        )
+                    ),
+                )
+            ),
+        )
+    )
+    initial_messages = [{"role": "user", "content": "request"}]
+
+    with pytest.raises(RuntimeError) as captured:
+        await AgentRunner(
+            ScriptedFakeRouter(provider),
+            FailingRecorderPreparer(initial_messages),
+        ).run(
+            initial_messages,
+            model="chat",
+            tool_gateway=None,
+            on_output=_ignore_output,
+            confirmation=None,
+            externalize_result=None,
+            cancel_requested=None,
+            max_iterations=50,
+            propagate_unexpected_errors=True,
+        )
+
+    assert captured.value is failure
+    assert str(captured.value.__cause__) == "Agent Runner request preparation failed"
+    assert len(provider.stream_requests) == 1
 
 
 def test_result_validates_exact_usage_and_finish_invariants() -> None:
@@ -2036,14 +2169,15 @@ async def test_cancellation_after_fiftieth_tool_takes_priority_over_iteration_li
 @pytest.mark.asyncio
 async def test_callback_failure_propagates_and_closes_provider_iterator() -> None:
     router = _ClosingRouter()
+    failure = RuntimeError("output sink failed")
 
     async def fail(event: object) -> None:
         del event
-        raise RuntimeError("output sink failed")
+        raise failure
 
     runner = _runner(cast(AgentRunnerRouter, router))
 
-    with pytest.raises(RuntimeError, match="output sink failed"):
+    with pytest.raises(RuntimeError) as captured:
         await runner.run(
             [{"role": "user", "content": "Callback."}],
             model="chat",
@@ -2055,6 +2189,8 @@ async def test_callback_failure_propagates_and_closes_provider_iterator() -> Non
             max_iterations=50,
         )
 
+    assert captured.value is failure
+    assert str(captured.value.__cause__) == "Agent Runner output callback failed"
     assert router.closed.is_set()
 
 
