@@ -240,7 +240,6 @@ class AgentRunContextController:
         projected = self._project_candidate(
             project_messages,
             current_user=copied_user,
-            tools=effective_tools,
         )
         projection = self._projection_from_candidate(
             projected,
@@ -336,7 +335,6 @@ class AgentRunContextController:
         final_projected = self._project_candidate(
             project_messages,
             current_user=copied_user,
-            tools=effective_tools,
         )
         final_projection = self._projection_from_candidate(
             final_projected,
@@ -576,23 +574,12 @@ class AgentRunContextController:
         )
         self._checked_preparation_revision = preparation_revision
 
-    def _react_virtual_messages(
+    def _react_project_candidate(
         self,
         increment: Sequence[dict[str, Any]],
         *,
         current_user: dict[str, Any] | None,
-    ) -> list[dict[str, Any]]:
-        result = deepcopy(list(self._snapshot.messages))
-        if current_user is not None:
-            result.append(deepcopy(current_user))
-        result.extend(deepcopy(list(increment)))
-        return result
-
-    def _react_raw_projection(
-        self,
-        increment: Sequence[dict[str, Any]],
-        *,
-        current_user: dict[str, Any] | None,
+        project_messages: CompactionProjection,
     ) -> list[dict[str, Any]]:
         snapshot_length = len(self._snapshot.messages)
         user_offset = 1 if current_user is not None else 0
@@ -606,22 +593,8 @@ class AgentRunContextController:
         if current_user is not None:
             source.append(deepcopy(current_user))
         source.extend(deepcopy(list(increment[increment_start:])))
-        return source
-
-    def _react_project_candidate(
-        self,
-        increment: Sequence[dict[str, Any]],
-        *,
-        current_user: dict[str, Any] | None,
-        project_messages: CompactionProjection,
-    ) -> list[dict[str, Any]]:
         return _insert_action_summary(
-            project_messages(
-                self._react_raw_projection(
-                    increment,
-                    current_user=current_user,
-                )
-            ),
+            project_messages(source),
             self._pending_action_summary,
         )
 
@@ -659,7 +632,10 @@ class AgentRunContextController:
         current_user: dict[str, Any] | None,
         latest_cycle_start: int | None,
     ) -> tuple[tuple[dict[str, Any], ...], int]:
-        virtual = self._react_virtual_messages(increment, current_user=current_user)
+        virtual = deepcopy(list(self._snapshot.messages))
+        if current_user is not None:
+            virtual.append(deepcopy(current_user))
+        virtual.extend(deepcopy(list(increment)))
         snapshot_length = len(self._snapshot.messages)
         increment_base = snapshot_length + (1 if current_user is not None else 0)
         current_start = (
@@ -690,7 +666,6 @@ class AgentRunContextController:
         project_messages: CompactionProjection,
         *,
         current_user: dict[str, Any] | None,
-        tools: Sequence[dict[str, Any]],
     ) -> list[dict[str, Any]]:
         raw_messages = list(self._snapshot.messages[self._pending_last_compacted :])
         if current_user is not None:
