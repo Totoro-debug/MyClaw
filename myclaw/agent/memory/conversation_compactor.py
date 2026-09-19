@@ -148,7 +148,7 @@ class _PendingFactBatch:
 class _ReactRevisionObservation:
     current_user: dict[str, Any] | None
     tools: tuple[dict[str, Any], ...]
-    route_values: _RouteProjectionValues
+    route_status: ModelRouteStatus
     memory_route_status: ModelRouteStatus | None
     compact_ratio: float
     estimator_version: str
@@ -186,8 +186,7 @@ class AgentRunContextController:
         )
         self._pending_compaction_usage = empty_token_usage()
         self._current_user_compacted = False
-        usage_anchor = latest_main_agent_usage_anchor(snapshot.messages)
-        self._usage_history = [] if usage_anchor is None else [usage_anchor]
+        self._latest_usage_anchor = latest_main_agent_usage_anchor(snapshot.messages)
         self._checked_preparation_revision: str | None = None
         self._pending_fact: _PendingFactBatch | None = None
         self._failed_context_revision: str | None = None
@@ -240,7 +239,6 @@ class AgentRunContextController:
             max_output=route_status.max_output,
             compact_ratio=compact_ratio,
         )
-        route_values = _route_projection_values(route_status)
         effective_tools = tuple(deepcopy(list(tools)))
         copied_user = None if current_user is None else deepcopy(current_user)
         projected = self._project_candidate(
@@ -251,14 +249,14 @@ class AgentRunContextController:
         projection = self._projection_from_candidate(
             projected,
             tools=effective_tools,
-            route_values=route_values,
+            route_status=route_status,
             estimator_version=estimator_version,
         )
         revision = self._context_revision(
             current_user=copied_user,
             tools=effective_tools,
             projected=projected,
-            route_values=route_values,
+            route_status=route_status,
             memory_route_status=memory_route_status,
             compact_ratio=compact_ratio,
             estimator_version=estimator_version,
@@ -277,7 +275,7 @@ class AgentRunContextController:
             raw_messages=(),
             current_user=copied_user,
             tools=effective_tools,
-            route_values=route_values,
+            route_status=route_status,
             estimator_version=estimator_version,
         )
         if budget.exceeds_available_context(protected_projection.projected_tokens):
@@ -300,7 +298,7 @@ class AgentRunContextController:
                 raw_messages=self._snapshot.messages[cutoff:],
                 current_user=copied_user,
                 tools=effective_tools,
-                route_values=route_values,
+                route_status=route_status,
                 estimator_version=estimator_version,
             )
             if budget.exceeds_available_context(retained_projection.projected_tokens):
@@ -311,7 +309,7 @@ class AgentRunContextController:
                         raw_messages=self._snapshot.messages[all_cutoff:],
                         current_user=copied_user,
                         tools=effective_tools,
-                        route_values=route_values,
+                        route_status=route_status,
                         estimator_version=estimator_version,
                     )
                     if not budget.exceeds_available_context(all_projection.projected_tokens):
@@ -347,14 +345,14 @@ class AgentRunContextController:
         final_projection = self._projection_from_candidate(
             final_projected,
             tools=effective_tools,
-            route_values=route_values,
+            route_status=route_status,
             estimator_version=estimator_version,
         )
         final_revision = self._context_revision(
             current_user=copied_user,
             tools=effective_tools,
             projected=final_projected,
-            route_values=route_values,
+            route_status=route_status,
             memory_route_status=memory_route_status,
             compact_ratio=compact_ratio,
             estimator_version=estimator_version,
@@ -377,7 +375,6 @@ class AgentRunContextController:
         estimator_version: str,
     ) -> ContextUsageSnapshot:
         """Record one main response's route, anchor and run projection provenance."""
-        route_values = _route_projection_values(route_status)
         anchor_estimated_tokens = estimate_request_tokens(
             [*request_messages, response.message.to_dict()],
             tools,
@@ -398,7 +395,7 @@ class AgentRunContextController:
             and self._run_anchor_tools == tuple(deepcopy(list(tools)))
             and self._run_anchor_non_target == non_target
             and not self._current_user_compacted
-            and _usage_context_matches(baseline, route_values, estimator_version)
+            and _usage_context_matches(baseline, route_status, estimator_version)
             and reported_model_usage_total(baseline_usage) is not None
         ):
             run_projected_tokens = max(
@@ -410,12 +407,12 @@ class AgentRunContextController:
             projection_source = "reported_delta"
 
         context = ContextUsageSnapshot(
-            requested_route=route_values.requested_route,
-            selected_route=route_values.selected_route,
-            provider_id=route_values.provider_id,
-            model=route_values.model,
-            context_window=route_values.context_window,
-            max_output=route_values.max_output,
+            requested_route=route_status.requested_route,
+            selected_route=route_status.selected_route,
+            provider_id=route_status.provider_id,
+            model=route_status.model,
+            context_window=route_status.context_window,
+            max_output=route_status.max_output,
             anchor_estimated_tokens=anchor_estimated_tokens,
             estimator_version=estimator_version,
             run_projected_tokens=run_projected_tokens,
@@ -425,7 +422,7 @@ class AgentRunContextController:
             "model_calls": 1,
             **response.usage.to_dict(),
         }
-        self._usage_history = [(context, deepcopy(usage))]
+        self._latest_usage_anchor = (context, deepcopy(usage))
         self._run_anchor_context = context
         self._run_anchor_usage = deepcopy(usage)
         self._run_anchor_tools = tuple(deepcopy(list(tools)))
@@ -452,10 +449,9 @@ class AgentRunContextController:
         micro_compression_enabled: bool = False,
     ) -> tuple[dict[str, Any], ...]:
         """Prepare one ReAct request from the run's raw increment."""
-        route_values = _route_projection_values(route_status)
         budget = ContextBudget(
-            context_window=route_values.context_window,
-            max_output=route_values.max_output,
+            context_window=route_status.context_window,
+            max_output=route_status.max_output,
             compact_ratio=compact_ratio,
         )
         effective_tools = tuple(deepcopy(list(tools)))
@@ -479,14 +475,14 @@ class AgentRunContextController:
         projection = self._projection_from_candidate(
             projected,
             tools=effective_tools,
-            route_values=route_values,
+            route_status=route_status,
             estimator_version=estimator_version,
         )
         revision = self._context_revision(
             current_user=copied_user,
             tools=effective_tools,
             projected=projected,
-            route_values=route_values,
+            route_status=route_status,
             memory_route_status=memory_route_status,
             compact_ratio=compact_ratio,
             estimator_version=estimator_version,
@@ -509,7 +505,7 @@ class AgentRunContextController:
             latest_cycle_start=latest_cycle_start,
             project_messages=project_messages,
             tools=effective_tools,
-            route_values=route_values,
+            route_status=route_status,
             estimator_version=estimator_version,
         )
         if budget.exceeds_available_context(protected.projected_tokens):
@@ -557,7 +553,7 @@ class AgentRunContextController:
             current_user=copied_user,
             tools=effective_tools,
             projected=final_projected,
-            route_values=route_values,
+            route_status=route_status,
             memory_route_status=memory_route_status,
             compact_ratio=compact_ratio,
             estimator_version=estimator_version,
@@ -583,7 +579,7 @@ class AgentRunContextController:
             current_user=observation.current_user,
             tools=observation.tools,
             projected=tuple(deepcopy(list(messages))),
-            route_values=observation.route_values,
+            route_status=observation.route_status,
             memory_route_status=observation.memory_route_status,
             compact_ratio=observation.compact_ratio,
             estimator_version=observation.estimator_version,
@@ -651,7 +647,7 @@ class AgentRunContextController:
         latest_cycle_start: int | None,
         project_messages: CompactionProjection,
         tools: Sequence[dict[str, Any]],
-        route_values: _RouteProjectionValues,
+        route_status: ModelRouteStatus,
         estimator_version: str,
     ) -> ContextProjection:
         if latest_cycle_start is None:
@@ -665,7 +661,7 @@ class AgentRunContextController:
         return self._projection_from_candidate(
             projected,
             tools=tools,
-            route_values=route_values,
+            route_status=route_status,
             estimator_version=estimator_version,
         )
 
@@ -725,7 +721,7 @@ class AgentRunContextController:
         raw_messages: Sequence[dict[str, Any]],
         current_user: dict[str, Any] | None,
         tools: Sequence[dict[str, Any]],
-        route_values: _RouteProjectionValues,
+        route_status: ModelRouteStatus,
         estimator_version: str,
     ) -> ContextProjection:
         source = list(deepcopy(list(raw_messages)))
@@ -735,7 +731,7 @@ class AgentRunContextController:
         return self._projection_from_candidate(
             projected,
             tools=tools,
-            route_values=route_values,
+            route_status=route_status,
             estimator_version=estimator_version,
         )
 
@@ -744,19 +740,27 @@ class AgentRunContextController:
         projected: Sequence[dict[str, Any]],
         *,
         tools: Sequence[dict[str, Any]],
-        route_values: _RouteProjectionValues,
+        route_status: ModelRouteStatus,
         estimator_version: str,
     ) -> ContextProjection:
+        usage_anchor = self._latest_usage_anchor
+        if usage_anchor is None or not _usage_context_matches(
+            usage_anchor[0], route_status, estimator_version
+        ):
+            usage_context = None
+            usage = None
+        else:
+            usage_context, usage = usage_anchor
         return project_next_request_tokens(
             estimate_request_tokens(projected, tools),
-            snapshot=self._compatible_usage_context(route_values, estimator_version),
-            reported_usage=self._compatible_usage(route_values, estimator_version),
-            requested_route=route_values.requested_route,
-            selected_route=route_values.selected_route,
-            provider_id=route_values.provider_id,
-            model=route_values.model,
-            context_window=route_values.context_window,
-            max_output=route_values.max_output,
+            snapshot=usage_context,
+            reported_usage=usage,
+            requested_route=route_status.requested_route,
+            selected_route=route_status.selected_route,
+            provider_id=route_status.provider_id,
+            model=route_status.model,
+            context_window=route_status.context_window,
+            max_output=route_status.max_output,
             estimator_version=estimator_version,
         )
 
@@ -916,41 +920,13 @@ class AgentRunContextController:
             if end > self._pending_last_compacted
         ]
 
-    def _compatible_usage_context(
-        self,
-        route_values: _RouteProjectionValues,
-        estimator_version: str,
-    ) -> ContextUsageSnapshot | None:
-        return next(
-            (
-                context
-                for context, _usage in self._usage_history
-                if _usage_context_matches(context, route_values, estimator_version)
-            ),
-            None,
-        )
-
-    def _compatible_usage(
-        self,
-        route_values: _RouteProjectionValues,
-        estimator_version: str,
-    ) -> dict[str, int] | None:
-        return next(
-            (
-                usage
-                for context, usage in self._usage_history
-                if _usage_context_matches(context, route_values, estimator_version)
-            ),
-            None,
-        )
-
     def _context_revision(
         self,
         *,
         current_user: dict[str, Any] | None,
         tools: Sequence[dict[str, Any]],
         projected: Sequence[dict[str, Any]],
-        route_values: _RouteProjectionValues,
+        route_status: ModelRouteStatus,
         memory_route_status: ModelRouteStatus | None,
         compact_ratio: float,
         estimator_version: str,
@@ -972,7 +948,14 @@ class AgentRunContextController:
             "micro_compression_enabled": micro_compression_enabled,
             "tools": list(tools),
             "projected": list(projected),
-            "route": route_values.to_dict(),
+            "route": {
+                "requested_route": route_status.requested_route,
+                "selected_route": route_status.selected_route,
+                "provider_id": route_status.provider_id,
+                "model": route_status.model,
+                "context_window": route_status.context_window,
+                "max_output": route_status.max_output,
+            },
             "compact_ratio": compact_ratio,
             "memory_route": (
                 None
@@ -1049,7 +1032,6 @@ class AgentRunContextRequestPreparer:
             continuation=continuation,
         )
         memory_route_status = self._router.call_route_status("memory", continuation=None)
-        route_values = _route_projection_values(route_status)
         prepared_messages = await self._controller.prepare_react(
             project_messages=self._project_messages,
             increment=deepcopy(list(increment)),
@@ -1067,7 +1049,7 @@ class AgentRunContextRequestPreparer:
         self._pending_observation = _ReactRevisionObservation(
             current_user=None if self._current_user is None else deepcopy(self._current_user),
             tools=tuple(deepcopy(list(tools))),
-            route_values=route_values,
+            route_status=route_status,
             memory_route_status=memory_route_status,
             compact_ratio=self._compact_ratio,
             estimator_version=self._estimator_version,
@@ -1189,37 +1171,6 @@ class AgentRunContextRouterAdapter:
             self._call_statuses[route] = status
 
 
-@dataclass(frozen=True, slots=True)
-class _RouteProjectionValues:
-    requested_route: str
-    selected_route: str
-    provider_id: str
-    model: str
-    context_window: int
-    max_output: int
-
-    def to_dict(self) -> dict[str, object]:
-        return {
-            "requested_route": self.requested_route,
-            "selected_route": self.selected_route,
-            "provider_id": self.provider_id,
-            "model": self.model,
-            "context_window": self.context_window,
-            "max_output": self.max_output,
-        }
-
-
-def _route_projection_values(route_status: ModelRouteStatus) -> _RouteProjectionValues:
-    return _RouteProjectionValues(
-        requested_route=route_status.requested_route,
-        selected_route=route_status.selected_route,
-        provider_id=route_status.provider_id,
-        model=route_status.model,
-        context_window=route_status.context_window,
-        max_output=route_status.max_output,
-    )
-
-
 def _completed_run_ranges(messages: Sequence[dict[str, Any]]) -> list[tuple[int, int]]:
     starts = [index for index, message in enumerate(messages) if message.get("role") == "user"]
     return [
@@ -1296,16 +1247,16 @@ def latest_main_agent_usage_anchor(
 
 def _usage_context_matches(
     context: ContextUsageSnapshot,
-    route_values: _RouteProjectionValues,
+    route_status: ModelRouteStatus,
     estimator_version: str,
 ) -> bool:
     return (
-        context.requested_route == route_values.requested_route
-        and context.selected_route == route_values.selected_route
-        and context.provider_id == route_values.provider_id
-        and context.model == route_values.model
-        and context.context_window == route_values.context_window
-        and context.max_output == route_values.max_output
+        context.requested_route == route_status.requested_route
+        and context.selected_route == route_status.selected_route
+        and context.provider_id == route_status.provider_id
+        and context.model == route_status.model
+        and context.context_window == route_status.context_window
+        and context.max_output == route_status.max_output
         and context.estimator_version == estimator_version
     )
 
