@@ -441,7 +441,7 @@ class AgentLoop:
         )
         projected_messages = status_input.projected_messages
         estimated = estimate_request_tokens(projected_messages, status_input.projected_tools)
-        if estimated >= budget.available_context:
+        if budget.exceeds_available_context(estimated):
             raise ModelContextOverflowError(
                 ErrorInfo(
                     "model_context_overflow",

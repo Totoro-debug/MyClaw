@@ -319,7 +319,7 @@ class AgentRunContextController:
             route_values=route_values,
             estimator_version=estimator_version,
         )
-        if protected_projection.projected_tokens >= budget.available_context:
+        if budget.exceeds_available_context(protected_projection.projected_tokens):
             overflow_error = model_context_overflow_error()
             self._record_failure(revision, overflow_error)
             raise overflow_error
@@ -342,7 +342,7 @@ class AgentRunContextController:
                 route_values=route_values,
                 estimator_version=estimator_version,
             )
-            if retained_projection.projected_tokens >= budget.available_context:
+            if budget.exceeds_available_context(retained_projection.projected_tokens):
                 all_batch, all_cutoff = self._all_eligible_batch()
                 if all_batch and all_cutoff != cutoff:
                     all_projection = self._projected_tokens(
@@ -353,7 +353,7 @@ class AgentRunContextController:
                         route_values=route_values,
                         estimator_version=estimator_version,
                     )
-                    if all_projection.projected_tokens < budget.available_context:
+                    if not budget.exceeds_available_context(all_projection.projected_tokens):
                         batch, cutoff = all_batch, all_cutoff
                     else:
                         overflow_error = model_context_overflow_error()
@@ -366,7 +366,7 @@ class AgentRunContextController:
         else:
             if not batch:
                 self._checked_preparation_revision = revision
-                if projection.projected_tokens >= budget.available_context:
+                if budget.exceeds_available_context(projection.projected_tokens):
                     overflow_error = model_context_overflow_error()
                     self._record_failure(revision, overflow_error)
                     raise overflow_error
@@ -382,12 +382,17 @@ class AgentRunContextController:
             fallback_context_window=route_context_window,
             fallback_max_output=route_max_output,
         )
+        memory_budget = ContextBudget(
+            context_window=memory_context_window,
+            max_output=memory_max_output,
+            compact_ratio=0.9,
+        )
         if pending_fact is None:
             fact_messages = _summary_request_messages(
                 template_name="conversation-compaction-system-prompt.md",
                 selected_payload=selected_payload,
             )
-            if estimate_request_tokens(fact_messages) >= memory_context_window - memory_max_output:
+            if memory_budget.exceeds_available_context(estimate_request_tokens(fact_messages)):
                 overflow_error = model_context_overflow_error()
                 self._record_failure(revision, overflow_error)
                 raise overflow_error
@@ -397,7 +402,7 @@ class AgentRunContextController:
                     "memory",
                     messages=fact_messages,
                     tools=(),
-                    guard=_summary_hard_guard,
+                    guard=_request_hard_guard,
                 )
             except Exception as provider_error:
                 self._record_failure(revision, provider_error)
@@ -434,7 +439,7 @@ class AgentRunContextController:
                 selected_payload,
             ),
         )
-        if estimate_request_tokens(action_messages) >= memory_context_window - memory_max_output:
+        if memory_budget.exceeds_available_context(estimate_request_tokens(action_messages)):
             overflow_error = model_context_overflow_error()
             self._record_failure(revision, overflow_error)
             raise overflow_error
@@ -443,7 +448,7 @@ class AgentRunContextController:
                 "memory",
                 messages=action_messages,
                 tools=(),
-                guard=_summary_hard_guard,
+                guard=_request_hard_guard,
             )
         except Exception as provider_error:
             self._record_failure(revision, provider_error)
@@ -477,7 +482,7 @@ class AgentRunContextController:
             estimator_version=estimator_version,
         )
         self._checked_preparation_revision = final_revision
-        if final_projection.projected_tokens >= budget.available_context:
+        if budget.exceeds_available_context(final_projection.projected_tokens):
             overflow_error = model_context_overflow_error()
             self._record_failure(final_revision, overflow_error)
             raise overflow_error
@@ -657,7 +662,7 @@ class AgentRunContextController:
             route_values=route_values,
             estimator_version=estimator_version,
         )
-        if protected.projected_tokens >= budget.available_context:
+        if budget.exceeds_available_context(protected.projected_tokens):
             overflow_error = model_context_overflow_error()
             self._record_failure(revision, overflow_error)
             raise overflow_error
@@ -695,12 +700,17 @@ class AgentRunContextController:
             fallback_context_window=route_context_window,
             fallback_max_output=route_max_output,
         )
+        memory_budget = ContextBudget(
+            context_window=memory_context_window,
+            max_output=memory_max_output,
+            compact_ratio=0.9,
+        )
         if pending_fact is None:
             fact_messages = _summary_request_messages(
                 template_name="conversation-compaction-system-prompt.md",
                 selected_payload=selected_payload,
             )
-            if estimate_request_tokens(fact_messages) >= memory_context_window - memory_max_output:
+            if memory_budget.exceeds_available_context(estimate_request_tokens(fact_messages)):
                 overflow_error = model_context_overflow_error()
                 self._record_failure(revision, overflow_error)
                 raise overflow_error
@@ -709,7 +719,7 @@ class AgentRunContextController:
                     "memory",
                     messages=fact_messages,
                     tools=(),
-                    guard=_summary_hard_guard,
+                    guard=_request_hard_guard,
                 )
             except Exception as provider_error:
                 self._record_failure(revision, provider_error)
@@ -746,7 +756,7 @@ class AgentRunContextController:
                 selected_payload,
             ),
         )
-        if estimate_request_tokens(action_messages) >= memory_context_window - memory_max_output:
+        if memory_budget.exceeds_available_context(estimate_request_tokens(action_messages)):
             overflow_error = model_context_overflow_error()
             self._record_failure(revision, overflow_error)
             raise overflow_error
@@ -755,7 +765,7 @@ class AgentRunContextController:
                 "memory",
                 messages=action_messages,
                 tools=(),
-                guard=_summary_hard_guard,
+                guard=_request_hard_guard,
             )
         except Exception as provider_error:
             self._record_failure(revision, provider_error)
@@ -1290,7 +1300,7 @@ class AgentRunContextRouterAdapter:
             messages=messages,
             tools=tools,
             continuation=continuation,
-            guard=_agent_run_hard_guard if guard is None else guard,
+            guard=_request_hard_guard if guard is None else guard,
         )
 
         async def observe() -> AsyncIterator[ModelStreamEvent]:
@@ -1317,7 +1327,7 @@ class AgentRunContextRouterAdapter:
                 messages=messages,
                 tools=tools,
                 continuation=continuation,
-                guard=_agent_run_hard_guard if guard is None else guard,
+                guard=_request_hard_guard if guard is None else guard,
             )
         finally:
             self._remember_call_status(route)
@@ -1534,21 +1544,13 @@ def _summary_response_error(response: ModelResponse) -> ModelCallError | None:
     )
 
 
-def _summary_hard_guard(
+def _request_hard_guard(
     status: ModelRouteStatus,
     messages: ModelMessages,
     tools: Sequence[dict[str, Any]],
 ) -> bool:
-    available_context = status.context_window - status.max_output
-    return estimate_request_tokens(messages, tools) < available_context
-
-
-def _agent_run_hard_guard(
-    status: ModelRouteStatus,
-    messages: ModelMessages,
-    tools: Sequence[dict[str, Any]],
-) -> bool:
-    return _summary_hard_guard(status, messages, tools)
+    budget = ContextBudget(status.context_window, status.max_output, 0.9)
+    return not budget.exceeds_available_context(estimate_request_tokens(messages, tools))
 
 
 def _normalize_action_summary(content: str) -> str | None:

@@ -109,6 +109,7 @@ def test_context_budget_hard_failure_includes_equality() -> None:
 
     assert not budget.exceeds_available_context(89)
     assert budget.exceeds_available_context(90)
+    assert budget.exceeds_available_context(91)
 
 
 def test_request_estimate_counts_canonical_messages_and_tool_schema_delta() -> None:

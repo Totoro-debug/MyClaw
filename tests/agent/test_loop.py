@@ -37,7 +37,7 @@ from myclaw.config.config import ConfigLoader
 from myclaw.errors import MODEL_CONTEXT_OVERFLOW_MESSAGE, ErrorInfo
 from myclaw.logging.session import session_log as real_session_log
 from myclaw.provider.errors import ModelCallError
-from myclaw.provider.model_router import ModelRouter, ModelRouteStatus
+from myclaw.provider.model_router import ModelRouter
 from myclaw.provider.models import (
     AssistantModelMessage,
     ModelCompleted,
@@ -1269,18 +1269,6 @@ timeout = 30
     )
     loop, session, bus = _runtime(tmp_path, model_router, config_text=config)
     persist_calls: list[None] = []
-    attempt_statuses: list[ModelRouteStatus] = []
-    original_guard = compactor_module._agent_run_hard_guard
-
-    def capture_attempt_status(
-        route_status: ModelRouteStatus,
-        messages: Sequence[dict[str, Any]],
-        tools: Sequence[dict[str, Any]],
-    ) -> bool | None:
-        attempt_statuses.append(route_status)
-        return original_guard(route_status, messages, tools)
-
-    monkeypatch.setattr(compactor_module, "_agent_run_hard_guard", capture_attempt_status)
     monkeypatch.setattr(session, "persist", lambda: persist_calls.append(None))
 
     await loop.start()
@@ -1289,7 +1277,10 @@ timeout = 30
         await _terminals(bus, 1)
         assert len(chat_provider.stream_requests) == 1
         assert len(default_provider.stream_requests) == 1
-        assert [status.selected_route for status in attempt_statuses] == ["chat", "default"]
+        chat_attempt = chat_provider.stream_requests[0]
+        fallback_attempt = default_provider.stream_requests[0]
+        assert (chat_attempt.model, chat_attempt.max_output) == ("chat-model", 2048)
+        assert (fallback_attempt.model, fallback_attempt.max_output) == ("default-model", 1024)
         assert persist_calls == [None]
         fallback_context = session.messages[-1]["context_usage"]
         assert fallback_context["selected_route"] == "default"
@@ -1323,21 +1314,19 @@ timeout = 30
         ) == provider_counts
         assert len(persist_calls) == persist_count
 
-        attempt_count = len(attempt_statuses)
         await bus.put_inbound(InboundMessage("Start the next independent run."))
         await _terminals(bus, 1)
 
         assert len(chat_provider.stream_requests) == 2
         assert len(default_provider.stream_requests) == 1
-        assert len(attempt_statuses) == attempt_count + 1
-        next_attempt_status = attempt_statuses[-1]
+        next_context = session.messages[-1]["context_usage"]
         assert (
-            next_attempt_status.requested_route,
-            next_attempt_status.selected_route,
-            next_attempt_status.provider_id,
-            next_attempt_status.model,
-            next_attempt_status.context_window,
-            next_attempt_status.max_output,
+            next_context["requested_route"],
+            next_context["selected_route"],
+            next_context["provider_id"],
+            next_context["model"],
+            next_context["context_window"],
+            next_context["max_output"],
         ) == (
             status_input.requested_route,
             status_input.selected_route,

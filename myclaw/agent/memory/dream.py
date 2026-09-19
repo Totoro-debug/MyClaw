@@ -267,7 +267,7 @@ class Dream:
             },
         ]
         tools = tuple(self._tool_gateway.schemas)
-        if not _request_fits(self._memory_route_status, messages=messages, tools=tools):
+        if not _request_fits(self._memory_route_status, messages, tools):
             overflow = model_context_overflow_error()
             self._capture_terminal_failure(overflow)
             return _model_failure(cursor=claim.cursor, error=overflow.error)
@@ -277,7 +277,7 @@ class Dream:
                 "memory",
                 messages=messages,
                 tools=tools,
-                guard=_memory_attempt_guard,
+                guard=_request_fits,
             )
         except asyncio.CancelledError:
             raise
@@ -345,17 +345,8 @@ def _require_long_term_path(path: str, *, expected: Path) -> None:
         raise ToolError("Memory Tasks may access only Long-term Memory.")
 
 
-def _memory_attempt_guard(
-    route_status: ModelRouteStatus,
-    messages: ModelMessages,
-    tools: Sequence[dict[str, Any]],
-) -> bool:
-    return _request_fits(route_status, messages=messages, tools=tools)
-
-
 def _request_fits(
     route_status: ModelRouteStatus,
-    *,
     messages: ModelMessages,
     tools: Sequence[dict[str, Any]],
 ) -> bool:
