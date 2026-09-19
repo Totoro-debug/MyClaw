@@ -10,6 +10,7 @@ from uuid import uuid4
 
 import pytest
 
+from myclaw.agent.run_errors import CommittableAgentRunError
 from myclaw.agent.runner import (
     AgentRunner,
     AgentRunnerResponseSegmentEnd,
@@ -25,7 +26,7 @@ from myclaw.agent.tools.tool_gateway import (
     ModelToolCall,
     ToolResult,
 )
-from myclaw.errors import ErrorInfo
+from myclaw.errors import TURN_CANCELLED_MESSAGE, ErrorInfo
 from myclaw.provider.errors import ModelCallError
 from myclaw.provider.models import (
     AssistantModelMessage,
@@ -57,6 +58,60 @@ async def _ignore_output(event: object) -> None:
 
 def _runner(router: AgentRunnerRouter) -> AgentRunner:
     return AgentRunner(router, DetachedRequestPreparer())
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("error", "finish_reason"),
+    (
+        (ErrorInfo("model_context_overflow", "summary overflow"), "failed"),
+        (ErrorInfo("turn_cancelled", TURN_CANCELLED_MESSAGE), "cancelled"),
+    ),
+)
+async def test_committable_preparation_failure_forms_terminal_result_without_model_call(
+    error: ErrorInfo,
+    finish_reason: Literal["failed", "cancelled"],
+) -> None:
+    class FailingSummaryPreparer(DetachedRequestPreparer):
+        async def prepare(
+            self,
+            candidate: Sequence[dict[str, Any]],
+            *,
+            increment: Sequence[dict[str, Any]],
+            latest_cycle_start: int | None,
+            tools: Sequence[dict[str, Any]],
+            continuation_revision: int,
+        ) -> list[dict[str, Any]]:
+            del self, candidate, increment, latest_cycle_start, tools, continuation_revision
+            raise CommittableAgentRunError(error)
+
+    provider = ScriptedFakeProvider()
+    result = await AgentRunner(
+        ScriptedFakeRouter(provider),
+        FailingSummaryPreparer(),
+    ).run(
+        [{"role": "user", "content": "request"}],
+        model="chat",
+        tool_gateway=None,
+        on_output=_ignore_output,
+        confirmation=None,
+        externalize_result=None,
+        cancel_requested=None,
+        max_iterations=50,
+    )
+
+    assert result.finish_reason == finish_reason
+    assert result.error == error
+    assert result.usage["model_calls"] == 0
+    if finish_reason == "cancelled":
+        assert result.messages == []
+    else:
+        assert result.messages[-1]["status"] == "error"
+        assert result.messages[-1]["error"] == {
+            "code": error.code,
+            "message": error.message,
+        }
+    assert provider.stream_requests == []
 
 
 @pytest.mark.asyncio

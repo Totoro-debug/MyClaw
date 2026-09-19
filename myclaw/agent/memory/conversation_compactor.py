@@ -8,7 +8,7 @@ from copy import deepcopy
 from dataclasses import dataclass
 from datetime import datetime
 from hashlib import sha256
-from typing import Any, Literal, Protocol, cast
+from typing import Any, Literal, NoReturn, Protocol, cast
 
 from myclaw.agent.context_budget import (
     CONTEXT_ESTIMATOR_VERSION,
@@ -21,6 +21,7 @@ from myclaw.agent.context_budget import (
     project_next_request_tokens,
 )
 from myclaw.agent.memory.manager import MemoryManager
+from myclaw.agent.run_errors import CommittableAgentRunError
 from myclaw.agent.session.session import Session
 from myclaw.errors import TURN_CANCELLED_MESSAGE, ErrorInfo
 from myclaw.provider.errors import ModelCallError, model_context_overflow_error
@@ -361,8 +362,7 @@ class AgentRunContextController:
             )
             if memory_budget.exceeds_available_context(estimate_request_tokens(fact_messages)):
                 overflow_error = model_context_overflow_error()
-                self._record_failure(revision, overflow_error)
-                raise overflow_error
+                self._raise_summary_failure(revision, overflow_error)
 
             try:
                 fact_response = await self._provider.complete(
@@ -371,14 +371,15 @@ class AgentRunContextController:
                     tools=(),
                     guard=_request_hard_guard,
                 )
+            except ModelCallError as provider_error:
+                self._raise_summary_failure(revision, provider_error)
             except Exception as provider_error:
                 self._record_failure(revision, provider_error)
                 raise
             _add_pending_usage(self._pending_compaction_usage, fact_response)
             response_error = _summary_response_error(fact_response)
             if response_error is not None:
-                self._record_failure(revision, response_error)
-                raise response_error
+                self._raise_summary_failure(revision, response_error)
             try:
                 await self._memory_manager.append_summary(
                     content=fact_response.message.content,
@@ -391,8 +392,11 @@ class AgentRunContextController:
                         message="Conversation Summary could not be persisted.",
                     )
                 )
-                self._record_failure(revision, persistence_error)
-                raise persistence_error from persistence_cause
+                self._raise_summary_failure(
+                    revision,
+                    persistence_error,
+                    cause=persistence_cause,
+                )
             self._pending_fact = _PendingFactBatch(
                 batch=tuple(deepcopy(list(batch))),
                 cutoff=cutoff,
@@ -408,8 +412,7 @@ class AgentRunContextController:
         )
         if memory_budget.exceeds_available_context(estimate_request_tokens(action_messages)):
             overflow_error = model_context_overflow_error()
-            self._record_failure(revision, overflow_error)
-            raise overflow_error
+            self._raise_summary_failure(revision, overflow_error)
         try:
             action_response = await self._provider.complete(
                 "memory",
@@ -417,14 +420,15 @@ class AgentRunContextController:
                 tools=(),
                 guard=_request_hard_guard,
             )
+        except ModelCallError as provider_error:
+            self._raise_summary_failure(revision, provider_error)
         except Exception as provider_error:
             self._record_failure(revision, provider_error)
             raise
         _add_pending_usage(self._pending_compaction_usage, action_response)
         response_error = _summary_response_error(action_response)
         if response_error is not None:
-            self._record_failure(revision, response_error)
-            raise response_error
+            self._raise_summary_failure(revision, response_error)
         self._pending_action_summary = _normalize_action_summary(action_response.message.content)
         self._pending_last_compacted = cutoff
         self._pending_fact = None
@@ -679,8 +683,7 @@ class AgentRunContextController:
             )
             if memory_budget.exceeds_available_context(estimate_request_tokens(fact_messages)):
                 overflow_error = model_context_overflow_error()
-                self._record_failure(revision, overflow_error)
-                raise overflow_error
+                self._raise_summary_failure(revision, overflow_error)
             try:
                 fact_response = await self._provider.complete(
                     "memory",
@@ -688,14 +691,15 @@ class AgentRunContextController:
                     tools=(),
                     guard=_request_hard_guard,
                 )
+            except ModelCallError as provider_error:
+                self._raise_summary_failure(revision, provider_error)
             except Exception as provider_error:
                 self._record_failure(revision, provider_error)
                 raise
             _add_pending_usage(self._pending_compaction_usage, fact_response)
             response_error = _summary_response_error(fact_response)
             if response_error is not None:
-                self._record_failure(revision, response_error)
-                raise response_error
+                self._raise_summary_failure(revision, response_error)
             try:
                 await self._memory_manager.append_summary(
                     content=fact_response.message.content,
@@ -708,8 +712,11 @@ class AgentRunContextController:
                         message="Conversation Summary could not be persisted.",
                     )
                 )
-                self._record_failure(revision, persistence_error)
-                raise persistence_error from persistence_cause
+                self._raise_summary_failure(
+                    revision,
+                    persistence_error,
+                    cause=persistence_cause,
+                )
             self._pending_fact = _PendingFactBatch(
                 batch=tuple(deepcopy(list(batch))),
                 cutoff=cutoff,
@@ -725,8 +732,7 @@ class AgentRunContextController:
         )
         if memory_budget.exceeds_available_context(estimate_request_tokens(action_messages)):
             overflow_error = model_context_overflow_error()
-            self._record_failure(revision, overflow_error)
-            raise overflow_error
+            self._raise_summary_failure(revision, overflow_error)
         try:
             action_response = await self._provider.complete(
                 "memory",
@@ -734,14 +740,15 @@ class AgentRunContextController:
                 tools=(),
                 guard=_request_hard_guard,
             )
+        except ModelCallError as provider_error:
+            self._raise_summary_failure(revision, provider_error)
         except Exception as provider_error:
             self._record_failure(revision, provider_error)
             raise
         _add_pending_usage(self._pending_compaction_usage, action_response)
         response_error = _summary_response_error(action_response)
         if response_error is not None:
-            self._record_failure(revision, response_error)
-            raise response_error
+            self._raise_summary_failure(revision, response_error)
 
         self._pending_action_summary = _normalize_action_summary(action_response.message.content)
         self._pending_last_compacted = cutoff
@@ -965,6 +972,17 @@ class AgentRunContextController:
         self._checked_preparation_revision = revision
         self._failed_context_revision = revision
         self._failed_exception = error
+
+    def _raise_summary_failure(
+        self,
+        revision: str,
+        failure: ModelCallError,
+        *,
+        cause: BaseException | None = None,
+    ) -> NoReturn:
+        committable = CommittableAgentRunError(failure.error)
+        self._record_failure(revision, committable)
+        raise committable from (failure if cause is None else cause)
 
     def _select_run_start_batch(
         self, budget: ContextBudget

@@ -31,6 +31,7 @@ from myclaw.agent.message_bus import (
     OutboundMessage,
     OutboundMessageType,
 )
+from myclaw.agent.run_errors import CommittableAgentRunError
 from myclaw.agent.runner import (
     AgentRunner,
     AgentRunnerResponseSegmentEnd,
@@ -739,6 +740,10 @@ class AgentLoop:
             if not self._aborted:
                 self._commit_schedule_run(session, run_context, [current_user], job=job)
             raise
+        except CommittableAgentRunError as failure:
+            if self._aborted:
+                raise asyncio.CancelledError() from None
+            self._commit_schedule_failure(session, run_context, current_user, failure.error, job)
         except ModelCallError as failure:
             if self._aborted:
                 raise asyncio.CancelledError() from None
@@ -929,11 +934,16 @@ class AgentLoop:
             [
                 deepcopy(current_user),
                 _build_assistant_repair_message(
-                    content="", status="error", error=error, model_calls=0
+                    content=(TURN_CANCELLED_MESSAGE if error.code == "turn_cancelled" else ""),
+                    status="interrupted" if error.code == "turn_cancelled" else "error",
+                    error=error,
+                    model_calls=0,
                 ),
             ],
             job=job,
         )
+        if error.code == "turn_cancelled":
+            raise asyncio.CancelledError()
         raise ScheduleJobExecutionError(error)
 
     def respond_to_confirmation(
@@ -1128,6 +1138,16 @@ class AgentLoop:
                 run_context,
                 current_user,
                 error=ErrorInfo("turn_cancelled", TURN_CANCELLED_MESSAGE),
+                framing_usage=framing_usage,
+                metadata_updates=metadata_patch()[0],
+                metadata_removals=metadata_patch()[1],
+            )
+        except CommittableAgentRunError as failure:
+            return await self._finish_foreground_terminal(
+                active_session,
+                run_context,
+                current_user,
+                error=failure.error,
                 framing_usage=framing_usage,
                 metadata_updates=metadata_patch()[0],
                 metadata_removals=metadata_patch()[1],

@@ -10,6 +10,7 @@ from typing import Any, ClassVar, Literal, Protocol, cast
 
 from loguru import logger
 
+from myclaw.agent.run_errors import CommittableAgentRunError
 from myclaw.agent.tools.tool_gateway import (
     ConfirmationRequester,
     ModelToolCall,
@@ -578,7 +579,11 @@ class AgentRunner:
             if failure.error.code == "turn_cancelled" or is_cancel_requested():
                 cancelled_content = "".join(partial_content)
                 return finish_cancelled(final_content=cancelled_content)
-            if failure.error.code == "model_context_overflow" and usage["model_calls"] == 0:
+            if (
+                failure.error.code == "model_context_overflow"
+                and usage["model_calls"] == 0
+                and not isinstance(failure, CommittableAgentRunError)
+            ):
                 raise
             _log_agent_failure(failure)
             failed_content = "".join(partial_content) if model == "chat" else ""

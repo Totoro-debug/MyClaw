@@ -18,6 +18,7 @@ from myclaw.agent.memory.conversation_compactor import (
     latest_main_agent_usage_anchor,
 )
 from myclaw.agent.memory.manager import MemoryManager
+from myclaw.agent.run_errors import CommittableAgentRunError
 from myclaw.agent.runner import AgentRunner
 from myclaw.agent.session.session import Session
 from myclaw.agent.tools.tool_gateway import ModelToolCall, ToolResult
@@ -30,7 +31,7 @@ from myclaw.config.config import (
     RuntimeConfiguration,
     UserConfiguration,
 )
-from myclaw.errors import ErrorInfo
+from myclaw.errors import MODEL_CONTEXT_OVERFLOW_MESSAGE, ErrorInfo
 from myclaw.provider.errors import ModelCallError
 from myclaw.provider.model_router import ModelRouter, ModelRouteStatus
 from myclaw.provider.models import (
@@ -1220,14 +1221,14 @@ async def test_fact_model_failure_does_not_stage_cursor_action_or_summary(
     provider = ScriptedFakeProvider(completions=(failure,))
     controller = _controller(workspace, session, provider)
 
-    with pytest.raises(ModelCallError):
+    with pytest.raises(CommittableAgentRunError) as raised:
         await _prepare_controller(
             controller,
             context_window=1_000,
             max_output=200,
             memory_route_status=_memory_status(context_window=4_000),
         )
-    with pytest.raises(ModelCallError):
+    with pytest.raises(CommittableAgentRunError) as repeated:
         await _prepare_controller(
             controller,
             context_window=1_000,
@@ -1241,6 +1242,8 @@ async def test_fact_model_failure_does_not_stage_cursor_action_or_summary(
     assert terminal.usage_delta["model_calls"] == 0
     assert not (state.memory_directory / "summary.jsonl").exists()
     assert len(provider.complete_requests) == 1
+    assert raised.value.__cause__ is failure
+    assert repeated.value is raised.value
 
 
 @pytest.mark.asyncio
@@ -1257,7 +1260,7 @@ async def test_fact_persistence_failure_keeps_batch_uncommitted_but_stages_usage
     )
     controller = _controller(workspace, session, provider)
 
-    with pytest.raises(ModelCallError, match="could not be persisted"):
+    with pytest.raises(CommittableAgentRunError, match="could not be persisted") as raised:
         await _prepare_controller(
             controller,
             context_window=1_000,
@@ -1275,6 +1278,7 @@ async def test_fact_persistence_failure_keeps_batch_uncommitted_but_stages_usage
         "total_tokens": 10,
     }
     assert len(provider.complete_requests) == 1
+    assert isinstance(raised.value.__cause__, OSError)
 
 
 @pytest.mark.asyncio
@@ -1296,19 +1300,26 @@ async def test_action_failure_keeps_fact_and_earlier_staged_state_without_advanc
         "memory_route_status": _memory_status(context_window=4_000),
     }
 
-    with pytest.raises(ModelCallError):
+    with pytest.raises(CommittableAgentRunError) as raised:
         await _prepare_controller(controller, **kwargs)
 
     failed_values = controller.terminal_commit_values()
     assert failed_values.pending_last_compacted == 0
     assert failed_values.pending_action_summary == "previous action"
-    assert failed_values.usage_delta["model_calls"] == 1
+    assert failed_values.usage_delta == {
+        "model_calls": 1,
+        "input_tokens": 20,
+        "output_tokens": 5,
+        "total_tokens": 25,
+    }
     assert "facts" in (state.memory_directory / "summary.jsonl").read_text(encoding="utf-8")
     assert len(provider.complete_requests) == 2
+    assert raised.value.__cause__ is failure
 
-    with pytest.raises(ModelCallError):
+    with pytest.raises(CommittableAgentRunError) as repeated:
         await _prepare_controller(controller, **kwargs)
     assert len(provider.complete_requests) == 2
+    assert repeated.value is raised.value
 
     recovered = await _prepare_controller(controller, current_user="changed user", **kwargs)
 
@@ -1344,7 +1355,7 @@ async def test_action_finish_failure_keeps_orphan_fact_and_usage_without_advanci
     provider = ScriptedFakeProvider(completions=(_response("facts"), action_response))
     controller = _controller(workspace, session, provider)
 
-    with pytest.raises(ModelCallError) as raised:
+    with pytest.raises(CommittableAgentRunError) as raised:
         await _prepare_controller(
             controller,
             context_window=1_000,
@@ -1381,13 +1392,15 @@ async def test_summary_hard_overflow_is_rejected_before_provider_call(
         "memory_route_status": _memory_status(context_window=20, max_output=10),
     }
 
-    with pytest.raises(ModelCallError) as raised:
+    with pytest.raises(CommittableAgentRunError) as raised:
         await _prepare_controller(controller, **kwargs)
-    with pytest.raises(ModelCallError) as repeated:
+    with pytest.raises(CommittableAgentRunError) as repeated:
         await _prepare_controller(controller, **kwargs)
 
     assert raised.value.error.code == "model_context_overflow"
+    assert raised.value.error.message == MODEL_CONTEXT_OVERFLOW_MESSAGE
     assert repeated.value is raised.value
+    assert isinstance(raised.value.__cause__, ModelCallError)
     assert provider.complete_requests == []
 
 
@@ -1411,6 +1424,7 @@ async def test_action_replacement_is_checked_against_the_final_hard_limit(
         await _prepare_controller(controller, **kwargs)
 
     assert raised.value.error.code == "model_context_overflow"
+    assert not isinstance(raised.value, CommittableAgentRunError)
     terminal = controller.terminal_commit_values()
     assert terminal.pending_last_compacted == len(session.messages)
     assert terminal.pending_action_summary == oversized_action
@@ -1783,10 +1797,12 @@ async def test_react_revision_changes_for_each_model_visible_input_source(
         "memory_route_status": _memory_status(context_window=4_000),
         "continuation_revision": 0,
     }
-    with pytest.raises(ModelCallError, match="summary failed"):
+    with pytest.raises(CommittableAgentRunError, match="summary failed") as raised:
         await controller.prepare_react(**base)
-    with pytest.raises(ModelCallError, match="summary failed"):
+    with pytest.raises(CommittableAgentRunError, match="summary failed") as repeated:
         await controller.prepare_react(**base)
+    assert repeated.value is raised.value
+    assert raised.value.__cause__ is failure
     assert len(provider.complete_requests) == 1
 
     changed = dict(base)

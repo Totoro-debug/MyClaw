@@ -26,6 +26,7 @@ from myclaw.agent.context_budget import estimate_request_tokens
 from myclaw.agent.loop import AgentLoop, ConfirmationRequestView, ModelContextOverflowError
 from myclaw.agent.memory.manager import MemoryManager
 from myclaw.agent.message_bus import InboundMessage, MessageBus, OutboundMessage
+from myclaw.agent.run_errors import CommittableAgentRunError
 from myclaw.agent.runner import AgentRunner, AgentRunnerResult, AgentRunnerRouter
 from myclaw.agent.session.session import Session
 from myclaw.agent.tools.base import BaseTool
@@ -34,7 +35,7 @@ from myclaw.agent.tools.tool_gateway import ModelToolCall, ToolGateway
 from myclaw.agent.workspace_state import WorkspaceState
 from myclaw.config.agent_home import AgentHome
 from myclaw.config.config import ConfigLoader
-from myclaw.errors import MODEL_CONTEXT_OVERFLOW_MESSAGE, ErrorInfo
+from myclaw.errors import MODEL_CONTEXT_OVERFLOW_MESSAGE, TURN_CANCELLED_MESSAGE, ErrorInfo
 from myclaw.logging.session import session_log as real_session_log
 from myclaw.provider.errors import ModelCallError
 from myclaw.provider.model_router import ModelRouter
@@ -2333,6 +2334,7 @@ async def test_loop_preparation_failure_has_no_session_commit_and_fifo_continues
 @pytest.mark.asyncio
 async def test_foreground_run_start_hard_overflow_does_not_commit_or_call_provider(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     config = MINIMAL_VALID_CONFIG.replace(
         "context_window = 200000", "context_window = 8192"
@@ -2341,6 +2343,19 @@ async def test_foreground_run_start_hard_overflow_does_not_commit_or_call_provid
     loop, session, bus = _runtime(tmp_path, router, config_text=config)
     messages_before = deepcopy(session.messages)
     metadata_before = deepcopy(session.metadata)
+    commit_calls = 0
+    original_commit = Session.commit_agent_run
+
+    def commit_agent_run(
+        active: Session,
+        messages: list[dict[str, Any]],
+        **kwargs: Any,
+    ) -> None:
+        nonlocal commit_calls
+        commit_calls += 1
+        original_commit(active, messages, **kwargs)
+
+    monkeypatch.setattr(Session, "commit_agent_run", commit_agent_run)
 
     await loop.start()
     try:
@@ -2353,7 +2368,131 @@ async def test_foreground_run_start_hard_overflow_does_not_commit_or_call_provid
     assert session.messages == messages_before
     assert session.metadata == metadata_before
     assert router.calls == []
+    assert commit_calls == 0
     assert not (session.workspace_state.sessions_directory / f"{session.session_id}.jsonl").exists()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("stage", "error"),
+    (
+        (
+            "run_start",
+            ErrorInfo("model_context_overflow", MODEL_CONTEXT_OVERFLOW_MESSAGE),
+        ),
+        ("react", ErrorInfo("provider_unavailable", "Summary provider failed.")),
+    ),
+)
+async def test_foreground_commits_summary_failure_once(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    stage: Literal["run_start", "react"],
+    error: ErrorInfo,
+) -> None:
+    router = _Router(())
+    loop, session, bus = _runtime(tmp_path, router)
+    failure = CommittableAgentRunError(error)
+    commit_calls = 0
+    original_commit = Session.commit_agent_run
+
+    def commit_agent_run(
+        active: Session,
+        messages: list[dict[str, Any]],
+        **kwargs: Any,
+    ) -> None:
+        nonlocal commit_calls
+        commit_calls += 1
+        original_commit(active, messages, **kwargs)
+
+    async def fail_run_start(
+        context: Any,
+        *,
+        tool_gateway: ToolGateway,
+    ) -> list[dict[str, Any]]:
+        del context, tool_gateway
+        raise failure
+
+    async def fail_react(*args: Any, **kwargs: Any) -> list[dict[str, Any]]:
+        del args, kwargs
+        raise failure
+
+    monkeypatch.setattr(Session, "commit_agent_run", commit_agent_run)
+    if stage == "run_start":
+        object.__setattr__(loop, "_prepare_agent_run", fail_run_start)
+    else:
+        monkeypatch.setattr(
+            compactor_module.AgentRunContextRequestPreparer,
+            "prepare",
+            fail_react,
+        )
+
+    await loop.start()
+    try:
+        await bus.put_inbound(InboundMessage("summary failure"))
+        terminal = (await _terminals(bus, 1))[0]
+    finally:
+        await loop.close()
+
+    assert terminal.content == error.message
+    assert terminal.metadata == {
+        "finish_reason": "failed",
+        "error_code": error.code,
+        "_streamed": True,
+    }
+    assert commit_calls == 1
+    assert router.calls == []
+    assert [message["role"] for message in session.messages] == ["user", "assistant"]
+    assert session.messages[-1]["status"] == "error"
+    assert session.messages[-1]["error"] == {
+        "code": error.code,
+        "message": error.message,
+    }
+
+
+@pytest.mark.asyncio
+async def test_foreground_commits_cancelled_summary_failure_once(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    loop, session, bus = _runtime(tmp_path, _Router(()))
+    error = ErrorInfo("turn_cancelled", TURN_CANCELLED_MESSAGE)
+    commit_calls = 0
+    original_commit = Session.commit_agent_run
+
+    def commit_agent_run(
+        active: Session,
+        messages: list[dict[str, Any]],
+        **kwargs: Any,
+    ) -> None:
+        nonlocal commit_calls
+        commit_calls += 1
+        original_commit(active, messages, **kwargs)
+
+    async def fail_run_start(
+        context: Any,
+        *,
+        tool_gateway: ToolGateway,
+    ) -> list[dict[str, Any]]:
+        del context, tool_gateway
+        raise CommittableAgentRunError(error)
+
+    monkeypatch.setattr(Session, "commit_agent_run", commit_agent_run)
+    object.__setattr__(loop, "_prepare_agent_run", fail_run_start)
+
+    await loop.start()
+    try:
+        await bus.put_inbound(InboundMessage("cancelled summary"))
+        terminal = (await _terminals(bus, 1))[0]
+    finally:
+        await loop.close()
+
+    assert terminal.metadata == {
+        "finish_reason": "cancelled",
+        "error_code": "turn_cancelled",
+        "_streamed": True,
+    }
+    assert commit_calls == 1
+    assert session.messages[-1]["status"] == "interrupted"
 
 
 @pytest.mark.asyncio

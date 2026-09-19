@@ -12,9 +12,11 @@ from uuid import UUID
 import pytest
 from mcp.types import CallToolResult
 
+import myclaw.agent.memory.conversation_compactor as compactor_module
 from myclaw.agent.loop import AgentLoop
 from myclaw.agent.memory.manager import MemoryManager
 from myclaw.agent.message_bus import InboundMessage, MessageBus
+from myclaw.agent.run_errors import CommittableAgentRunError
 from myclaw.agent.runner import AgentRunner, AgentRunnerResult
 from myclaw.agent.session.session import Session, SessionStoragePartition
 from myclaw.agent.tools.base import BaseTool
@@ -24,7 +26,7 @@ from myclaw.agent.tools.tool_gateway import ModelToolCall, ToolGateway, ToolResu
 from myclaw.agent.workspace_state import WorkspaceState
 from myclaw.config.agent_home import AgentHome
 from myclaw.config.config import ConfigLoader
-from myclaw.errors import ErrorInfo
+from myclaw.errors import MODEL_CONTEXT_OVERFLOW_MESSAGE, TURN_CANCELLED_MESSAGE, ErrorInfo
 from myclaw.provider.errors import ModelCallError
 from myclaw.provider.models import (
     AssistantModelMessage,
@@ -898,19 +900,155 @@ async def test_schedule_context_preparation_failures_preserve_cancel(
 @pytest.mark.asyncio
 async def test_schedule_run_start_hard_overflow_does_not_commit_or_call_provider(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     config = MINIMAL_VALID_CONFIG.replace("max_output = 1024", "max_output = 7000")
     router = _ScheduleRouter()
     loop, state, _, bus = _loop(tmp_path, router, config_text=config)
     job = replace(_job(), message="x" * 20_000)
+    commit_calls = 0
+    original_commit = Session.commit_agent_run
+
+    def commit_agent_run(
+        active: Session,
+        messages: list[dict[str, Any]],
+        **kwargs: Any,
+    ) -> None:
+        nonlocal commit_calls
+        commit_calls += 1
+        original_commit(active, messages, **kwargs)
+
+    monkeypatch.setattr(Session, "commit_agent_run", commit_agent_run)
 
     with pytest.raises(ScheduleJobExecutionError) as raised:
         await loop.run_schedule_job(job)
 
     assert raised.value.error.code == "model_context_overflow"
     assert router.routes == []
+    assert commit_calls == 0
     await _assert_no_outbound(bus)
     assert not (state.schedule_sessions_directory / f"schedule_{JOB_ID}.jsonl").exists()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("stage", "error"),
+    (
+        ("run_start", ErrorInfo("provider_unavailable", "Summary provider failed.")),
+        (
+            "react",
+            ErrorInfo("model_context_overflow", MODEL_CONTEXT_OVERFLOW_MESSAGE),
+        ),
+    ),
+)
+async def test_schedule_commits_summary_failure_once(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    stage: Literal["run_start", "react"],
+    error: ErrorInfo,
+) -> None:
+    router = _ScheduleRouter()
+    loop, state, _, bus = _loop(tmp_path, router)
+    failure = CommittableAgentRunError(error)
+    commit_calls = 0
+    original_commit = Session.commit_agent_run
+
+    def commit_agent_run(
+        active: Session,
+        messages: list[dict[str, Any]],
+        **kwargs: Any,
+    ) -> None:
+        nonlocal commit_calls
+        commit_calls += 1
+        original_commit(active, messages, **kwargs)
+
+    async def fail_run_start(
+        context: Any,
+        *,
+        tool_gateway: ToolGateway,
+    ) -> list[dict[str, Any]]:
+        del context, tool_gateway
+        raise failure
+
+    async def fail_react(*args: Any, **kwargs: Any) -> list[dict[str, Any]]:
+        del args, kwargs
+        raise failure
+
+    monkeypatch.setattr(Session, "commit_agent_run", commit_agent_run)
+    if stage == "run_start":
+        object.__setattr__(loop, "_prepare_agent_run", fail_run_start)
+    else:
+        monkeypatch.setattr(
+            compactor_module.AgentRunContextRequestPreparer,
+            "prepare",
+            fail_react,
+        )
+
+    with pytest.raises(ScheduleJobExecutionError) as raised:
+        await loop.run_schedule_job(_job())
+
+    assert raised.value.error == error
+    assert commit_calls == 1
+    assert router.routes == []
+    await _assert_no_outbound(bus)
+    schedule_session = Session.load(
+        state,
+        f"schedule_{JOB_ID}",
+        partition=SessionStoragePartition.SCHEDULE,
+    )
+    assert [message["role"] for message in schedule_session.messages] == ["user", "assistant"]
+    assert schedule_session.messages[-1]["status"] == "error"
+    assert schedule_session.messages[-1]["error"] == {
+        "code": error.code,
+        "message": error.message,
+    }
+
+
+@pytest.mark.asyncio
+async def test_schedule_commits_cancelled_summary_failure_once(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    loop, state, _, bus = _loop(tmp_path, _ScheduleRouter())
+    error = ErrorInfo("turn_cancelled", TURN_CANCELLED_MESSAGE)
+    commit_calls = 0
+    original_commit = Session.commit_agent_run
+
+    def commit_agent_run(
+        active: Session,
+        messages: list[dict[str, Any]],
+        **kwargs: Any,
+    ) -> None:
+        nonlocal commit_calls
+        commit_calls += 1
+        original_commit(active, messages, **kwargs)
+
+    async def fail_run_start(
+        context: Any,
+        *,
+        tool_gateway: ToolGateway,
+    ) -> list[dict[str, Any]]:
+        del context, tool_gateway
+        raise CommittableAgentRunError(error)
+
+    monkeypatch.setattr(Session, "commit_agent_run", commit_agent_run)
+    object.__setattr__(loop, "_prepare_agent_run", fail_run_start)
+
+    with pytest.raises(asyncio.CancelledError):
+        await loop.run_schedule_job(_job())
+
+    assert commit_calls == 1
+    await _assert_no_outbound(bus)
+    schedule_session = Session.load(
+        state,
+        f"schedule_{JOB_ID}",
+        partition=SessionStoragePartition.SCHEDULE,
+    )
+    assert schedule_session.messages[-1]["status"] == "interrupted"
+    assert schedule_session.messages[-1]["error"] == {
+        "code": error.code,
+        "message": error.message,
+    }
 
 
 def _tool_response(
