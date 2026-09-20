@@ -25,6 +25,9 @@ _CLI_TOOL_IMPORTS = frozenset(
         ("myclaw.agent.tools.tool_gateway", "BUILT_IN_TOOL_NAMES"),
     }
 )
+_TOOL_EXECUTION_DISPATCH_METHODS = frozenset(
+    {"execute_prepared", "execute_authorized"}
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -191,6 +194,27 @@ def _terminal_tool_import_violations(
     return tuple(violations)
 
 
+def _tool_execution_dispatch_violations(
+    sources: Mapping[Path, str],
+    *,
+    allowed_dispatchers: frozenset[Path],
+) -> tuple[str, ...]:
+    violations: list[str] = []
+    for path in sorted(sources, key=str):
+        if path in allowed_dispatchers:
+            continue
+        tree = ast.parse(sources[path], filename=str(path))
+        display_path = path.relative_to(PROJECT_ROOT) if path.is_absolute() else path
+        violations.extend(
+            f"{display_path}:{node.lineno} calls {node.func.attr}"
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr in _TOOL_EXECUTION_DISPATCH_METHODS
+        )
+    return tuple(violations)
+
+
 def _retired_mcp_runtime_import_violations(sources: Mapping[Path, str]) -> tuple[str, ...]:
     violations: list[str] = []
     for path in sorted(sources, key=str):
@@ -240,6 +264,47 @@ def test_production_code_does_not_import_removed_contracts_package() -> None:
     ]
 
     assert violations == []
+
+
+def test_production_tool_execution_dispatch_has_one_gateway_boundary() -> None:
+    sources = {
+        path: path.read_text(encoding="utf-8") for path in _python_files(PACKAGE_ROOT)
+    }
+    violations = _tool_execution_dispatch_violations(
+        sources,
+        allowed_dispatchers=frozenset(
+            {
+                PACKAGE_ROOT / "agent" / "tools" / "base.py",
+                PACKAGE_ROOT / "agent" / "tools" / "tool_gateway.py",
+            }
+        ),
+    )
+
+    assert violations == ()
+
+
+@pytest.mark.parametrize("method", sorted(_TOOL_EXECUTION_DISPATCH_METHODS))
+def test_tool_execution_dispatch_checker_rejects_gateway_bypasses(method: str) -> None:
+    path = Path("myclaw/agent/bypass.py")
+    source = f"async def bypass(tool):\n    await tool.{method}({{}})"
+
+    assert _tool_execution_dispatch_violations(
+        {path: source},
+        allowed_dispatchers=frozenset(),
+    ) == (f"{path}:2 calls {method}",)
+
+
+def test_tool_execution_dispatch_checker_allows_unrelated_execute_methods() -> None:
+    path = Path("myclaw/agent/host_adapter.py")
+    source = "async def run(adapter):\n    await adapter.execute()"
+
+    assert (
+        _tool_execution_dispatch_violations(
+            {path: source},
+            allowed_dispatchers=frozenset(),
+        )
+        == ()
+    )
 
 
 @pytest.mark.parametrize("root", [PACKAGE_ROOT / "utils", PACKAGE_ROOT / "errors.py"])

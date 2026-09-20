@@ -29,6 +29,11 @@ from myclaw.agent.tools.core.web_fetch import WebFetchTool
 from myclaw.agent.tools.core.web_search import WebSearchTool
 from myclaw.agent.tools.core.write_file import WriteFileTool
 from myclaw.agent.tools.mcp import MCPTool
+from myclaw.agent.tools.permission import (
+    PermissionContext,
+    ToolAuthorizationSession,
+    ToolPermissionPolicy,
+)
 from myclaw.schedule.service import ScheduleService
 from myclaw.utils.validation import require_uuid4
 
@@ -201,6 +206,8 @@ class ToolGateway:
         schedule_service: ScheduleService,
         skill_root: Path | None = None,
         additional_tools: Sequence[BaseTool] = (),
+        permission_policy: ToolPermissionPolicy | None = None,
+        permission_context: PermissionContext | None = None,
     ) -> None:
         if not isinstance(workspace, Path):
             raise TypeError("Tool Gateway requires a Path")
@@ -229,6 +236,14 @@ class ToolGateway:
         self._tools = {tool.name: tool for tool in tools}
         self._exposed_names = tuple(tool.name for tool in tools)
         self._failure_observer: Callable[[Exception], None] | None = None
+        self._permission_policy = (
+            ToolPermissionPolicy() if permission_policy is None else permission_policy
+        )
+        self._permission_context = (
+            PermissionContext(workspace_root=workspace)
+            if permission_context is None
+            else permission_context
+        )
 
     def for_run(
         self,
@@ -236,6 +251,8 @@ class ToolGateway:
         exposed_names: Collection[str],
         excluded_names: Collection[str] = (),
         run_tools: Sequence[BaseTool] = (),
+        permission_policy: ToolPermissionPolicy | None = None,
+        permission_context: PermissionContext | None = None,
     ) -> ToolGateway:
         """Create an isolated Run view over this Gateway's reusable Tool instances."""
         excluded = _normalize_tool_names(excluded_names, label="Excluded Tool names")
@@ -261,6 +278,12 @@ class ToolGateway:
             catalog,
             exposed_names=exposure,
             on_failure=self._failure_observer,
+            permission_policy=(
+                self._permission_policy if permission_policy is None else permission_policy
+            ),
+            permission_context=(
+                self._permission_context if permission_context is None else permission_context
+            ),
         )
 
     @classmethod
@@ -270,12 +293,20 @@ class ToolGateway:
         *,
         exposed_names: tuple[str, ...],
         on_failure: Callable[[Exception], None] | None,
+        permission_policy: ToolPermissionPolicy | None = None,
+        permission_context: PermissionContext | None = None,
     ) -> ToolGateway:
         gateway = object.__new__(cls)
         gateway._catalog = catalog
         gateway._tools = {tool.name: tool for tool in catalog}
         gateway._exposed_names = exposed_names
         gateway._failure_observer = on_failure
+        gateway._permission_policy = (
+            ToolPermissionPolicy() if permission_policy is None else permission_policy
+        )
+        gateway._permission_context = (
+            PermissionContext() if permission_context is None else permission_context
+        )
         return gateway
 
     @property
@@ -313,6 +344,8 @@ class ToolGateway:
         tools: tuple[BaseTool, ...],
         *,
         on_failure: Callable[[Exception], None] | None = None,
+        permission_policy: ToolPermissionPolicy | None = None,
+        permission_context: PermissionContext | None = None,
     ) -> ToolGateway:
         """Build the isolated Long-term Memory catalog without widening the public API."""
         if not tools or len({tool.name for tool in tools}) != len(tools):
@@ -322,6 +355,8 @@ class ToolGateway:
             catalog,
             exposed_names=tuple(tool.name for tool in catalog),
             on_failure=on_failure,
+            permission_policy=permission_policy,
+            permission_context=permission_context,
         )
 
     @property
@@ -381,8 +416,32 @@ class ToolGateway:
         if refusal is not None:
             return _result(tool_call, "refused", refusal)
 
-        if safety_reason is None:
-            return await self._execute(tool_call, tool, prepared_arguments, confirmation=None)
+        try:
+            facts = tool.build_invocation_facts(
+                prepared_arguments,
+                safety_reason=safety_reason,
+            )
+            authorization = self._permission_policy.open(facts, self._permission_context)
+            authorization_decision = authorization.initial_decision()
+        except asyncio.CancelledError:
+            raise
+        except ToolError as error:
+            return _result(tool_call, "error", error.message)
+        except Exception as error:
+            self._record_unexpected_failure(tool, error)
+            return _result(tool_call, "error", _generic_tool_failure(tool.name))
+
+        if authorization_decision not in {"direct", "confirm"}:
+            return _result(tool_call, "error", "Tool authorization returned an invalid decision.")
+
+        if authorization_decision == "direct":
+            return await self._execute(
+                tool_call,
+                tool,
+                prepared_arguments,
+                authorization=authorization,
+                confirmation=None,
+            )
 
         try:
             confirmation_details = cast(
@@ -395,7 +454,11 @@ class ToolGateway:
                 confirmation_id=uuid4(),
                 tool_call_id=tool_call.id,
                 tool_name=tool_call.name,
-                reason=safety_reason,
+                reason=(
+                    facts.legacy_safety_reason
+                    if facts.legacy_safety_reason is not None
+                    else "Tool confirmation is required."
+                ),
                 summary=f"Confirm {tool.name}"[:240],
                 details=confirmation_details,
             )
@@ -416,7 +479,7 @@ class ToolGateway:
             )
 
         try:
-            decision = await confirmation(request)
+            confirmation_decision = await confirmation(request)
         except asyncio.CancelledError:
             raise
         except Exception as error:
@@ -427,22 +490,28 @@ class ToolGateway:
                 request=request,
                 decision=None,
             )
-        if decision not in {"approved", "declined"}:
+        if confirmation_decision not in {"approved", "declined"}:
             return _refused_confirmation_result(
                 tool_call,
                 "Tool confirmation was expired or invalid.",
                 request=request,
                 decision=None,
             )
-        metadata = ToolConfirmationMetadata(request=request, decision=decision)
-        if decision == "declined":
+        metadata = ToolConfirmationMetadata(request=request, decision=confirmation_decision)
+        if confirmation_decision == "declined":
             return _result(
                 tool_call,
                 "refused",
                 "Tool confirmation was declined.",
                 confirmation=metadata,
             )
-        return await self._execute(tool_call, tool, prepared_arguments, confirmation=metadata)
+        return await self._execute(
+            tool_call,
+            tool,
+            prepared_arguments,
+            authorization=authorization,
+            confirmation=metadata,
+        )
 
     @staticmethod
     def _refusal_reason(tool: BaseTool, prepared_arguments: dict[str, Any]) -> str | None:
@@ -460,10 +529,14 @@ class ToolGateway:
         tool: BaseTool,
         prepared_arguments: dict[str, Any],
         *,
+        authorization: ToolAuthorizationSession,
         confirmation: ToolConfirmationMetadata | None,
     ) -> ToolResult:
         try:
-            content = await tool.execute_prepared(deepcopy(prepared_arguments))
+            content = await tool.execute_authorized(
+                deepcopy(prepared_arguments),
+                authorization,
+            )
             if not isinstance(content, str):
                 raise TypeError("Tool execution must return a string")
         except asyncio.CancelledError:

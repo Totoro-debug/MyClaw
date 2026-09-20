@@ -26,6 +26,7 @@ from uuid import uuid4
 
 from loguru import logger
 
+from myclaw.agent.tools.permission import ToolAuthorizationSession, ToolInvocationFacts
 from myclaw.agent.tools.schema import Schema, ToolParam
 from myclaw.utils.validation import require_nonnegative_int
 
@@ -231,6 +232,15 @@ class BaseTool(ABC, metaclass=_BaseToolMeta):
         """Execute one prepared argument dictionary through the Built-in Tool seam."""
         return await self.execute(**deepcopy(arguments))
 
+    async def execute_authorized(
+        self,
+        arguments: dict[str, Any],
+        authorization: ToolAuthorizationSession,
+    ) -> str:
+        """Execute one prepared call while retaining its per-call authorization boundary."""
+        del authorization
+        return await self.execute_prepared(arguments)
+
     @final
     def resolve_path_argument(
         self,
@@ -350,6 +360,19 @@ class BaseTool(ABC, metaclass=_BaseToolMeta):
         if safety is not None and not isinstance(safety, str):
             raise TypeError("Tool safety checks must return a string reason or None")
         return prepared_arguments, safety if isinstance(safety, str) else None
+
+    def build_invocation_facts(
+        self,
+        prepared_arguments: dict[str, Any],
+        *,
+        safety_reason: str | None,
+    ) -> ToolInvocationFacts:
+        """Build detached authorization facts after normalization and validation."""
+        return ToolInvocationFacts(
+            tool_name=self.name,
+            normalized_arguments=prepared_arguments,
+            legacy_safety_reason=safety_reason,
+        )
 
     async def prepare_arguments(self, arguments: dict[str, Any]) -> dict[str, Any]:
         """Cast, default, filter, and validate one Built-in Tool argument object."""
