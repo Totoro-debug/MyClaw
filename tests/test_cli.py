@@ -2310,6 +2310,8 @@ def test_installed_config_command_generates_and_displays_missing_configuration(
 
     assert result.returncode == 0, result.stderr
     assert f"Path: {agent_home / 'config.toml'}" in result.stdout
+    assert "Effective runtime.permission_level: workspace-write" in result.stdout
+    assert "Effective runtime.exec_shell: auto" in result.stdout
     assert EXPECTED_DEFAULT_CONFIG in result.stdout
     assert "configuration gate passed" not in result.stdout
     assert not (agent_home / "logs").exists()
@@ -2366,6 +2368,31 @@ headers = { Authorization = "Bearer installed-header-secret" }
     assert "***REDACTED***" in visible
     assert not (agent_home / "logs").exists()
     assert not (workspace / ".myclaw").exists()
+
+
+def test_installed_config_command_keeps_fallback_diagnostic_before_later_fatal_error(
+    agent_home: Path,
+    workspace: Path,
+) -> None:
+    agent_home.mkdir(parents=True)
+    content = MINIMAL_VALID_CONFIG.replace(
+        "[runtime]\n",
+        '[runtime]\npermission_level = "level-secret"\n',
+    ).replace('model = "small-model"\n', "", 1)
+    config_path = agent_home / "config.toml"
+    config_path.write_text(content, encoding="utf-8")
+
+    result = run_installed_myclaw(agent_home, "config", workspace=workspace)
+
+    error = "config_invalid: Configuration field 'models.routes.default.model' is required."
+    diagnostic = (
+        "Configuration field 'runtime.permission_level' is invalid; "
+        "using 'workspace-write'."
+    )
+    path = f"Path: {config_path}"
+    assert result.returncode == 2
+    assert result.stdout.index(error) < result.stdout.index(diagnostic) < result.stdout.index(path)
+    assert "level-secret" not in result.stdout[: result.stdout.index(path)] + result.stderr
 
 
 def test_installed_config_command_shows_safe_malformed_configuration(

@@ -2,7 +2,7 @@
 
 import re
 import tomllib
-from collections.abc import Mapping, MutableMapping, MutableSequence, Sequence
+from collections.abc import Callable, Mapping, MutableMapping, MutableSequence, Sequence
 from dataclasses import dataclass, field
 from math import isfinite
 from pathlib import Path
@@ -22,6 +22,8 @@ DEFAULT_CONFIG_TEMPLATE: Final = load_template("default-config.md")
 
 type ReasoningEffort = Literal["low", "medium", "high", "xhigh", "max"]
 type MCPTransport = Literal["stdio", "streamable-http"]
+type PermissionLevel = Literal["read-only", "workspace-write", "full-access"]
+type ExecShell = Literal["auto", "powershell", "pwsh"]
 
 _PROVIDER_ID_PATTERN: Final = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
 _MCP_NAME_PATTERN: Final = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
@@ -30,7 +32,15 @@ _MCP_TRANSPORTS: Final = frozenset({"stdio", "streamable-http"})
 _MCP_DEFAULT_CONNECT_TIMEOUT: Final = 30
 _MCP_DEFAULT_CALL_TIMEOUT: Final = 60
 _MCP_MAX_TIMEOUT: Final = 600
+_DEFAULT_MAX_TOOL_RESULT_CHARS: Final = 4_096
+_DEFAULT_MAX_ITERATIONS: Final = 50
+_DEFAULT_ENABLE_SKILL_ALWAYS_LOAD: Final = False
 _DEFAULT_COMPACT_RATIO: Final = 0.9
+_DEFAULT_PERMISSION_LEVEL: Final[PermissionLevel] = "workspace-write"
+_DEFAULT_EXEC_SHELL: Final[ExecShell] = "auto"
+_DEFAULT_MEMORY_BATCH_SIZE: Final = 10
+_DEFAULT_MEMORY_SCHEDULE: Final = "0 * * * *"
+_DEFAULT_REASONING_EFFORT: Final[ReasoningEffort] = "medium"
 _API_KEY_FIELD_PATTERN: Final = re.compile(r"api[-_]?key", flags=re.IGNORECASE)
 _TOML_KEY_SEGMENT_PATTERN: Final = r"""(?:[a-z0-9_-]+|"(?:[^"\\\r\n]|\\.)*"|'[^'\r\n]*')"""
 
@@ -103,9 +113,11 @@ _TOML_ASSIGNMENT_PATTERN: Final = re.compile(
 @dataclass(frozen=True, slots=True)
 class RuntimeConfiguration:
     max_tool_result_chars: int
-    max_iterations: int = 50
-    enable_skill_always_load: bool = False
+    max_iterations: int = _DEFAULT_MAX_ITERATIONS
+    enable_skill_always_load: bool = _DEFAULT_ENABLE_SKILL_ALWAYS_LOAD
     compact_ratio: float = _DEFAULT_COMPACT_RATIO
+    permission_level: PermissionLevel = _DEFAULT_PERMISSION_LEVEL
+    exec_shell: ExecShell = _DEFAULT_EXEC_SHELL
 
 
 @dataclass(frozen=True, slots=True)
@@ -251,20 +263,25 @@ class ConfigurationDiagnostic:
 
 
 @dataclass(frozen=True, slots=True)
-class RuntimeConfigurationDiagnostic:
-    """A safe diagnostic for a runtime field using its declared fallback."""
+class DefaultValueDiagnostic:
+    """A safe diagnostic for a configuration field using its declared default."""
 
     field: str
+    default_value: object
 
     @property
     def message(self) -> str:
-        return (
-            f"Configuration field {self.field!r} is invalid or missing; "
-            f"using {_DEFAULT_COMPACT_RATIO:g}."
-        )
+        default_text = self.default_value
+        if isinstance(default_text, bool):
+            rendered_default = str(default_text).lower()
+        elif isinstance(default_text, str):
+            rendered_default = repr(default_text)
+        else:
+            rendered_default = str(default_text)
+        return f"Configuration field {self.field!r} is invalid; using {rendered_default}."
 
 
-type ConfigurationDiagnosticValue = ConfigurationDiagnostic | RuntimeConfigurationDiagnostic
+type ConfigurationDiagnosticValue = ConfigurationDiagnostic | DefaultValueDiagnostic
 
 
 @dataclass(frozen=True, slots=True)
@@ -276,9 +293,33 @@ class ConfigView:
     error: ErrorInfo | None
     diagnostics: tuple[ConfigurationDiagnosticValue, ...] = ()
     effective_compact_ratio: float | None = None
+    effective_permission_level: PermissionLevel | None = None
+    effective_exec_shell: ExecShell | None = None
 
     def diagnostics_text(self) -> str:
         return "".join(f"{diagnostic.message}\n" for diagnostic in self.diagnostics)
+
+    def effective_values_text(self) -> str:
+        lines: list[str] = []
+        if self.effective_compact_ratio is not None:
+            lines.append(f"Effective runtime.compact_ratio: {self.effective_compact_ratio:g}\n")
+        if self.effective_permission_level is not None:
+            lines.append(
+                f"Effective runtime.permission_level: {self.effective_permission_level}\n"
+            )
+        if self.effective_exec_shell is not None:
+            lines.append(f"Effective runtime.exec_shell: {self.effective_exec_shell}\n")
+        return "".join(lines)
+
+    def header_text(self) -> str:
+        """Render the shared CLI and Management configuration header."""
+        error_text = ""
+        if self.error is not None:
+            error_text = f"{self.error.code}: {self.error.message}\n"
+        return (
+            f"{error_text}{self.effective_values_text()}{self.diagnostics_text()}"
+            f"Path: {self.path}\n"
+        )
 
 
 class ConfigError(Exception):
@@ -564,27 +605,82 @@ def _redact_sensitive_content(content: str) -> str:
     return "".join(lines)
 
 
-def _parse_compact_ratio(
+_MISSING: Final = object()
+
+
+def _defaulted[DefaultableValue](
     table: Mapping[str, object],
+    key: str,
     *,
+    field: str,
+    default: DefaultableValue,
+    parse: Callable[[object], DefaultableValue | None],
     diagnostics: list[ConfigurationDiagnosticValue] | None,
-) -> float:
-    value = table.get("compact_ratio")
-    valid = (
-        isinstance(value, (int, float))
-        and not isinstance(value, bool)
-        and isfinite(value)
-        and 0.5 <= value <= 0.95
-    )
-    if not valid:
-        if diagnostics is not None:
-            diagnostics.append(
-                RuntimeConfigurationDiagnostic(
-                    field="runtime.compact_ratio",
-                )
+) -> DefaultableValue:
+    value = table.get(key, _MISSING)
+    if value is _MISSING:
+        return default
+    parsed = parse(value)
+    if parsed is not None:
+        return parsed
+    if diagnostics is not None:
+        diagnostics.append(
+            DefaultValueDiagnostic(
+                field=field,
+                default_value=default,
             )
-        return _DEFAULT_COMPACT_RATIO
-    return float(cast(int | float, value))
+        )
+    return default
+
+
+def _parse_default_integer(value: object, minimum: int, maximum: int | None) -> int | None:
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, int)
+        or value < minimum
+        or (maximum is not None and value > maximum)
+    ):
+        return None
+    return value
+
+
+def _parse_default_boolean(value: object) -> bool | None:
+    return value if isinstance(value, bool) else None
+
+
+def _parse_default_compact_ratio(value: object) -> float | None:
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, (int, float))
+        or not isfinite(value)
+        or not 0.5 <= value <= 0.95
+    ):
+        return None
+    return float(value)
+
+
+def _parse_default_schedule(value: object) -> str | None:
+    if not isinstance(value, str) or len(value.split()) != 5 or not croniter.is_valid(value):
+        return None
+    return value
+
+
+def _parse_default_permission_level(value: object) -> PermissionLevel | None:
+    if not isinstance(value, str) or value not in {"read-only", "workspace-write", "full-access"}:
+        return None
+    return cast(PermissionLevel, value)
+
+
+def _parse_default_exec_shell(value: object) -> ExecShell | None:
+    if not isinstance(value, str) or value not in {"auto", "powershell", "pwsh"}:
+        return None
+    return cast(ExecShell, value)
+
+
+def _parse_default_reasoning_effort(value: object) -> ReasoningEffort | None:
+    if not isinstance(value, str) or value not in {"low", "medium", "high", "xhigh", "max"}:
+        return None
+    return cast(ReasoningEffort, value)
 
 
 def _parse_runtime(
@@ -594,38 +690,80 @@ def _parse_runtime(
 ) -> RuntimeConfiguration:
     table = _table(document.get("runtime", {}), "runtime")
     return RuntimeConfiguration(
-        max_tool_result_chars=_integer(
-            table.get("max_tool_result_chars", 4_096),
-            "runtime.max_tool_result_chars",
-            1000,
-            1_000_000,
+        max_tool_result_chars=_defaulted(
+            table,
+            "max_tool_result_chars",
+            field="runtime.max_tool_result_chars",
+            default=_DEFAULT_MAX_TOOL_RESULT_CHARS,
+            parse=lambda value: _parse_default_integer(value, 1000, 1_000_000),
+            diagnostics=diagnostics,
         ),
-        max_iterations=_integer(
-            table.get("max_iterations", 50),
-            "runtime.max_iterations",
-            50,
+        max_iterations=_defaulted(
+            table,
+            "max_iterations",
+            field="runtime.max_iterations",
+            default=_DEFAULT_MAX_ITERATIONS,
+            parse=lambda value: _parse_default_integer(value, 50, None),
+            diagnostics=diagnostics,
         ),
-        enable_skill_always_load=_boolean(
-            table.get("enable_skill_always_load", False),
-            "runtime.enable_skill_always_load",
+        enable_skill_always_load=_defaulted(
+            table,
+            "enable_skill_always_load",
+            field="runtime.enable_skill_always_load",
+            default=_DEFAULT_ENABLE_SKILL_ALWAYS_LOAD,
+            parse=_parse_default_boolean,
+            diagnostics=diagnostics,
         ),
-        compact_ratio=_parse_compact_ratio(table, diagnostics=diagnostics),
+        compact_ratio=_defaulted(
+            table,
+            "compact_ratio",
+            field="runtime.compact_ratio",
+            default=_DEFAULT_COMPACT_RATIO,
+            parse=_parse_default_compact_ratio,
+            diagnostics=diagnostics,
+        ),
+        permission_level=_defaulted(
+            table,
+            "permission_level",
+            field="runtime.permission_level",
+            default=_DEFAULT_PERMISSION_LEVEL,
+            parse=_parse_default_permission_level,
+            diagnostics=diagnostics,
+        ),
+        exec_shell=_defaulted(
+            table,
+            "exec_shell",
+            field="runtime.exec_shell",
+            default=_DEFAULT_EXEC_SHELL,
+            parse=_parse_default_exec_shell,
+            diagnostics=diagnostics,
+        ),
     )
 
 
-def _parse_memory(document: Mapping[str, object]) -> MemoryConfiguration:
+def _parse_memory(
+    document: Mapping[str, object],
+    *,
+    diagnostics: list[ConfigurationDiagnosticValue] | None,
+) -> MemoryConfiguration:
     table = _table(document.get("memory", {}), "memory")
-    schedule = _string(table.get("schedule", "0 * * * *"), "memory.schedule")
-    if len(schedule.split()) != 5 or not croniter.is_valid(schedule):
-        _invalid("memory.schedule", "must be a valid five-field cron expression")
     return MemoryConfiguration(
-        batch_size=_integer(
-            table.get("batch_size", 10),
-            "memory.batch_size",
-            1,
-            1000,
+        batch_size=_defaulted(
+            table,
+            "batch_size",
+            field="memory.batch_size",
+            default=_DEFAULT_MEMORY_BATCH_SIZE,
+            parse=lambda value: _parse_default_integer(value, 1, 1000),
+            diagnostics=diagnostics,
         ),
-        schedule=schedule,
+        schedule=_defaulted(
+            table,
+            "schedule",
+            field="memory.schedule",
+            default=_DEFAULT_MEMORY_SCHEDULE,
+            parse=_parse_default_schedule,
+            diagnostics=diagnostics,
+        ),
     )
 
 
@@ -653,7 +791,12 @@ def _parse_provider(provider_id: str, value: object) -> ProviderConfiguration:
     )
 
 
-def _parse_route(route_name: str, value: object) -> RouteConfiguration:
+def _parse_route(
+    route_name: str,
+    value: object,
+    *,
+    diagnostics: list[ConfigurationDiagnosticValue] | None,
+) -> RouteConfiguration:
     prefix = f"models.routes.{route_name}"
     if route_name not in _ROUTE_NAMES:
         _invalid(prefix, "is not a supported Model Route")
@@ -679,16 +822,6 @@ def _parse_route(route_name: str, value: object) -> RouteConfiguration:
     )
     if max_output >= context_window:
         _invalid(f"{prefix}.max_output", "must be less than context_window")
-    reasoning_value = table.get("reasoning_effort")
-    reasoning_effort: ReasoningEffort = "medium"
-    if reasoning_value is not None:
-        reasoning = _string(reasoning_value, f"{prefix}.reasoning_effort")
-        if reasoning not in {"low", "medium", "high", "xhigh", "max"}:
-            _invalid(
-                f"{prefix}.reasoning_effort",
-                "must be low, medium, high, xhigh, or max",
-            )
-        reasoning_effort = cast(ReasoningEffort, reasoning)
     return RouteConfiguration(
         provider_id=provider_id,
         model=_string(
@@ -704,7 +837,14 @@ def _parse_route(route_name: str, value: object) -> RouteConfiguration:
             0,
             2,
         ),
-        reasoning_effort=reasoning_effort,
+        reasoning_effort=_defaulted(
+            table,
+            "reasoning_effort",
+            field=f"{prefix}.reasoning_effort",
+            default=_DEFAULT_REASONING_EFFORT,
+            parse=_parse_default_reasoning_effort,
+            diagnostics=diagnostics,
+        ),
         timeout=_integer(
             _required(table, "timeout", f"{prefix}.timeout"),
             f"{prefix}.timeout",
@@ -714,7 +854,11 @@ def _parse_route(route_name: str, value: object) -> RouteConfiguration:
     )
 
 
-def _parse_models(document: Mapping[str, object]) -> ModelsConfiguration:
+def _parse_models(
+    document: Mapping[str, object],
+    *,
+    diagnostics: list[ConfigurationDiagnosticValue] | None,
+) -> ModelsConfiguration:
     models_value = document.get("models", {})
     table = _table(models_value, "models")
     provider_tables = _table(table.get("providers", {}), "models.providers")
@@ -724,7 +868,7 @@ def _parse_models(document: Mapping[str, object]) -> ModelsConfiguration:
         for provider_id, provider in provider_tables.items()
     }
     routes = {
-        route_name: _parse_route(route_name, route)
+        route_name: _parse_route(route_name, route, diagnostics=diagnostics)
         for route_name, route in route_tables.items()
         if route_name in _ROUTE_NAMES
     }
@@ -884,8 +1028,8 @@ def _parse_configuration(
 ) -> UserConfiguration:
     return UserConfiguration(
         runtime=_parse_runtime(document, diagnostics=diagnostics),
-        memory=_parse_memory(document),
-        models=_parse_models(document),
+        memory=_parse_memory(document, diagnostics=diagnostics),
+        models=_parse_models(document, diagnostics=diagnostics),
         mcp=_parse_mcp(document, diagnostics=diagnostics),
     )
 
@@ -1089,6 +1233,8 @@ class ConfigLoader:
         error: ErrorInfo | None = None
         diagnostics: list[ConfigurationDiagnosticValue] = []
         effective_compact_ratio: float | None = None
+        effective_permission_level: PermissionLevel | None = None
+        effective_exec_shell: ExecShell | None = None
         try:
             configuration = _parse_configuration(document, diagnostics=diagnostics)
         except ConfigError as config_error:
@@ -1096,10 +1242,14 @@ class ConfigLoader:
         else:
             self._diagnostics = tuple(diagnostics)
             effective_compact_ratio = configuration.runtime.compact_ratio
+            effective_permission_level = configuration.runtime.permission_level
+            effective_exec_shell = configuration.runtime.exec_shell
         return ConfigView(
             path=self.path,
             redacted_content=_redact_parsed_content(content),
             error=error,
             diagnostics=tuple(diagnostics),
             effective_compact_ratio=effective_compact_ratio,
+            effective_permission_level=effective_permission_level,
+            effective_exec_shell=effective_exec_shell,
         )

@@ -3,6 +3,8 @@ max_tool_result_chars = 4096
 max_iterations = 50
 enable_skill_always_load = false
 compact_ratio = 0.9
+permission_level = "workspace-write"
+exec_shell = "auto"
 
 [memory]
 batch_size = 10

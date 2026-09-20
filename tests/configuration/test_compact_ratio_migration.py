@@ -3,7 +3,7 @@ from pathlib import Path
 import pytest
 
 from myclaw.config.agent_home import AgentHome
-from myclaw.config.config import ConfigError, ConfigLoader, RuntimeConfigurationDiagnostic
+from myclaw.config.config import ConfigLoader, DefaultValueDiagnostic
 
 VALID_CONFIG = """[runtime]
 max_tool_result_chars = 4096
@@ -69,21 +69,21 @@ def test_invalid_compact_ratio_falls_back_once_with_safe_diagnostic(
     assert configuration.runtime.compact_ratio == 0.9
     assert len(loader.diagnostics) == 1
     diagnostic = loader.diagnostics[0]
-    assert isinstance(diagnostic, RuntimeConfigurationDiagnostic)
+    assert isinstance(diagnostic, DefaultValueDiagnostic)
     assert diagnostic.field == "runtime.compact_ratio"
     assert diagnostic.message == (
-        "Configuration field 'runtime.compact_ratio' is invalid or missing; using 0.9."
+        "Configuration field 'runtime.compact_ratio' is invalid; using 0.9."
     )
     assert not hasattr(diagnostic, "mcp_name")
 
 
-def test_missing_compact_ratio_uses_default_and_one_diagnostic(tmp_path: Path) -> None:
+def test_missing_compact_ratio_uses_default_without_diagnostic(tmp_path: Path) -> None:
     loader = _loader(tmp_path, VALID_CONFIG.replace("compact_ratio = 0.9\n", ""))
 
     configuration = loader.load()
 
     assert configuration.runtime.compact_ratio == 0.9
-    assert len(loader.diagnostics) == 1
+    assert loader.diagnostics == ()
 
 
 def test_config_view_exposes_effective_ratio_before_raw_content(tmp_path: Path) -> None:
@@ -125,8 +125,13 @@ def test_removed_threshold_is_not_a_memory_configuration_field(tmp_path: Path) -
     assert "compaction_message_threshold = 40" in view.redacted_content
 
 
-def test_runtime_configuration_still_rejects_other_known_invalid_fields(tmp_path: Path) -> None:
+def test_runtime_configuration_defaults_other_known_invalid_fields(tmp_path: Path) -> None:
     loader = _loader(tmp_path, VALID_CONFIG.replace("max_iterations = 50", "max_iterations = 49"))
 
-    with pytest.raises(ConfigError):
-        loader.load()
+    configuration = loader.load()
+
+    assert configuration.runtime.max_iterations == 50
+    assert len(loader.diagnostics) == 1
+    diagnostic = loader.diagnostics[0]
+    assert isinstance(diagnostic, DefaultValueDiagnostic)
+    assert diagnostic.field == "runtime.max_iterations"

@@ -14,6 +14,8 @@ max_tool_result_chars = 4096
 max_iterations = 50
 enable_skill_always_load = false
 compact_ratio = 0.9
+permission_level = "workspace-write"
+exec_shell = "auto"
 
 [memory]
 batch_size = 10
@@ -488,7 +490,7 @@ def test_unknown_configuration_projection_is_accepted_by_startup_and_config_view
 
 @pytest.mark.parametrize("operation", ["startup", "view"])
 @pytest.mark.parametrize("value", ["0.5", '"not-a-ratio"'], ids=("valid", "invalid"))
-def test_compact_ratio_is_loaded_or_falls_back_with_a_warning(
+def test_compact_ratio_is_loaded_or_falls_back_with_a_diagnostic(
     agent_home: Path,
     operation: str,
     value: str,
@@ -522,9 +524,9 @@ def test_compact_ratio_is_loaded_or_falls_back_with_a_warning(
     ("content", "error_code", "field"),
     [
         (
-            VALID_CONFIG.replace("max_tool_result_chars = 60000", "max_tool_result_chars = 999"),
+            VALID_CONFIG.replace("[runtime]\n", "runtime = true\n"),
             "config_invalid",
-            "runtime.max_tool_result_chars",
+            "runtime",
         ),
         (
             VALID_CONFIG.replace('model = "claude-model"\n', ""),
@@ -548,7 +550,7 @@ api_key = "invalid-secret"
             None,
         ),
     ],
-    ids=("known-invalid", "missing-required", "eager-provider", "malformed-toml"),
+    ids=("structural-table", "missing-required", "eager-provider", "malformed-toml"),
 )
 def test_startup_and_config_view_preserve_configuration_failures(
     agent_home: Path,
@@ -652,12 +654,24 @@ def test_valid_configuration_loads_as_typed_values(agent_home: Path) -> None:
     assert (
         configuration.runtime.max_tool_result_chars,
         configuration.runtime.compact_ratio,
+        configuration.runtime.permission_level,
+        configuration.runtime.exec_shell,
         configuration.memory.batch_size,
         configuration.memory.schedule,
         configuration.models.providers["anthropic-default"].models,
         configuration.models.routes["default"].reasoning_effort,
         configuration.models.routes["default"].timeout,
-    ) == (60000, 0.9, 12, "15 * * * *", ("claude-model",), "medium", 120)
+    ) == (
+        60000,
+        0.9,
+        "workspace-write",
+        "auto",
+        12,
+        "15 * * * *",
+        ("claude-model",),
+        "medium",
+        120,
+    )
 
 
 @pytest.mark.parametrize("effort", ["low", "medium", "high", "xhigh", "max"])
@@ -723,11 +737,13 @@ def test_omitted_defaulted_configuration_fields_use_accepted_defaults(
     assert (
         configuration.runtime.max_tool_result_chars,
         configuration.runtime.compact_ratio,
+        configuration.runtime.permission_level,
+        configuration.runtime.exec_shell,
         configuration.memory.batch_size,
         configuration.memory.schedule,
         configuration.models.routes["default"].reasoning_effort,
         configuration.runtime.enable_skill_always_load,
-    ) == (4096, 0.9, 10, "0 * * * *", "medium", False)
+    ) == (4096, 0.9, "workspace-write", "auto", 10, "0 * * * *", "medium", False)
     assert write_operations == []
     assert loader.path.read_text(encoding="utf-8") == before_load
 
@@ -940,26 +956,6 @@ def test_config_view_ignores_undefined_configuration_fields(agent_home: Path) ->
     ("content", "field"),
     [
         (
-            VALID_CONFIG.replace("max_tool_result_chars = 60000", "max_tool_result_chars = true"),
-            "runtime.max_tool_result_chars",
-        ),
-        (
-            VALID_CONFIG.replace("max_tool_result_chars = 60000", "max_tool_result_chars = 999"),
-            "runtime.max_tool_result_chars",
-        ),
-        (
-            VALID_CONFIG.replace(
-                "max_tool_result_chars = 60000",
-                'max_tool_result_chars = 60000\nenable_skill_always_load = "true"',
-            ),
-            "runtime.enable_skill_always_load",
-        ),
-        (VALID_CONFIG.replace("batch_size = 12", "batch_size = 1001"), "memory.batch_size"),
-        (
-            VALID_CONFIG.replace('schedule = "15 * * * *"', 'schedule = "99 99 99 99 99"'),
-            "memory.schedule",
-        ),
-        (
             VALID_CONFIG.replace('protocol = "anthropic"', "protocol = 1"),
             "models.providers.anthropic-default.protocol",
         ),
@@ -1028,18 +1024,6 @@ def test_config_view_ignores_undefined_configuration_fields(agent_home: Path) ->
         (
             VALID_CONFIG.replace("temperature = 0.2", 'temperature = "0.2"'),
             "models.routes.default.temperature",
-        ),
-        (
-            VALID_CONFIG.replace('reasoning_effort = "medium"', 'reasoning_effort = "extreme"'),
-            "models.routes.default.reasoning_effort",
-        ),
-        (
-            VALID_CONFIG.replace('reasoning_effort = "medium"', "reasoning_effort = 1"),
-            "models.routes.default.reasoning_effort",
-        ),
-        (
-            VALID_CONFIG.replace('reasoning_effort = "medium"', 'reasoning_effort = ""'),
-            "models.routes.default.reasoning_effort",
         ),
         (
             VALID_CONFIG.replace("timeout = 120", "timeout = 601"),

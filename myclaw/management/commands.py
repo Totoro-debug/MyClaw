@@ -219,17 +219,9 @@ class ManagementCommandDispatcher:
                     handled=True,
                     output=f"{management_error.error.code}: {management_error.error.message}",
                 )
-            effective = (
-                ""
-                if view.effective_compact_ratio is None
-                else f"Effective runtime.compact_ratio: {view.effective_compact_ratio:g}\n"
-            )
-            prefix = f"{effective}{view.diagnostics_text()}Path: {view.path}\n"
-            if view.error is not None:
-                prefix = f"{view.error.code}: {view.error.message}\n{prefix}"
             return ManagementCommandResult(
                 handled=True,
-                output=f"{prefix}{view.redacted_content}",
+                output=f"{view.header_text()}{view.redacted_content}",
             )
 
     async def update_reasoning_effort(

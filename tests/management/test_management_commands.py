@@ -366,6 +366,8 @@ max_tool_result_chars = 4096
 max_iterations = 50
 enable_skill_always_load = false
 compact_ratio = 0.9
+permission_level = "workspace-write"
+exec_shell = "auto"
 
 [memory]
 batch_size = 10
@@ -470,10 +472,39 @@ async def test_config_command_returns_renderable_complete_redacted_text(
     assert result.handled is True
     assert result.output == (
         "Effective runtime.compact_ratio: 0.9\n"
-        "Configuration field 'runtime.compact_ratio' is invalid or missing; using 0.9.\n"
+        "Effective runtime.permission_level: workspace-write\n"
+        "Effective runtime.exec_shell: auto\n"
         f"Path: {config_path}\n{REDACTED_CONFIG_CONTENT}"
     )
     assert "command-secret" not in result.output
+
+
+@pytest.mark.asyncio
+async def test_config_command_keeps_fallback_diagnostic_before_later_fatal_error(
+    agent_home: Path,
+) -> None:
+    home = AgentHome(agent_home)
+    home.initialize()
+    config_path = agent_home / "config.toml"
+    content = (
+        '[runtime]\npermission_level = "level-secret"\n\n'
+        + CONFIG_CONTENT.replace('model = "model-id"\n', "", 1)
+    )
+    config_path.write_text(content, encoding="utf-8")
+    dispatcher = ManagementCommandDispatcher(management_service(home))
+
+    result = await dispatcher.dispatch("/config")
+
+    assert result.handled is True
+    assert result.output is not None
+    error = "config_invalid: Configuration field 'models.routes.default.model' is required."
+    diagnostic = (
+        "Configuration field 'runtime.permission_level' is invalid; "
+        "using 'workspace-write'."
+    )
+    path = f"Path: {config_path}"
+    assert result.output.index(error) < result.output.index(diagnostic) < result.output.index(path)
+    assert "level-secret" not in result.output[: result.output.index(path)]
 
 
 @pytest.mark.asyncio
@@ -537,7 +568,8 @@ async def test_config_command_ignores_undefined_source_fields(
 
     assert result.output == (
         "Effective runtime.compact_ratio: 0.9\n"
-        "Configuration field 'runtime.compact_ratio' is invalid or missing; using 0.9.\n"
+        "Effective runtime.permission_level: workspace-write\n"
+        "Effective runtime.exec_shell: auto\n"
         f"Path: {config_path}\n{REDACTED_SCHEMA_INVALID_CONFIG_CONTENT}"
     )
     assert "schema-command-secret" not in result.output
@@ -553,7 +585,10 @@ async def test_config_command_generates_and_displays_missing_configuration(
     result = await dispatcher.dispatch("/config")
 
     assert result.output == (
-        f"Effective runtime.compact_ratio: 0.9\nPath: {config_path}\n{DEFAULT_CONFIG_CONTENT}"
+        "Effective runtime.compact_ratio: 0.9\n"
+        "Effective runtime.permission_level: workspace-write\n"
+        "Effective runtime.exec_shell: auto\n"
+        f"Path: {config_path}\n{DEFAULT_CONFIG_CONTENT}"
     )
     assert config_path.read_text(encoding="utf-8") == DEFAULT_CONFIG_CONTENT
 

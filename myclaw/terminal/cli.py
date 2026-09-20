@@ -658,30 +658,13 @@ def config_command() -> None:
         )
         raise typer.Exit(code=1) from None
 
-    if view.error is not None:
-        _print_error(view.error, view.path)
-    else:
-        if view.effective_compact_ratio is not None:
-            console.print(
-                f"Effective runtime.compact_ratio: {view.effective_compact_ratio:g}",
-                markup=False,
-                highlight=False,
-                soft_wrap=True,
-            )
-        if view.diagnostics:
-            console.print(
-                view.diagnostics_text(),
-                markup=False,
-                highlight=False,
-                soft_wrap=True,
-                end="",
-            )
-        console.print(
-            f"Path: {view.path}",
-            markup=False,
-            highlight=False,
-            soft_wrap=True,
-        )
+    console.print(
+        view.header_text(),
+        markup=False,
+        highlight=False,
+        soft_wrap=True,
+        end="",
+    )
     console.print(
         view.redacted_content,
         markup=False,

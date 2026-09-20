@@ -59,7 +59,9 @@ API Key 直接保存在配置文件中，当前不支持环境变量引用；`my
 
 MCP Server 可在 `[mcp.servers.<name>.tool_keywords]` 下按远端 Tool 原名配置英文关键词；缺失或为空的关键词会在启动时通过现有 `chat` Model Route 生成并尽力保存。生成失败时，当前进程使用对应的远端 Tool 原名；生成成功但保存失败时，当前进程继续使用已生成的内存关键词。两类失败都不会阻止 Agent 启动。
 
-`[runtime].compact_ratio` 的默认值为 `0.9`，只接受有限且非布尔的数值 `0.5` 至 `0.95`（含边界）。缺失或非法值会回退到 `0.9`，并产生且只产生一条安全诊断；原始配置不会被自动改写。`/config` 同时显示实际生效的比例和脱敏后的原始 TOML；已移除的 `compaction_message_threshold` 等未知字段会被忽略。
+`[runtime].permission_level` 接受 `read-only`、`workspace-write` 和 `full-access`，默认值为 `workspace-write`；`[runtime].exec_shell` 接受 `auto`、`powershell` 和 `pwsh`，默认值为 `auto`。本阶段只解析并展示这些配置值，不改变 Tool 执行行为。
+
+安全默认值字段包括 Runtime 的 Tool 结果大小、迭代上限、Always-load Skill 开关、`compact_ratio`、权限级别和 Exec Shell，Memory 的 batch size 与 schedule，以及每个 Model Route 的 `reasoning_effort`。缺失字段静默使用默认值；显式非法值使用有效默认值并产生且只产生一条不包含原始值的安全诊断。`compact_ratio` 的默认值为 `0.9`，只接受有限且非布尔的数值 `0.5` 至 `0.95`（含边界）。原始配置不会被自动改写；`myclaw config` 与 `/config` 显示相同的有效值和诊断，以及脱敏后的原始 TOML。已移除的 `compaction_message_threshold` 等未知字段会被忽略。
 
 ## 项目启动
 

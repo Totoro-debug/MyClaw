@@ -3,7 +3,11 @@ from pathlib import Path
 import pytest
 
 from myclaw.config.agent_home import AgentHome
-from myclaw.config.config import ConfigError, ConfigLoader, RuntimeConfiguration
+from myclaw.config.config import (
+    ConfigLoader,
+    DefaultValueDiagnostic,
+    RuntimeConfiguration,
+)
 
 
 def _config(max_iterations: str | None = None) -> str:
@@ -62,15 +66,17 @@ def test_config_view_recognizes_max_iterations_as_a_defined_runtime_field(tmp_pa
 
 
 @pytest.mark.parametrize("value", ("49", "0", "-1", "true", "50.0", '"50"'))
-def test_max_iterations_rejects_values_below_fifty_and_non_integers(
+def test_max_iterations_falls_back_for_invalid_values(
     tmp_path: Path, value: str
 ) -> None:
     loader = ConfigLoader(AgentHome(tmp_path))
     loader.ensure_default()
     loader.path.write_text(_config(value), encoding="utf-8")
 
-    with pytest.raises(ConfigError) as raised:
-        loader.load()
+    configuration = loader.load()
 
-    assert raised.value.error.code == "config_invalid"
-    assert "runtime.max_iterations" in raised.value.error.message
+    assert configuration.runtime.max_iterations == 50
+    assert len(loader.diagnostics) == 1
+    diagnostic = loader.diagnostics[0]
+    assert isinstance(diagnostic, DefaultValueDiagnostic)
+    assert diagnostic.field == "runtime.max_iterations"
