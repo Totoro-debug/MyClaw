@@ -3,82 +3,76 @@
 from __future__ import annotations
 
 import asyncio
-import os
 import re
 from pathlib import Path
-from typing import Annotated, Final, Protocol
+from typing import Annotated, Any, Final
 from urllib.parse import urlsplit
 
 from myclaw.agent.tools.base import BaseTool, ToolError, ToolParam, truncate_text
+from myclaw.agent.tools.core.exec_host import (
+    ExecCapabilityUnavailable,
+    ExecHost,
+    ExecHostError,
+    ExecProcess,
+    create_exec_host,
+    resolve_exec_shell,
+)
+from myclaw.agent.tools.core.exec_policy import (
+    ExecAssessment,
+    requires_legacy_destructive_confirmation,
+)
 from myclaw.agent.tools.network_safety import DNSResolver, SocketDNSResolver, assess_target
-from myclaw.utils.async_tasks import await_task_preserving_cancellation
+from myclaw.agent.tools.permission import ToolInvocationFacts
 
-_BASH: Final[str] = "bash"
 _OUTPUT_LIMIT: Final[int] = 4000
-_PROCESS_REAP_TIMEOUT: Final[float] = 5.0
-_ALLOWED_ENVIRONMENT: Final[tuple[str, ...]] = ("HOME", "LANG", "TERM", "PATH")
-_BACKGROUND_CLEANUPS: Final[set[asyncio.Task[None]]] = set()
 _URL_PATTERN: Final[re.Pattern[str]] = re.compile(
     r"https?://[^\s\"'`<>]+",
     re.IGNORECASE,
 )
 _URL_TRAILING_CHARACTERS: Final[str] = ".,;:!?)]}"
-_DESTRUCTIVE_PATTERNS: Final[tuple[re.Pattern[str], ...]] = (
-    re.compile(
-        r"(?<![\w-])rm\b(?=[^\n;&|]*(?:--(?:force|recursive)\b|(?<![\w-])-[^\s;&|]*[rf]))",
-        re.IGNORECASE,
-    ),
-    re.compile(r"(?<![\w-])(?:del|erase)\b(?=[^\n;&|]*/[^\s;&|]*f\b)", re.IGNORECASE),
-    re.compile(
-        r"(?<![\w-])(?:rd|rmdir)\b(?=[^\n;&|]*(?:/[^\s;&|]*s\b|(?<![\w-])-[^\s;&|]*r))",
-        re.IGNORECASE,
-    ),
-    re.compile(r"(?<![\w-])format(?:\s|$)", re.IGNORECASE),
-    re.compile(r"(?<![\w-])(?:mkfs(?:\.[\w-]+)?|diskpart)(?:\s|$)", re.IGNORECASE),
-    re.compile(r"(?<![\w-])dd\b[^\n;]*\bif\s*=", re.IGNORECASE),
-    re.compile(r"(?:>\s*|\bof\s*=\s*)/dev/", re.IGNORECASE),
-    re.compile(
-        r"(?:>\s*|\bof\s*=\s*)\\\\\.\\(?:PhysicalDrive\d*|[A-Za-z]:)",
-        re.IGNORECASE,
-    ),
-    re.compile(r"(?<![\w-])(?:shutdown|reboot|poweroff)(?:\s|$)", re.IGNORECASE),
-    re.compile(r":\s*\(\s*\)\s*\{\s*:\s*\|\s*:\s*&\s*\}\s*;?\s*:", re.IGNORECASE),
-)
-
-
-class ExecProcess(Protocol):
-    """The direct Bash process operations required by Exec."""
-
-    @property
-    def returncode(self) -> int | None: ...
-
-    async def communicate(self) -> tuple[bytes | None, bytes | None]: ...
-
-    def kill(self) -> None: ...
-
-    async def wait(self) -> int: ...
 
 
 class ExecTool(BaseTool):
-    """Run one user-confirmable command through a direct Bash login shell."""
+    """Adapt one normalized Tool call to the process-lifetime Host Exec boundary."""
 
     name = "exec"
-    description = (
-        "Run one Bash login-shell command with captured output in the selected directory. "
-        "External working directories and safety-check findings require confirmation."
-    )
+    description = "Run one host-shell command with captured output in the selected directory."
     required = ("command",)
 
-    command: Annotated[str, ToolParam(description="Bash command to execute.", min_length=1)]
+    command: Annotated[str, ToolParam(description="Shell command to execute.", min_length=1)]
     cwd: Annotated[str, ToolParam(description="Working directory.", min_length=1)] = "."
     timeout: Annotated[
         int,
         ToolParam(description="Execution timeout in seconds.", minimum=1, maximum=600),
     ] = 60
 
-    def __init__(self, *, workspace: Path, resolver: DNSResolver | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        workspace: Path,
+        resolver: DNSResolver | None = None,
+        host: ExecHost | None = None,
+    ) -> None:
         self._workspace = workspace
         self._resolver = SocketDNSResolver() if resolver is None else resolver
+        self._host = (
+            create_exec_host(resolve_exec_shell("auto"))
+            if host is None
+            else host
+        )
+
+    async def prepare_arguments(self, arguments: dict[str, Any]) -> dict[str, Any]:
+        """Freeze one canonical cwd for validation, inspection, confirmation, and execution."""
+        prepared = await super().prepare_arguments(arguments)
+        if not self._host.resolved_shell.available:
+            return prepared
+        cwd = prepared.get("cwd")
+        if not isinstance(cwd, str):
+            raise ToolError("Exec working directory is invalid.")
+        prepared["cwd"] = str(
+            self.resolve_path_argument(workspace=self._workspace, requested=cwd)
+        )
+        return prepared
 
     def validate_arguments(  # type: ignore[override]
         self,
@@ -92,6 +86,10 @@ class ExecTool(BaseTool):
             return "Exec command must not be blank."
         if "\x00" in command:
             return "Exec command must not contain a NUL character."
+        if not self._host.resolved_shell.available:
+            return self._host.resolved_shell.diagnostic or (
+                "Exec capability is unavailable because the selected shell is missing."
+            )
         try:
             target = self.resolve_path_argument(workspace=self._workspace, requested=cwd)
         except ToolError as error:
@@ -109,7 +107,7 @@ class ExecTool(BaseTool):
     ) -> str | None:
         del timeout
         reasons: list[str] = []
-        if _matches_destructive_pattern(command):
+        if requires_legacy_destructive_confirmation(command):
             reasons.append(
                 "The Exec command matches a known destructive operation and requires confirmation."
             )
@@ -128,44 +126,54 @@ class ExecTool(BaseTool):
         target = self.resolve_path_argument(workspace=self._workspace, requested=cwd)
         if not target.is_dir():
             raise ToolError("Exec working directory must be a directory.")
-
-        process: ExecProcess | None = None
-        communication: asyncio.Task[tuple[bytes | None, bytes | None]] | None = None
         try:
-            process = await _spawn_process(
-                command=command,
-                cwd=target,
-            )
-            communication = asyncio.create_task(process.communicate())
-            try:
-                stdout, stderr = await asyncio.wait_for(
-                    asyncio.shield(communication),
-                    timeout=timeout,
-                )
-            except TimeoutError as error:
-                stdout, stderr = await _cleanup_preserving_cancellation(process, communication)
-                raise ToolError(
-                    _format_timeout(timeout=timeout, stdout=stdout, stderr=stderr)
-                ) from error
-            except asyncio.CancelledError:
-                await _cleanup_without_replacing_cancellation(process, communication)
-                raise
-            except Exception as error:
-                await _cleanup_without_replacing_cancellation(process, communication)
-                raise ToolError(f"Exec failed while reading process output: {error}") from error
-            return _format_result(
-                exit_code=process.returncode,
-                stdout=_as_bytes(stdout),
-                stderr=_as_bytes(stderr),
-            )
+            outcome = await self._host.execute(command, target, timeout)
         except asyncio.CancelledError:
-            if process is not None and communication is None:
-                await _cleanup_without_replacing_cancellation(process, None)
             raise
-        except ToolError:
-            raise
+        except ExecCapabilityUnavailable as error:
+            raise ToolError(str(error)) from error
+        except ExecHostError as error:
+            raise ToolError(str(error)) from error
         except Exception as error:
-            raise ToolError(f"Exec failed to start Bash: {error}") from error
+            raise ToolError("Exec failed to start the selected shell.") from error
+        if outcome.timed_out:
+            raise ToolError(
+                _format_timeout(timeout=timeout, stdout=outcome.stdout, stderr=outcome.stderr)
+            )
+        return _format_result(
+            exit_code=outcome.exit_code,
+            stdout=outcome.stdout,
+            stderr=outcome.stderr,
+        )
+
+    async def collect_invocation_facts(
+        self,
+        prepared_arguments: dict[str, Any],
+        *,
+        safety_reason: str | None,
+    ) -> ToolInvocationFacts:
+        """Attach one detached Host assessment to the shared authorization facts."""
+        command = prepared_arguments["command"]
+        cwd = prepared_arguments["cwd"]
+        if not isinstance(command, str) or not isinstance(cwd, str):
+            raise ToolError("Exec arguments are invalid.")
+        target = self.resolve_path_argument(workspace=self._workspace, requested=cwd)
+        try:
+            assessment = await self._host.inspect(command, target)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            assessment = ExecAssessment.uncertain_result(
+                "Exec inspection failed.",
+                status="failed",
+            )
+        reasons = [reason for reason in (safety_reason, assessment.confirmation_reason) if reason]
+        return ToolInvocationFacts(
+            tool_name=self.name,
+            normalized_arguments=prepared_arguments,
+            legacy_safety_reason=" ".join(dict.fromkeys(reasons)) or None,
+            exec_assessment=assessment,
+        )
 
     async def _url_safety_reason(self, command: str) -> str | None:
         reasons: list[str] = []
@@ -202,151 +210,6 @@ class ExecTool(BaseTool):
         }
         return None if assessment.risk is None else reasons[assessment.risk]
 
-
-async def _spawn_process(*, command: str, cwd: os.PathLike[str]) -> ExecProcess:
-    spawning = asyncio.create_task(
-        _create_process(
-            command=command,
-            cwd=cwd,
-        )
-    )
-    try:
-        return await asyncio.shield(spawning)
-    except asyncio.CancelledError as cancellation:
-        cleanup = asyncio.create_task(_cleanup_cancelled_spawn(spawning))
-        try:
-            await await_task_preserving_cancellation(cleanup)
-        except asyncio.CancelledError:
-            raise
-        except BaseException:
-            pass
-        raise cancellation
-
-
-async def _create_process(*, command: str, cwd: os.PathLike[str]) -> ExecProcess:
-    process = await asyncio.create_subprocess_exec(
-        _BASH,
-        "--login",
-        "-c",
-        command,
-        cwd=os.fspath(cwd),
-        env=_minimal_environment(),
-        stdin=asyncio.subprocess.DEVNULL,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-    )
-    return process
-
-
-async def _cleanup_cancelled_spawn(spawning: asyncio.Task[ExecProcess]) -> None:
-    try:
-        process = await asyncio.wait_for(
-            asyncio.shield(spawning),
-            timeout=_PROCESS_REAP_TIMEOUT,
-        )
-    except TimeoutError:
-        _defer_spawn_cleanup(spawning)
-        return
-    except BaseException:
-        return
-    await _cleanup_process(process, None)
-
-
-def _defer_spawn_cleanup(spawning: asyncio.Task[ExecProcess]) -> None:
-    spawning.cancel()
-    cleanup = asyncio.create_task(_cleanup_late_spawn(spawning))
-    _BACKGROUND_CLEANUPS.add(cleanup)
-    cleanup.add_done_callback(_BACKGROUND_CLEANUPS.discard)
-
-
-async def _cleanup_late_spawn(spawning: asyncio.Task[ExecProcess]) -> None:
-    try:
-        process = await spawning
-        await _cleanup_process(process, None)
-    except BaseException:
-        pass
-
-
-def _minimal_environment() -> dict[str, str]:
-    environment: dict[str, str] = {}
-    for expected in _ALLOWED_ENVIRONMENT:
-        for name, value in os.environ.items():
-            if name.upper() == expected:
-                environment[expected] = value
-                break
-    return environment
-
-
-async def _cleanup_process(
-    process: ExecProcess,
-    communication: asyncio.Task[tuple[bytes | None, bytes | None]] | None,
-) -> tuple[bytes, bytes]:
-    try:
-        if process.returncode is None:
-            process.kill()
-    except Exception:
-        pass
-
-    wait_task = asyncio.create_task(process.wait())
-    tasks: tuple[asyncio.Task[object], ...] = (
-        wait_task,
-        *((communication,) if communication is not None else ()),
-    )
-    joined = asyncio.create_task(_join_cleanup_tasks(tasks))
-    try:
-        await asyncio.wait_for(asyncio.shield(joined), timeout=_PROCESS_REAP_TIMEOUT)
-    except TimeoutError:
-        for task in tasks:
-            if not task.done():
-                task.cancel()
-        await asyncio.gather(*tasks, return_exceptions=True)
-        if not joined.done():
-            joined.cancel()
-        await asyncio.gather(joined, return_exceptions=True)
-    return _communication_output(communication)
-
-
-async def _join_cleanup_tasks(tasks: tuple[asyncio.Task[object], ...]) -> None:
-    await asyncio.gather(*tasks, return_exceptions=True)
-
-
-async def _cleanup_without_replacing_cancellation(
-    process: ExecProcess,
-    communication: asyncio.Task[tuple[bytes | None, bytes | None]] | None,
-) -> None:
-    cleanup = asyncio.create_task(_cleanup_process(process, communication))
-    try:
-        await await_task_preserving_cancellation(cleanup)
-    except asyncio.CancelledError:
-        raise
-    except BaseException:
-        pass
-
-
-async def _cleanup_preserving_cancellation(
-    process: ExecProcess,
-    communication: asyncio.Task[tuple[bytes | None, bytes | None]] | None,
-) -> tuple[bytes, bytes]:
-    cleanup = asyncio.create_task(_cleanup_process(process, communication))
-    return await await_task_preserving_cancellation(cleanup)
-
-
-def _communication_output(
-    communication: asyncio.Task[tuple[bytes | None, bytes | None]] | None,
-) -> tuple[bytes, bytes]:
-    if communication is None or not communication.done() or communication.cancelled():
-        return b"", b""
-    try:
-        stdout, stderr = communication.result()
-    except BaseException:
-        return b"", b""
-    return _as_bytes(stdout), _as_bytes(stderr)
-
-
-def _as_bytes(value: bytes | None) -> bytes:
-    return b"" if value is None else value
-
-
 def _format_result(*, exit_code: int | None, stdout: bytes, stderr: bytes) -> str:
     return _format_streams(
         heading=f"Exit code: {exit_code}",
@@ -372,10 +235,5 @@ def _format_streams(*, heading: str, stdout: bytes, stderr: bytes) -> str:
     if decoded_stderr:
         blocks.append(f"stderr:\n{decoded_stderr}")
     return truncate_text("\n".join(blocks), limit=_OUTPUT_LIMIT)
-
-
-def _matches_destructive_pattern(command: str) -> bool:
-    return any(pattern.search(command) is not None for pattern in _DESTRUCTIVE_PATTERNS)
-
 
 __all__ = ["ExecProcess", "ExecTool"]

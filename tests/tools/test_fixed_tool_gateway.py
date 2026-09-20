@@ -693,7 +693,11 @@ async def test_exec_confirmation_preserves_the_exact_normalized_operation(
 
     assert result.status == "refused"
     assert len(requests) == 1
-    assert requests[0].details == {"command": command, "cwd": ".", "timeout": 45}
+    assert requests[0].details == {
+        "command": command,
+        "cwd": str(workspace.resolve()),
+        "timeout": 45,
+    }
 
 
 @pytest.mark.asyncio

@@ -13,12 +13,12 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal, Protocol
 
+from myclaw.agent.tools.core.exec_policy import ExecAssessment, ResolvedExecShell
+
 type PermissionDecision = Literal["direct", "confirm"]
 type ToolPermissionLevel = Literal["read-only", "workspace-write", "full-access"]
 type ToolRunOrigin = Literal["foreground", "schedule", "memory"]
-type ResolvedExecShell = str
 type FileAccess = object
-type ExecAssessment = object
 type ScheduleAction = object
 type NetworkAssessment = object
 type NormalizedNetworkTarget = object

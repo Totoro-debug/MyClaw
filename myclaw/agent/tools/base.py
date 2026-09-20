@@ -374,6 +374,18 @@ class BaseTool(ABC, metaclass=_BaseToolMeta):
             legacy_safety_reason=safety_reason,
         )
 
+    async def collect_invocation_facts(
+        self,
+        prepared_arguments: dict[str, Any],
+        *,
+        safety_reason: str | None,
+    ) -> ToolInvocationFacts:
+        """Collect detached facts, allowing Host-backed Tools to inspect asynchronously."""
+        return self.build_invocation_facts(
+            prepared_arguments,
+            safety_reason=safety_reason,
+        )
+
     async def prepare_arguments(self, arguments: dict[str, Any]) -> dict[str, Any]:
         """Cast, default, filter, and validate one Built-in Tool argument object."""
         schema = self._build_preparation_schema()

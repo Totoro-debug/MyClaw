@@ -14,6 +14,11 @@ from myclaw.agent.loop import AgentLoop, ModelContextOverflowError
 from myclaw.agent.memory.dream import Dream
 from myclaw.agent.memory.manager import MemoryManager
 from myclaw.agent.message_bus import MessageBus
+from myclaw.agent.tools.core.exec_host import (
+    EXEC_CAPABILITY_ERROR,
+    create_exec_host,
+    resolve_exec_shell,
+)
 from myclaw.agent.tools.mcp_keywords import MCPKeywordPreparer
 from myclaw.agent.tools.mcp_runtime import (
     MCPRuntimeManager,
@@ -101,6 +106,10 @@ def _print_error(error: ErrorInfo, path: object) -> None:
 
 
 def _print_mcp_notice(message: str) -> None:
+    console.print(message, markup=False, highlight=False, soft_wrap=True)
+
+
+def _print_exec_notice(message: str) -> None:
     console.print(message, markup=False, highlight=False, soft_wrap=True)
 
 
@@ -193,6 +202,12 @@ async def _run_cli_conversation(
 
     try:
         workspace_path = normalize_workspace_path(workspace)
+        resolved_exec_shell = resolve_exec_shell(
+            getattr(configuration.runtime, "exec_shell", "auto")
+        )
+        exec_host = create_exec_host(resolved_exec_shell)
+        if not resolved_exec_shell.available:
+            _print_exec_notice(resolved_exec_shell.diagnostic or EXEC_CAPABILITY_ERROR)
         workspace_state = WorkspaceState(workspace_path)
         workspace_state.initialize(agent_home_root=agent_home.path)
 
@@ -285,6 +300,7 @@ async def _run_cli_conversation(
                 monotonic_now=monotonic,
                 mcp_tools=selected_mcp_snapshot,
                 mcp_keywords=selected_mcp_keywords,
+                exec_host=exec_host,
             )
 
         def current_agent_loop() -> AgentLoop:

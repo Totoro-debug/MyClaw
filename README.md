@@ -6,7 +6,7 @@ MyClaw 是面向单用户、本地优先的个人 Agent 运行时。通过全屏
 
 ## 项目安装
 
-需要 Python 3.12+ 和 Git；使用命令执行工具还需安装 Bash。
+需要 Python 3.12+ 和 Git。POSIX 主机使用 Bash；Windows 主机的 `auto` 选择可用的 PowerShell 7，否则使用 Windows PowerShell 5.1。
 
 目前已验证 Windows x64；macOS 尚未完成原生验证，其他 POSIX 平台暂无正式支持承诺。
 
@@ -59,7 +59,7 @@ API Key 直接保存在配置文件中，当前不支持环境变量引用；`my
 
 MCP Server 可在 `[mcp.servers.<name>.tool_keywords]` 下按远端 Tool 原名配置英文关键词；缺失或为空的关键词会在启动时通过现有 `chat` Model Route 生成并尽力保存。生成失败时，当前进程使用对应的远端 Tool 原名；生成成功但保存失败时，当前进程继续使用已生成的内存关键词。两类失败都不会阻止 Agent 启动。
 
-`[runtime].permission_level` 接受 `read-only`、`workspace-write` 和 `full-access`，默认值为 `workspace-write`；`[runtime].exec_shell` 接受 `auto`、`powershell` 和 `pwsh`，默认值为 `auto`。本阶段只解析并展示这些配置值，不改变 Tool 执行行为。
+`[runtime].permission_level` 接受 `read-only`、`workspace-write` 和 `full-access`，默认值为 `workspace-write`；`[runtime].exec_shell` 接受 `auto`、`powershell` 和 `pwsh`，默认值为 `auto`。Windows 下 `auto` 优先选择版本至少为 7 的 `pwsh`，否则选择 Windows PowerShell 5.1；显式选择不会交叉回退，POSIX 始终使用 Bash 并忽略该 Windows selector。Exec Host 的检查和执行都禁用 Profile/rc（PowerShell 使用 `-NoLogo -NoProfile -NonInteractive`，Bash 不使用 login/profile/rc），并共享同一个可执行文件、工作目录、最小环境和超时/取消行为。选定 Shell 缺失不会阻止启动，只显示一次安全诊断；Exec 仍在工具目录中，但调用时返回稳定的能力错误。Shell 存在但检查器失败时按不确定结果继续沿用确认语义。
 
 安全默认值字段包括 Runtime 的 Tool 结果大小、迭代上限、Always-load Skill 开关、`compact_ratio`、权限级别和 Exec Shell，Memory 的 batch size 与 schedule，以及每个 Model Route 的 `reasoning_effort`。缺失字段静默使用默认值；显式非法值使用有效默认值并产生且只产生一条不包含原始值的安全诊断。`compact_ratio` 的默认值为 `0.9`，只接受有限且非布尔的数值 `0.5` 至 `0.95`（含边界）。原始配置不会被自动改写；`myclaw config` 与 `/config` 显示相同的有效值和诊断，以及脱敏后的原始 TOML。已移除的 `compaction_message_threshold` 等未知字段会被忽略。
 
@@ -111,7 +111,7 @@ CLI 负责组装运行时和管理组件生命周期。前台输入经终端与 
 
 全局配置与 Skill 位于 `~/.myclaw/`；会话、记忆、定时任务、工具产物和日志归各 Workspace 的 `.myclaw/` 所有。
 
-内置工具通过权限检查决定是否请求一次性确认；Exec 以当前用户权限执行，不提供操作系统沙箱。MCP 支持 stdio 和 Streamable HTTP，已启用的 Server 视为可信能力，其工具调用不再逐次确认。
+内置工具通过权限检查决定是否请求一次性确认；Exec 通过 Host 以当前用户权限执行，不提供操作系统沙箱。MCP 支持 stdio 和 Streamable HTTP，已启用的 Server 视为可信能力，其工具调用不再逐次确认。
 
 架构决策见[现行 ADR](docs/adr/)，领域术语见[CONTEXT.md](CONTEXT.md)。
 

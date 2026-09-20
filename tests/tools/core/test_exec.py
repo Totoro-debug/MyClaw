@@ -8,7 +8,10 @@ from typing import cast
 
 import pytest
 
+from myclaw.agent.tools import base as tool_base_module
 from myclaw.agent.tools.core.exec import ExecTool
+from myclaw.agent.tools.core.exec_host import BashExecHost, ExecProcessSpec, resolve_exec_shell
+from myclaw.agent.tools.core.exec_policy import ExecAssessment, ExecOutcome
 from myclaw.agent.tools.network_safety import DNSResolver
 from myclaw.agent.tools.tool_gateway import (
     ConfirmationDecision,
@@ -103,8 +106,18 @@ def _gateway(
     resolver: DNSResolver | None = None,
     confirmation: ConfirmationRequester | None = None,
 ) -> SingleToolGateway:
-    tool = ExecTool(workspace=workspace, resolver=resolver)
+    tool = ExecTool(workspace=workspace, resolver=resolver, host=_bash_host())
     return SingleToolGateway((tool,), confirmation=confirmation)
+
+
+def _bash_host() -> BashExecHost:
+    return BashExecHost(
+        resolve_exec_shell(
+            "auto",
+            platform="posix",
+            which=lambda name: "/usr/bin/bash" if name == "bash" else None,
+        )
+    )
 
 
 def _fake_process_factory(
@@ -121,7 +134,7 @@ def _fake_process_factory(
     return calls
 
 
-def test_exec_schema_declares_bash_command_cwd_and_timeout(workspace: Path) -> None:
+def test_exec_schema_declares_host_shell_command_cwd_and_timeout(workspace: Path) -> None:
     schema = ExecTool(workspace=workspace).to_schema()
 
     assert schema == {
@@ -134,7 +147,7 @@ def test_exec_schema_declares_bash_command_cwd_and_timeout(workspace: Path) -> N
                 "properties": {
                     "command": {
                         "type": "string",
-                        "description": "Bash command to execute.",
+                        "description": "Shell command to execute.",
                         "minLength": 1,
                     },
                     "cwd": {
@@ -158,7 +171,7 @@ def test_exec_schema_declares_bash_command_cwd_and_timeout(workspace: Path) -> N
 
 
 @pytest.mark.asyncio
-async def test_exec_starts_a_login_bash_with_minimal_environment_and_captured_streams(
+async def test_exec_starts_a_no_profile_bash_with_minimal_environment_and_captured_streams(
     monkeypatch: pytest.MonkeyPatch,
     workspace: Path,
 ) -> None:
@@ -178,7 +191,7 @@ async def test_exec_starts_a_login_bash_with_minimal_environment_and_captured_st
     assert "stdout:\nout\n" in result.content
     assert "stderr:\nerr\n" in result.content
     argv, options = calls[0]
-    assert argv == ("bash", "--login", "-c", command)
+    assert argv == ("/usr/bin/bash", "--noprofile", "--norc", "-c", command)
     assert options["cwd"] == os.fspath(nested.resolve())
     assert options["stdin"] is asyncio.subprocess.DEVNULL
     assert options["stdout"] is asyncio.subprocess.PIPE
@@ -207,6 +220,54 @@ async def test_exec_keeps_nonzero_exit_success_and_replaces_invalid_utf8(
     assert "Exit code: 23" in result.content
     assert "ok\ufffd" in result.content
     assert "failed\ufffd" in result.content
+
+
+@pytest.mark.asyncio
+async def test_exec_freezes_canonical_cwd_before_inspection_and_execution(
+    monkeypatch: pytest.MonkeyPatch,
+    workspace: Path,
+    tmp_path: Path,
+) -> None:
+    inspected: list[Path] = []
+    executed: list[Path] = []
+    inside = workspace / "inside"
+    outside = tmp_path / "outside"
+    inside.mkdir()
+    outside.mkdir()
+    dot_resolutions = 0
+
+    def drifting_resolution(root: Path, requested: str | Path) -> Path:
+        nonlocal dot_resolutions
+        del root
+        if requested == ".":
+            dot_resolutions += 1
+            return inside if dot_resolutions < 4 else outside
+        return Path(requested)
+
+    class Host:
+        resolved_shell = _bash_host().resolved_shell
+
+        async def inspect(self, command: str, cwd: Path) -> ExecAssessment:
+            del command
+            inspected.append(cwd)
+            return ExecAssessment(syntax_confidence="high", syntax_uncertain=False)
+
+        async def execute(self, command: str, cwd: Path, timeout: int) -> ExecOutcome:
+            del command, timeout
+            executed.append(cwd)
+            return ExecOutcome(exit_code=0, stdout=b"", stderr=b"")
+
+        def process_spec(self, cwd: Path) -> ExecProcessSpec:
+            raise AssertionError(f"unexpected process spec request for {cwd}")
+
+    monkeypatch.setattr(tool_base_module, "resolve_tool_path", drifting_resolution)
+    gateway = SingleToolGateway((ExecTool(workspace=workspace, host=Host()),))
+
+    result = await gateway.call(_call({"command": "pwd"}))
+
+    assert result.status == "success"
+    assert inspected == executed == [inside]
+    assert dot_resolutions == 1
 
 
 @pytest.mark.asyncio

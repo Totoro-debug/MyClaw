@@ -4513,7 +4513,7 @@ async def test_direct_terminal_loop_exec_confirmation_preserves_the_exact_long_c
             str(cast(Static, item).content) for item in app.screen.query(".confirmation-details")
         ]
         assert f"Command: {command}" in details
-        assert "CWD: ." in details
+        assert f"CWD: {workspace.resolve()}" in details
         assert "Timeout: 45" in details
 
         await pilot.press("escape")

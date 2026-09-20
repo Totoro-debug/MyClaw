@@ -42,6 +42,7 @@ from myclaw.agent.runner import (
 )
 from myclaw.agent.session.session import Session, SessionStoragePartition
 from myclaw.agent.tools.base import BaseTool
+from myclaw.agent.tools.core.exec_host import ExecHost
 from myclaw.agent.tools.deferred import build_agent_run_gateway
 from myclaw.agent.tools.tool_gateway import (
     ConfirmationDecision,
@@ -201,6 +202,7 @@ class AgentLoop:
         monotonic_now: Callable[[], float],
         mcp_tools: Sequence[BaseTool] = (),
         mcp_keywords: Mapping[str, Sequence[str]] | None = None,
+        exec_host: ExecHost | None = None,
     ) -> None:
         if workspace_state.workspace_path != workspace_path:
             raise ValueError("Agent Loop Workspace State must belong to the Workspace")
@@ -226,6 +228,7 @@ class AgentLoop:
             schedule_service=schedule_service,
             skill_root=skill_loader.root,
             additional_tools=tuple(mcp_tools),
+            exec_host=exec_host,
         )
         selected_mcp_keywords = {} if mcp_keywords is None else dict(mcp_keywords)
         baseline_gateway = build_agent_run_gateway(

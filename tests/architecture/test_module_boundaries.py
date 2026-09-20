@@ -23,6 +23,9 @@ _CLI_TOOL_IMPORTS = frozenset(
         ("myclaw.agent.tools.mcp_runtime", "MCPToolSnapshot"),
         ("myclaw.agent.tools.mcp_keywords", "MCPKeywordPreparer"),
         ("myclaw.agent.tools.tool_gateway", "BUILT_IN_TOOL_NAMES"),
+        ("myclaw.agent.tools.core.exec_host", "EXEC_CAPABILITY_ERROR"),
+        ("myclaw.agent.tools.core.exec_host", "create_exec_host"),
+        ("myclaw.agent.tools.core.exec_host", "resolve_exec_shell"),
     }
 )
 _TOOL_EXECUTION_DISPATCH_METHODS = frozenset(
@@ -863,7 +866,10 @@ def test_package_initializers_do_not_create_aggregate_import_entries() -> None:
 
 
 def test_host_selection_is_confined_to_the_workspace_filesystem_adapter() -> None:
-    expected = {Path("myclaw/utils/host_filesystem.py")}
+    expected = {
+        Path("myclaw/utils/host_filesystem.py"),
+        Path("myclaw/agent/tools/core/exec_host.py"),
+    }
     actual = {
         path.relative_to(PROJECT_ROOT)
         for path in _python_files(PACKAGE_ROOT)

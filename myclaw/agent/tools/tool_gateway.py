@@ -20,6 +20,7 @@ from myclaw.agent.tools.base import (
 )
 from myclaw.agent.tools.core.edit_file import EditFileTool
 from myclaw.agent.tools.core.exec import ExecTool
+from myclaw.agent.tools.core.exec_host import ExecHost
 from myclaw.agent.tools.core.glob import GlobTool
 from myclaw.agent.tools.core.grep import GrepTool
 from myclaw.agent.tools.core.list_dir import ListDirTool
@@ -208,6 +209,7 @@ class ToolGateway:
         additional_tools: Sequence[BaseTool] = (),
         permission_policy: ToolPermissionPolicy | None = None,
         permission_context: PermissionContext | None = None,
+        exec_host: ExecHost | None = None,
     ) -> None:
         if not isinstance(workspace, Path):
             raise TypeError("Tool Gateway requires a Path")
@@ -224,7 +226,7 @@ class ToolGateway:
             ListDirTool(workspace=workspace),
             GlobTool(workspace=workspace),
             GrepTool(workspace=workspace),
-            ExecTool(workspace=workspace),
+            ExecTool(workspace=workspace, host=exec_host),
             WebSearchTool(),
             WebFetchTool(),
             ScheduleTool(schedule_service=schedule_service),
@@ -417,7 +419,7 @@ class ToolGateway:
             return _result(tool_call, "refused", refusal)
 
         try:
-            facts = tool.build_invocation_facts(
+            facts = await tool.collect_invocation_facts(
                 prepared_arguments,
                 safety_reason=safety_reason,
             )
