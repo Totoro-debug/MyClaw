@@ -653,6 +653,7 @@ class AgentLoop:
                         workspace_state,
                         job.job_id,
                         now=self._schedule_now,
+                        title=cast(str, job.title),
                     )
                 try:
                     await self._run_schedule_agent(schedule_session, job)

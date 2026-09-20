@@ -1634,6 +1634,8 @@ def test_tool_message_preserves_provider_fields_and_unknown_extensions(
         ("\n  \u300c  Project\t review  \u300d\nIgnore this line", "Project review"),
         ("\n\t\t", "Untitled session"),
         ('"  Quoted title  "', "Quoted title"),
+        ("\u201c  Curly quoted title  \u201d", "Curly quoted title"),
+        ("\u300cone-sided title", "\u300cone-sided title"),
         ("\u754c" * 70, "\u754c" * 60),
     ],
 )

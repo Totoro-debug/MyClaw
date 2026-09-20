@@ -174,6 +174,7 @@ async def test_dream_registration_persists_a_hidden_recurring_system_job(
     assert registered.job_id == "dream"
     assert registered.source == "system"
     assert registered.message
+    assert registered.title == "Dream"
     assert registered.schedule == JobSchedule.cron("0 * * * *", "Asia/Shanghai")
     assert await service.public_snapshot() == ()
     assert await WorkspaceScheduleStore(state).snapshot() == (registered,)

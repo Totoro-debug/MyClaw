@@ -472,6 +472,7 @@ async def test_agent_loop_manages_schedule_jobs_without_confirmation(
                 {
                     "job_id": job_id,
                     "message": "ship report",
+                    "title": "ship report",
                     "schedule": {"type": "every", "every_seconds": 60},
                 }
             ]
@@ -798,6 +799,7 @@ async def test_schedule_tool_loop_does_not_prepare_compaction_inside_agent_run(
         partition=SessionStoragePartition.SCHEDULE,
     )
     assert persisted.last_compacted == 0
+    assert persisted.metadata["title"] == "Untitled session"
 
 
 @pytest.mark.asyncio
@@ -1419,6 +1421,7 @@ async def test_schedule_session_uses_schedule_clock_for_persisted_timestamps(
     job = ScheduleJob(
         job_id=str(JOB_UUID),
         message="Run at the Schedule clock time.",
+        title="Schedule clock title",
         schedule=JobSchedule.at("2026-08-07T05:59:00.000+00:00"),
         created_at_ms=1,
         updated_at_ms=1,
@@ -1438,6 +1441,7 @@ async def test_schedule_session_uses_schedule_clock_for_persisted_timestamps(
     expected_timestamp = schedule_now.isoformat(timespec="milliseconds")
     assert schedule_session.created_at == schedule_now
     assert schedule_session.updated_at == schedule_now
+    assert schedule_session.metadata["title"] == "Schedule clock title"
     assert {message["timestamp"] for message in schedule_session.messages} == {expected_timestamp}
 
 

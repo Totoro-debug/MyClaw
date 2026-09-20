@@ -1,5 +1,6 @@
 import asyncio
 import json
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -7,6 +8,7 @@ import pytest
 from myclaw.agent.workspace_state import WorkspaceState
 from myclaw.schedule.model import JobSchedule, ScheduleJob, ScheduleJobState
 from myclaw.schedule.store import (
+    ScheduleStaleRemovalError,
     ScheduleStateError,
     ScheduleStoreFaultedError,
     WorkspaceScheduleStore,
@@ -29,12 +31,14 @@ def _job(
     *,
     source: str = "user",
     message: str = "Run this.",
+    title: str | None = None,
     state: ScheduleJobState | None = None,
 ) -> ScheduleJob:
     return ScheduleJob(
         job_id=job_id,
         source=source,  # type: ignore[arg-type]
         message=message,
+        title=title,
         schedule=JobSchedule(kind="every", every_seconds=60),
         state=ScheduleJobState() if state is None else state,
         created_at_ms=10,
@@ -186,6 +190,85 @@ async def test_write_failure_leaves_the_last_complete_document_for_restart(
 
 
 @pytest.mark.asyncio
+async def test_exact_old_schema_derives_title_and_rewrites_on_next_successful_mutation(
+    workspace: Path,
+) -> None:
+    state = _state(workspace)
+    legacy = _job(message="First line\nSecond line").to_dict()
+    legacy.pop("title")
+    state.schedule_path.write_text(json.dumps([legacy], separators=(",", ":")), encoding="utf-8")
+
+    store = WorkspaceScheduleStore(state)
+
+    assert (await store.snapshot())[0].title == "First line"
+    assert json.loads(state.schedule_path.read_text(encoding="utf-8")) == [legacy]
+
+    await store.add_user_job(_job(OTHER_ID, message="New job"))
+
+    persisted = json.loads(state.schedule_path.read_text(encoding="utf-8"))
+    assert [item["title"] for item in persisted] == ["First line", "New job"]
+    assert all(set(item) == set(_job().to_dict()) for item in persisted)
+    restarted = WorkspaceScheduleStore(state)
+    assert [job.title for job in await restarted.snapshot()] == ["First line", "New job"]
+
+
+@pytest.mark.asyncio
+async def test_exact_old_dream_schema_uses_the_fixed_title(workspace: Path) -> None:
+    state = _state(workspace)
+    legacy = _job(
+        SYSTEM_ID,
+        source="system",
+        message="Unstable internal message.",
+    ).to_dict()
+    legacy.pop("title")
+    state.schedule_path.write_text(json.dumps([legacy], separators=(",", ":")), encoding="utf-8")
+
+    store = WorkspaceScheduleStore(state)
+
+    assert (await store.snapshot())[0].title == "Dream"
+
+
+@pytest.mark.asyncio
+async def test_failed_mutation_does_not_claim_old_schema_migration(
+    workspace: Path,
+) -> None:
+    state = _state(workspace)
+    legacy = _job(message="Legacy title").to_dict()
+    legacy.pop("title")
+    document = json.dumps([legacy], separators=(",", ":"))
+    state.schedule_path.write_text(document, encoding="utf-8")
+
+    def fail_replace(path: Path, content: str) -> None:
+        del path, content
+        raise OSError("injected replacement failure")
+
+    store = WorkspaceScheduleStore(state, replace_text=fail_replace)
+    with pytest.raises(OSError, match="injected replacement failure"):
+        await store.commit_terminal(JOB_ID, finished_at_ms=20, status="ok")
+
+    assert state.schedule_path.read_text(encoding="utf-8") == document
+    assert (await store.snapshot())[0].state == ScheduleJobState()
+
+    restarted = WorkspaceScheduleStore(state)
+    await restarted.add_user_job(_job(OTHER_ID, message="Migration retry"))
+    persisted = json.loads(state.schedule_path.read_text(encoding="utf-8"))
+    assert [item["title"] for item in persisted] == ["Legacy title", "Migration retry"]
+
+
+@pytest.mark.asyncio
+async def test_public_removal_detects_title_only_changes(workspace: Path) -> None:
+    state = _state(workspace)
+    job = _job(title="Original title")
+    await WorkspaceScheduleStore(state).add_user_job(job)
+    store = WorkspaceScheduleStore(state)
+
+    with pytest.raises(ScheduleStaleRemovalError, match="changed before removal"):
+        await store.remove_user_job(job.job_id, expected=replace(job, title="Changed title"))
+
+    assert await store.snapshot() == (job,)
+
+
+@pytest.mark.asyncio
 async def test_public_removal_treats_a_system_job_as_missing(workspace: Path) -> None:
     state = _state(workspace)
     system_job = _job(SYSTEM_ID, source="system", message="Internal run.")
@@ -238,6 +321,47 @@ def test_strict_load_rejects_duplicate_nested_keys(workspace: Path) -> None:
     )
 
     with pytest.raises(Exception, match="Schedule state"):
+        WorkspaceScheduleStore(state)
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        lambda document: document.update({"title": None}),
+        lambda document: document.update({"title": "  Canonical "}),
+        lambda document: document.update({"title": "Canonical", "legacy_field": True}),
+        lambda document: document.update({"unknown_field": True}),
+    ],
+)
+def test_strict_load_rejects_partial_hybrid_and_unknown_job_fields(
+    workspace: Path,
+    change: object,
+) -> None:
+    state = _state(workspace)
+    document = _job().to_dict()
+    assert callable(change)
+    change(document)
+    state.schedule_path.write_text(json.dumps([document], separators=(",", ":")), encoding="utf-8")
+
+    with pytest.raises(ScheduleStateError):
+        WorkspaceScheduleStore(state)
+
+
+@pytest.mark.parametrize("reverse", [False, True])
+def test_strict_load_rejects_documents_mixing_old_and_new_job_schemas(
+    workspace: Path,
+    reverse: bool,
+) -> None:
+    state = _state(workspace)
+    old_job = _job().to_dict()
+    old_job.pop("title")
+    new_job = _job(OTHER_ID).to_dict()
+    jobs = [old_job, new_job]
+    if reverse:
+        jobs.reverse()
+    state.schedule_path.write_text(json.dumps(jobs, separators=(",", ":")), encoding="utf-8")
+
+    with pytest.raises(ScheduleStateError):
         WorkspaceScheduleStore(state)
 
 

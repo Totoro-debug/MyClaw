@@ -15,7 +15,7 @@ from loguru import logger
 from myclaw.agent.workspace_state import WorkspaceState
 from myclaw.errors import ErrorInfo
 from myclaw.logging.session import session_log
-from myclaw.schedule.model import DREAM_JOB_ID, JobSchedule, ScheduleJob
+from myclaw.schedule.model import DREAM_JOB_ID, DREAM_JOB_TITLE, JobSchedule, ScheduleJob
 from myclaw.schedule.store import (
     ScheduleStaleRemovalError,
     ScheduleStateError,
@@ -869,6 +869,7 @@ def _new_dream_job(schedule: JobSchedule, *, now_ms: int) -> ScheduleJob:
         job_id=DREAM_JOB_ID,
         source="system",
         message="Internal Dream schedule.",
+        title=DREAM_JOB_TITLE,
         schedule=schedule,
         created_at_ms=now_ms,
         updated_at_ms=now_ms,

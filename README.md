@@ -76,6 +76,10 @@ myclaw
 
 启动目录即 Workspace，不会自动切换到 Git 根目录。运行状态保存在该目录的 `.myclaw/` 中；定时任务仅在 MyClaw 进程运行期间执行。
 
+Schedule Tool 的 `add` 可选接收用户可见 `title`；它会按 Conversation Session 的空白和成对引号规则规范化，并确定性截断到 60 个 Unicode code points。只有省略该字段时才从 `message` 第一条非空行派生；显式 `null` 或规范化后为空的值会被拒绝。`add` 和 `list` 的每个公开 Job 都返回 `job_id`、`title`、`message` 和 `schedule`。新建用户 Schedule Conversation Session 的初始 title 与 Job title 相同，Job 始终是 title 的权威来源。
+
+Workspace 的 `.myclaw/schedule.json` 使用严格 canonical Schedule Job schema，当前记录必须包含 `title`。升级时仅接受整份文档都使用完整旧字段集的状态，并在读取时派生 title；下一次成功的 Schedule Store 写入会把全部记录改写为新 schema。旧新记录混用、单条记录混合字段、未知字段和失败写入都不会被静默修复。
+
 `Enter` 提交输入，`Ctrl+J` 换行；`Ctrl+C` 取消当前回复，输入 `exit` 或 `quit` 退出。
 
 以下管理命令需单独输入，不附带参数：

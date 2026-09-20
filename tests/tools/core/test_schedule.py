@@ -77,12 +77,15 @@ def test_schema_exposes_the_three_actions_and_optional_schedule_branches(
     assert set(properties) == {
         "action",
         "message",
+        "title",
         "every_seconds",
         "cron_expr",
         "timezone",
         "at_time",
         "job_id",
     }
+    assert properties["title"]["type"] == "string"
+    assert "default" not in properties["title"]
 
 
 @pytest.mark.asyncio
@@ -124,12 +127,74 @@ async def test_add_uses_the_common_gateway_without_confirmation_and_ignores_lowe
         "job": {
             "job_id": str(JOB_UUID),
             "message": "Run it",
+            "title": "Run it",
             "schedule": {"type": "every", "every_seconds": 60},
         },
     }
     jobs = await store.snapshot()
     assert len(jobs) == 1
     assert jobs[0].message == "Run it"
+
+
+@pytest.mark.asyncio
+async def test_add_normalizes_explicit_title_and_rejects_invalid_explicit_titles(
+    workspace: Path,
+    agent_home: Path,
+) -> None:
+    store = _store(workspace, agent_home)
+    gateway = _gateway(
+        ScheduleTool(
+            schedule_service=_service(store),
+            now=lambda: NOW,
+            new_uuid=lambda: JOB_UUID,
+        )
+    )
+
+    explicit = await gateway.call(
+        ModelToolCall(
+            id="call_explicit_title",
+            name="schedule",
+            arguments=json.dumps(
+                {
+                    "action": "add",
+                    "message": "Run it",
+                    "title": "\n \u300c Weekly\t review \u300d\nignored",
+                    "every_seconds": 60,
+                }
+            ),
+        )
+    )
+
+    assert explicit.status == "success"
+    assert json.loads(explicit.content)["job"]["title"] == "Weekly review"
+    assert (await store.snapshot())[0].title == "Weekly review"
+
+    empty = await gateway.call(
+        ModelToolCall(
+            id="call_empty_title",
+            name="schedule",
+            arguments=json.dumps(
+                {"action": "add", "message": "Another", "title": '""', "every_seconds": 60}
+            ),
+        )
+    )
+
+    assert empty.status == "error"
+    assert empty.content == "Invalid arguments for schedule."
+
+    null = await gateway.call(
+        ModelToolCall(
+            id="call_null_title",
+            name="schedule",
+            arguments=json.dumps(
+                {"action": "add", "message": "Another", "title": None, "every_seconds": 60}
+            ),
+        )
+    )
+
+    assert null.status == "error"
+    assert null.content == "Invalid arguments for schedule."
+    assert len(await store.snapshot()) == 1
 
 
 @pytest.mark.asyncio
@@ -308,7 +373,13 @@ async def test_list_returns_only_public_jobs_in_creation_then_id_order(
 
     result = await _gateway(
         ScheduleTool(schedule_service=_service(store), now=lambda: NOW, new_uuid=lambda: JOB_UUID)
-    ).call(ModelToolCall(id="call_list", name="schedule", arguments='{"action":"list"}'))
+    ).call(
+        ModelToolCall(
+            id="call_list",
+            name="schedule",
+            arguments='{"action":"list","title":null}',
+        )
+    )
 
     assert result.status == "success"
     assert result.confirmation is None
@@ -317,16 +388,19 @@ async def test_list_returns_only_public_jobs_in_creation_then_id_order(
             {
                 "job_id": str(earlier_id),
                 "message": "Earlier",
+                "title": "Earlier",
                 "schedule": {"type": "at", "at_time": "2026-08-07T12:30:00.000+00:00"},
             },
             {
                 "job_id": str(first_id),
                 "message": "First",
+                "title": "First",
                 "schedule": {"type": "at", "at_time": "2026-08-07T13:00:00.000+00:00"},
             },
             {
                 "job_id": str(second_id),
                 "message": "Second",
+                "title": "Second",
                 "schedule": {"type": "at", "at_time": "2026-08-07T14:00:00.000+00:00"},
             },
         ]
@@ -384,7 +458,9 @@ async def test_remove_requires_canonical_uuid_and_hides_unknown_or_system_jobs(
         ModelToolCall(
             id="call_remove",
             name="schedule",
-            arguments=json.dumps({"action": "remove", "job_id": str(JOB_UUID)}),
+            arguments=json.dumps(
+                {"action": "remove", "job_id": str(JOB_UUID), "title": None}
+            ),
         )
     )
 
@@ -396,7 +472,14 @@ async def test_remove_requires_canonical_uuid_and_hides_unknown_or_system_jobs(
     assert system.content == "Schedule Job was not found."
     assert removed.status == "success"
     assert removed.confirmation is None
-    assert json.loads(removed.content)["job"]["job_id"] == str(JOB_UUID)
+    assert json.loads(removed.content) == {
+        "action": "remove",
+        "job": {
+            "job_id": str(JOB_UUID),
+            "message": "Remove me",
+            "schedule": {"type": "at", "at_time": "2026-08-07T13:00:00.000+00:00"},
+        },
+    }
     assert await store.snapshot() == (hidden,)
 
 

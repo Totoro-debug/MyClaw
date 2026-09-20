@@ -11,6 +11,7 @@ def test_schedule_job_round_trips_the_strict_persisted_shape() -> None:
     job = ScheduleJob(
         job_id=JOB_ID,
         message="Review the project.",
+        title="Project review",
         schedule=JobSchedule(
             kind="cron",
             cron_expr="0 9 * * 1",
@@ -26,6 +27,7 @@ def test_schedule_job_round_trips_the_strict_persisted_shape() -> None:
         "job_id",
         "source",
         "message",
+        "title",
         "schedule",
         "state",
         "created_at_ms",
@@ -35,6 +37,7 @@ def test_schedule_job_round_trips_the_strict_persisted_shape() -> None:
         "job_id": JOB_ID,
         "source": "user",
         "message": "Review the project.",
+        "title": "Project review",
         "schedule": {
             "kind": "cron",
             "at_time": None,
@@ -77,6 +80,28 @@ def test_schedule_job_accepts_the_reserved_dream_system_identity() -> None:
 
     assert job.source == "system"
     assert job.job_id == "dream"
+    assert job.title == "Dream"
+
+
+def test_dream_title_is_fixed_even_when_its_message_is_unstable() -> None:
+    job = _valid_job(
+        job_id="dream",
+        source="system",
+        message="A changing internal message.",
+    )
+
+    assert job.title == "Dream"
+
+
+def test_dream_rejects_a_noncanonical_explicit_title() -> None:
+    with pytest.raises(ValueError, match="fixed"):
+        _valid_job(job_id="dream", source="system", title="Derived from message")
+
+
+def test_canonical_dream_schema_round_trips_the_fixed_title() -> None:
+    job = _valid_job(job_id="dream", source="system", title="Dream")
+
+    assert ScheduleJob.from_dict(job.to_dict()) == job
 
 
 @pytest.mark.parametrize(
@@ -145,6 +170,43 @@ def _valid_job(**changes: object) -> ScheduleJob:
     }
     values.update(changes)
     return ScheduleJob(**values)  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize(
+    ("title", "expected"),
+    [
+        ("\n  \u300c  Project\t review  \u300d\nIgnore this line", "Project review"),
+        ('"  Quoted title  "', "Quoted title"),
+        ("'Single quoted title'", "Single quoted title"),
+        ('"one-sided title', '"one-sided title'),
+        ("a" * 59, "a" * 59),
+        ("b" * 60, "b" * 60),
+        ("c" * 61, "c" * 60),
+        ("\U0001f600" * 61, "\U0001f600" * 60),
+        ("e\u0301" * 31, "e\u0301" * 30),
+    ],
+)
+def test_schedule_job_normalizes_explicit_title_and_truncates_by_code_point(
+    title: str,
+    expected: str,
+) -> None:
+    job = _valid_job(title=title)
+
+    assert job.title == expected
+    assert len(job.title) <= 60
+    assert ScheduleJob.from_dict(job.to_dict()) == job
+
+
+@pytest.mark.parametrize("title", ["", "\n\t", '""', "''", "\u300c\u300d"])
+def test_schedule_job_rejects_explicit_title_empty_after_normalization(title: str) -> None:
+    with pytest.raises(ValueError, match="title"):
+        _valid_job(title=title)
+
+
+def test_schedule_job_derives_title_from_the_first_nonempty_message_line() -> None:
+    job = _valid_job(message="First\t line  \nSecond line")
+
+    assert job.title == "First line"
 
 
 @pytest.mark.parametrize(
@@ -371,6 +433,15 @@ def test_schedule_job_from_dict_rejects_unknown_or_missing_fields() -> None:
         ScheduleJob.from_dict({**document, "extra": True})
     with pytest.raises(ValueError, match="persisted schema"):
         ScheduleJob.from_dict({key: value for key, value in document.items() if key != "state"})
+
+
+@pytest.mark.parametrize("title", [None, "  Canonical ", "x" * 61])
+def test_schedule_job_from_dict_rejects_noncanonical_new_schema_title(title: object) -> None:
+    document = _valid_job(title="Canonical").to_dict()
+    document["title"] = title
+
+    with pytest.raises(ValueError, match="title"):
+        ScheduleJob.from_dict(document)
 
 
 @pytest.mark.parametrize(

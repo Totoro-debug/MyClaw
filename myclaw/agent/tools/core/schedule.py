@@ -12,6 +12,7 @@ from myclaw.agent.tools.base import BaseTool, ToolError
 from myclaw.agent.tools.schema import Schema
 from myclaw.schedule.model import JobSchedule, ScheduleJob
 from myclaw.schedule.service import ScheduleService, ScheduleStaleRemovalError
+from myclaw.utils.text import normalize_title_candidate
 from myclaw.utils.validation import require_uuid4_string
 
 _INVALID_ARGUMENTS = "Invalid arguments for schedule."
@@ -36,6 +37,9 @@ class _ScheduleArgumentsSchema(Schema):
                     description="The message to run for an added Schedule Job.",
                     nullable=True,
                     default=None,
+                ),
+                "title": Schema.string(
+                    description="The stable user-visible title for an added Schedule Job.",
                 ),
                 "every_seconds": Schema.integer(
                     description="Run again this many seconds after completion.",
@@ -81,6 +85,8 @@ class _ScheduleArgumentsSchema(Schema):
             message = value.get("message")
             if message is not None:
                 projected["message"] = message
+            if "title" in value:
+                projected["title"] = value["title"]
             for schedule_name in ("every_seconds", "cron_expr", "at_time"):
                 schedule_value = value.get(schedule_name)
                 if schedule_value is None:
@@ -117,11 +123,21 @@ class ScheduleTool(BaseTool):
     def _build_preparation_schema(self) -> Schema:
         return _ScheduleArgumentsSchema()
 
+    async def prepare_arguments(self, arguments: dict[str, Any]) -> dict[str, Any]:
+        if (
+            arguments.get("action") == "add"
+            and "title" in arguments
+            and arguments["title"] is None
+        ):
+            raise ToolError(_INVALID_ARGUMENTS)
+        return await super().prepare_arguments(arguments)
+
     def validate_arguments(  # type: ignore[override]
         self,
         *,
         action: str,
         message: str | None = None,
+        title: str | None = None,
         every_seconds: int | None = None,
         cron_expr: str | None = None,
         timezone: str | None = None,
@@ -131,6 +147,7 @@ class ScheduleTool(BaseTool):
         if action == "add":
             self._normalize_add(
                 message=message,
+                title=title,
                 every_seconds=every_seconds,
                 cron_expr=cron_expr,
                 timezone=timezone,
@@ -152,6 +169,7 @@ class ScheduleTool(BaseTool):
         *,
         action: str,
         message: str | None = None,
+        title: str | None = None,
         every_seconds: int | None = None,
         cron_expr: str | None = None,
         timezone: str | None = None,
@@ -159,8 +177,9 @@ class ScheduleTool(BaseTool):
         job_id: str | None = None,
     ) -> str:
         if action == "add":
-            normalized_message, schedule = self._normalize_add(
+            normalized_message, normalized_title, schedule = self._normalize_add(
                 message=message,
+                title=title,
                 every_seconds=every_seconds,
                 cron_expr=cron_expr,
                 timezone=timezone,
@@ -170,6 +189,7 @@ class ScheduleTool(BaseTool):
             job = ScheduleJob(
                 job_id=str(self._new_uuid()),
                 message=normalized_message,
+                title=normalized_title,
                 schedule=schedule,
                 created_at_ms=timestamp,
                 updated_at_ms=timestamp,
@@ -208,7 +228,7 @@ class ScheduleTool(BaseTool):
                 raise ToolError(_STATE_UPDATE_FAILED) from error
             if not removed:
                 raise ToolError(_STALE_REMOVAL)
-            return _json_content({"action": "remove", "job": _public_job(public_job)})
+            return _json_content({"action": "remove", "job": _remove_result_job(public_job)})
 
         raise ToolError(_INVALID_ARGUMENTS)
 
@@ -216,15 +236,23 @@ class ScheduleTool(BaseTool):
         self,
         *,
         message: str | None,
+        title: str | None,
         every_seconds: int | None,
         cron_expr: str | None,
         timezone: str | None,
         at_time: str | None,
-    ) -> tuple[str, JobSchedule]:
+    ) -> tuple[str, str, JobSchedule]:
         if not isinstance(message, str):
             raise ToolError(_INVALID_ARGUMENTS)
         normalized_message = message.strip()
         if not normalized_message or len(normalized_message) > 20_000:
+            raise ToolError(_INVALID_ARGUMENTS)
+        if title is not None and not isinstance(title, str):
+            raise ToolError(_INVALID_ARGUMENTS)
+        normalized_title = normalize_title_candidate(
+            normalized_message if title is None else title
+        )
+        if not normalized_title:
             raise ToolError(_INVALID_ARGUMENTS)
 
         if every_seconds is not None:
@@ -232,21 +260,21 @@ class ScheduleTool(BaseTool):
                 schedule = JobSchedule.every(every_seconds)
             except (TypeError, ValueError) as error:
                 raise ToolError(_INVALID_ARGUMENTS) from error
-            return normalized_message, schedule
+            return normalized_message, normalized_title, schedule
 
         if cron_expr is not None:
             try:
                 schedule = JobSchedule.from_cron_input(cron_expr, timezone)
             except (TypeError, ValueError) as error:
                 raise ToolError(_INVALID_ARGUMENTS) from error
-            return normalized_message, schedule
+            return normalized_message, normalized_title, schedule
 
         if at_time is not None:
             try:
                 schedule = JobSchedule.from_at_input(at_time)
             except (TypeError, ValueError) as error:
                 raise ToolError(_INVALID_ARGUMENTS) from error
-            return normalized_message, schedule
+            return normalized_message, normalized_title, schedule
 
         raise ToolError(_INVALID_ARGUMENTS)
 
@@ -284,6 +312,15 @@ def _public_schedule(schedule: JobSchedule) -> dict[str, Any]:
 
 
 def _public_job(job: ScheduleJob) -> dict[str, Any]:
+    return {
+        "job_id": job.job_id,
+        "title": job.title,
+        "message": job.message,
+        "schedule": _public_schedule(job.schedule),
+    }
+
+
+def _remove_result_job(job: ScheduleJob) -> dict[str, Any]:
     return {
         "job_id": job.job_id,
         "message": job.message,

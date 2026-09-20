@@ -11,6 +11,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from croniter import croniter  # type: ignore[import-untyped]
 
+from myclaw.utils.text import normalize_title_candidate
 from myclaw.utils.time import format_rfc3339_milliseconds
 from myclaw.utils.validation import require_nonnegative_int, require_uuid4_string
 
@@ -19,8 +20,9 @@ JobSource = Literal["user", "system"]
 JobStatus = Literal["ok", "error"]
 
 DREAM_JOB_ID = "dream"
+DREAM_JOB_TITLE = "Dream"
 
-_JOB_FIELDS = frozenset(
+_OLD_JOB_FIELDS = frozenset(
     {
         "job_id",
         "source",
@@ -31,6 +33,7 @@ _JOB_FIELDS = frozenset(
         "updated_at_ms",
     }
 )
+_JOB_FIELDS = _OLD_JOB_FIELDS | {"title"}
 _SCHEDULE_FIELDS = frozenset({"kind", "at_time", "every_seconds", "cron_expr", "timezone"})
 _STATE_FIELDS = frozenset({"last_finished_at_ms", "last_status", "last_error"})
 _RFC3339_MILLISECONDS = re.compile(
@@ -179,6 +182,7 @@ class ScheduleJob:
     updated_at_ms: int
     source: JobSource = "user"
     state: ScheduleJobState = field(default_factory=ScheduleJobState)
+    title: str | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.job_id, str):
@@ -195,6 +199,20 @@ class ScheduleJob:
             raise ValueError("message must be non-empty and trimmed")
         if len(self.message) > 20_000:
             raise ValueError("message must not exceed 20000 characters")
+        if self.source == "system" and self.job_id == DREAM_JOB_ID and self.title is None:
+            normalized_title = DREAM_JOB_TITLE
+        elif self.title is None:
+            normalized_title = normalize_title_candidate(self.message)
+        else:
+            if not isinstance(self.title, str):
+                raise ValueError("title must be a string")
+            normalized_title = normalize_title_candidate(self.title)
+        if not normalized_title:
+            raise ValueError("title must be non-empty after normalization")
+        if self.source == "system" and self.job_id == DREAM_JOB_ID:
+            if normalized_title != DREAM_JOB_TITLE:
+                raise ValueError("Dream Schedule Job title must be fixed")
+        object.__setattr__(self, "title", normalized_title)
         if not isinstance(self.schedule, JobSchedule):
             raise ValueError("schedule must be a JobSchedule")
         if self.source == "system" and self.schedule.kind == "at":
@@ -217,6 +235,7 @@ class ScheduleJob:
             "job_id": self.job_id,
             "source": self.source,
             "message": self.message,
+            "title": self.title,
             "schedule": self.schedule.to_dict(),
             "state": self.state.to_dict(),
             "created_at_ms": self.created_at_ms,
@@ -225,11 +244,14 @@ class ScheduleJob:
 
     @classmethod
     def from_dict(cls, value: Mapping[str, object]) -> ScheduleJob:
-        if set(value) != _JOB_FIELDS:
+        fields = set(value)
+        legacy = fields == _OLD_JOB_FIELDS
+        if not legacy and fields != _JOB_FIELDS:
             raise ValueError("Schedule Job fields do not match the persisted schema")
         job_id = value["job_id"]
         source = value["source"]
         message = value["message"]
+        title = value.get("title")
         schedule_value = value["schedule"]
         state_value = value["state"]
         created_at_ms = value["created_at_ms"]
@@ -240,6 +262,8 @@ class ScheduleJob:
             raise ValueError("source must be a string")
         if not isinstance(message, str):
             raise ValueError("message must be a string")
+        if not legacy and not isinstance(title, str):
+            raise ValueError("title must be a string")
         if not isinstance(schedule_value, dict):
             raise ValueError("schedule must be an object")
         if not isinstance(state_value, dict):
@@ -250,7 +274,7 @@ class ScheduleJob:
             raise ValueError("created_at_ms must be a nonnegative integer")
         if isinstance(updated_at_ms, bool) or not isinstance(updated_at_ms, int):
             raise ValueError("updated_at_ms must be a nonnegative integer")
-        return cls(
+        job = cls(
             job_id=job_id,
             message=message,
             schedule=schedule,
@@ -258,7 +282,11 @@ class ScheduleJob:
             updated_at_ms=updated_at_ms,
             source=cast(JobSource, source),
             state=state,
+            title=cast(str | None, None if legacy else title),
         )
+        if not legacy and job.title != title:
+            raise ValueError("title must be canonical")
+        return job
 
 
 def _schedule_from_dict(value: dict[str, object]) -> JobSchedule:
@@ -345,6 +373,7 @@ def _parse_canonical_rfc3339_milliseconds(value: str, *, field: str) -> datetime
 
 __all__ = [
     "DREAM_JOB_ID",
+    "DREAM_JOB_TITLE",
     "JobSchedule",
     "JobSource",
     "JobStatus",

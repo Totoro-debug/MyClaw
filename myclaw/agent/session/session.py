@@ -20,6 +20,8 @@ from myclaw.agent.tools.base import ArtifactReference
 from myclaw.agent.workspace_state import WorkspaceState
 from myclaw.utils.async_tasks import await_task_preserving_cancellation
 from myclaw.utils.host_filesystem import HOST_FILESYSTEM
+from myclaw.utils.text import normalize_title as _normalize_title
+from myclaw.utils.text import normalize_title_candidate
 from myclaw.utils.time import format_rfc3339_milliseconds, local_now
 from myclaw.utils.validation import (
     require_aware_datetime,
@@ -49,17 +51,6 @@ _SCHEDULE_SESSION_ID_PATTERN = re.compile(
     r"schedule_(?P<uuid>[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-"
     r"[0-9a-f]{4}-[0-9a-f]{12})"
 )
-_TITLE_PAIRS = (
-    ('"', '"'),
-    ("'", "'"),
-    ("\u201c", "\u201d"),
-    ("\u2018", "\u2019"),
-    ("\u300c", "\u300d"),
-    ("\u300e", "\u300f"),
-    ("\u00ab", "\u00bb"),
-)
-
-
 class Session:
     """Own the in-memory state and identity of one Conversation Session."""
 
@@ -531,7 +522,7 @@ class Session:
 
     @staticmethod
     def _normalize_title_candidate(value: str) -> str:
-        return _normalize_title(value, fallback="")
+        return normalize_title_candidate(value)
 
 
 def _coerce_partition(value: SessionStoragePartition | str) -> SessionStoragePartition:
@@ -894,16 +885,3 @@ def _accumulate_token_usage(
         key: current[key] + delta[key]
         for key in ("model_calls", "input_tokens", "output_tokens", "total_tokens")
     }
-
-
-def _normalize_title(value: str, *, fallback: str = "Untitled session") -> str:
-    for line in value.splitlines():
-        title = " ".join(line.split())
-        if not title:
-            continue
-        for opening, closing in _TITLE_PAIRS:
-            if len(title) >= 2 and title.startswith(opening) and title.endswith(closing):
-                title = " ".join(title[1:-1].split())
-                break
-        return title[:60] or fallback
-    return fallback
