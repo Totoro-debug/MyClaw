@@ -16,6 +16,7 @@ from myclaw.agent.tools.core._directory import (
     normalize_glob_pattern,
     report_path,
 )
+from myclaw.agent.tools.permission import FileAccess
 
 _OUTPUT_MODES: Final = frozenset({"content", "files_with_matches", "count"})
 _TYPE_PATTERNS: Final = {
@@ -152,6 +153,16 @@ class GrepTool(BaseTool):
     ) -> str | None:
         del pattern, glob, type, output_mode, fixed_string, ignore_case, context, head_limit, offset
         return self.workspace_path_safety_reason(workspace=self._workspace, requested=path)
+
+    def build_file_accesses(self, prepared_arguments: dict[str, object]) -> tuple[FileAccess, ...]:
+        return (
+            self.canonical_file_access(
+                workspace=self._workspace,
+                base=self._workspace,
+                requested=str(prepared_arguments["path"]),
+                role="read",
+            ),
+        )
 
     async def execute(
         self,

@@ -16,6 +16,7 @@ from zoneinfo import ZoneInfo
 
 from myclaw.agent.blackboard import Blackboard
 from myclaw.agent.memory.manager import MemoryManager
+from myclaw.agent.permission import PermissionSnapshot
 from myclaw.skills.catalog import LoadedSkill, ManualSkillInvocation, SkillLoader
 from myclaw.templates import render_template
 from myclaw.utils.time import format_rfc3339_milliseconds
@@ -136,6 +137,7 @@ class ContextBuilder:
         session_id: str,
         summary: str = "",
         blackboard: Blackboard | None = None,
+        permission_snapshot: PermissionSnapshot | None = None,
     ) -> list[dict[str, Any]]:
         """Build the minimum foreground request used by status and preflight."""
         return self.build_foreground_messages(
@@ -143,6 +145,7 @@ class ContextBuilder:
             session_id=session_id,
             blackboard=blackboard,
             summary=summary,
+            permission_snapshot=permission_snapshot,
         )
 
     def build_foreground_messages(
@@ -153,6 +156,7 @@ class ContextBuilder:
         blackboard: Blackboard | None = None,
         manual_invocation: ManualSkillInvocation | None = None,
         summary: str = "",
+        permission_snapshot: PermissionSnapshot | None = None,
     ) -> list[dict[str, Any]]:
         """Build the canonical initial Model Request Context for a foreground turn."""
         if manual_invocation is not None and not isinstance(
@@ -168,6 +172,7 @@ class ContextBuilder:
             blackboard=blackboard,
             manual_invocation=manual_invocation,
             summary=summary,
+            permission_snapshot=permission_snapshot,
         )
 
     def build_schedule_messages(
@@ -218,6 +223,7 @@ class ContextBuilder:
         manual_invocation: ManualSkillInvocation | None = None,
         current_time: datetime | None = None,
         summary: str = "",
+        permission_snapshot: PermissionSnapshot | None = None,
     ) -> list[dict[str, Any]]:
         if not isinstance(summary, str):
             raise TypeError("Context Builder summary must be a string")
@@ -245,6 +251,7 @@ class ContextBuilder:
                         else blackboard.to_dict()
                     ),
                     manual_invocation=manual_invocation,
+                    permission_snapshot=permission_snapshot,
                 ),
             }
         )
@@ -311,16 +318,17 @@ def _build_current_user_content(
     session_id: str,
     blackboard_projection: dict[str, str] | None = None,
     manual_invocation: ManualSkillInvocation | None = None,
+    permission_snapshot: PermissionSnapshot | None = None,
 ) -> str:
     if manual_invocation is None:
         rendered = (
-            f"{_format_runtime_context(current_time=current_time, session_id=session_id)}\n\n"
+            f"{_format_runtime_context(current_time=current_time, session_id=session_id, permission_snapshot=permission_snapshot)}\n\n"
             "## User Input\n\n"
             f"{content}"
         )
     else:
         rendered = (
-            f"{_format_runtime_context(current_time=current_time, session_id=session_id)}\n\n"
+            f"{_format_runtime_context(current_time=current_time, session_id=session_id, permission_snapshot=permission_snapshot)}\n\n"
             "## Skill Instructions\n\n"
             "```json\n"
             f"{_markdown_safe_json({'name': manual_invocation.metadata.name, 'body': manual_invocation.body})}\n"
@@ -341,11 +349,24 @@ def _build_current_user_content(
     return f"{rendered}\n\n{blackboard}"
 
 
-def _format_runtime_context(*, current_time: datetime, session_id: str) -> str:
-    return (
+def _format_runtime_context(
+    *,
+    current_time: datetime,
+    session_id: str,
+    permission_snapshot: PermissionSnapshot | None = None,
+) -> str:
+    rendered = (
         "## Runtime Context\n\n"
         f"- Current time: {format_rfc3339_milliseconds(current_time)}\n"
         f"- Session ID: {session_id}"
+    )
+    if permission_snapshot is None:
+        return rendered
+    return (
+        f"{rendered}\n"
+        f"- Tool Permission Level: {permission_snapshot.level}\n"
+        f"- Exec Shell: {permission_snapshot.exec_shell.family}\n"
+        "- Tool Confirmation: Permission checks may require one confirmation per Tool call."
     )
 
 

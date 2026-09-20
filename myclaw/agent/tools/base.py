@@ -26,7 +26,13 @@ from uuid import uuid4
 
 from loguru import logger
 
-from myclaw.agent.tools.permission import ToolAuthorizationSession, ToolInvocationFacts
+from myclaw.agent.tools.permission import (
+    FileAccess,
+    FileAccessRole,
+    ToolAuthorizationSession,
+    ToolInvocationFacts,
+    canonicalize_file_access,
+)
 from myclaw.agent.tools.schema import Schema, ToolParam
 from myclaw.utils.validation import require_nonnegative_int
 
@@ -276,6 +282,26 @@ class BaseTool(ABC, metaclass=_BaseToolMeta):
         return None if contained else _EXTERNAL_PATH_SAFETY_REASON
 
     @final
+    def canonical_file_access(
+        self,
+        *,
+        workspace: Path,
+        base: Path,
+        requested: str | Path,
+        role: FileAccessRole,
+    ) -> FileAccess:
+        """Build one canonical host path fact for a File Tool invocation."""
+        try:
+            return canonicalize_file_access(
+                workspace=workspace,
+                base=base,
+                requested=requested,
+                role=role,
+            )
+        except (OSError, RuntimeError, ValueError) as error:
+            raise self._path_resolution_error(error) from error
+
+    @final
     def _path_resolution_error(self, error: Exception) -> ToolError:
         operation = self.name.replace("_", " ").title()
         return ToolError(f"{operation} path could not be resolved: {error}")
@@ -372,7 +398,16 @@ class BaseTool(ABC, metaclass=_BaseToolMeta):
             tool_name=self.name,
             normalized_arguments=prepared_arguments,
             legacy_safety_reason=safety_reason,
+            file_accesses=self.build_file_accesses(prepared_arguments),
         )
+
+    def build_file_accesses(
+        self,
+        prepared_arguments: dict[str, Any],
+    ) -> tuple[FileAccess, ...]:
+        """Return structured host path facts for this invocation when applicable."""
+        del prepared_arguments
+        return ()
 
     async def collect_invocation_facts(
         self,

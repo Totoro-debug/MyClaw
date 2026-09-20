@@ -16,8 +16,10 @@ from mcp.types import CallToolResult
 from myclaw.agent.loop import AgentLoop, ConfirmationRequestView
 from myclaw.agent.memory.manager import MemoryManager
 from myclaw.agent.message_bus import MessageBus
+from myclaw.agent.permission import RuntimePermissionControl
 from myclaw.agent.session.session import Session
 from myclaw.agent.tools.base import BaseTool
+from myclaw.agent.tools.core.exec_host import create_exec_host, resolve_exec_shell
 from myclaw.agent.tools.core.web_fetch import JinaReaderClient
 from myclaw.agent.tools.deferred import RUN_BASELINE_TOOL_NAMES
 from myclaw.agent.tools.mcp import MCPTool, MCPToolSpec
@@ -222,6 +224,8 @@ def _agent_loop(
         now=lambda: NOW,
         new_uuid=uuid4,
         monotonic_now=lambda: 0.0,
+        exec_host=create_exec_host(resolve_exec_shell(configuration.runtime.exec_shell)),
+        permission_control=RuntimePermissionControl(configuration.runtime.permission_level),
         mcp_tools=mcp_tools,
     )
     return loop, router, schedule, bus
@@ -433,7 +437,7 @@ async def test_foreground_initial_request_has_zero_schema_cost_for_100_unused_mc
 
 
 @pytest.mark.asyncio
-async def test_agent_loop_reads_known_skill_path_without_confirmation(
+async def test_agent_loop_reads_known_skill_path_with_model_file_confirmation(
     agent_home: Path,
     workspace: Path,
 ) -> None:
@@ -467,7 +471,7 @@ async def test_agent_loop_reads_known_skill_path_without_confirmation(
     finally:
         await _close_loop(loop, router, schedule)
 
-    assert confirmations == []
+    assert len(confirmations) == 1
     tool_messages = [message for message in loop.session.messages if message["role"] == "tool"]
     assert len(tool_messages) == 1
     assert tool_messages[0]["content"] == "---\nname: review\n---\nbody\n"
@@ -524,6 +528,13 @@ async def test_agent_loop_advertises_and_persists_multiple_autonomous_skill_read
         agent_home, workspace, provider, config_text=config_text
     )
     session_id = loop.session.session_id
+    confirmations: list[ConfirmationRequestView] = []
+
+    def approve(request: ConfirmationRequestView) -> None:
+        confirmations.append(request)
+        loop.respond_to_confirmation(request.confirmation_id, "approved")
+
+    loop.bind_confirmation_callback(approve)
     try:
         await loop.start()
         messages = await collect_foreground_outbound(bus, "Use both Skills.")
@@ -531,6 +542,7 @@ async def test_agent_loop_advertises_and_persists_multiple_autonomous_skill_read
         await _close_loop(loop, router, schedule)
 
     assert messages[-1].metadata == {"_streamed": True}
+    assert len(confirmations) == 3
     assert len(provider.stream_requests) == 4
     system_prompt = provider.stream_requests[0].messages[0]["content"]
     assert isinstance(system_prompt, str)

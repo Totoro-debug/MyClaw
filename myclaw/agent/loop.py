@@ -31,6 +31,7 @@ from myclaw.agent.message_bus import (
     OutboundMessage,
     OutboundMessageType,
 )
+from myclaw.agent.permission import PermissionSnapshot, RuntimePermissionControl
 from myclaw.agent.run_errors import CommittableAgentRunError
 from myclaw.agent.runner import (
     AgentRunner,
@@ -44,6 +45,7 @@ from myclaw.agent.session.session import Session, SessionStoragePartition
 from myclaw.agent.tools.base import BaseTool
 from myclaw.agent.tools.core.exec_host import ExecHost
 from myclaw.agent.tools.deferred import build_agent_run_gateway
+from myclaw.agent.tools.permission import PermissionContext
 from myclaw.agent.tools.tool_gateway import (
     ConfirmationDecision,
     ConfirmationRequest,
@@ -200,9 +202,10 @@ class AgentLoop:
         now: Callable[[], datetime],
         new_uuid: Callable[[], UUID],
         monotonic_now: Callable[[], float],
+        exec_host: ExecHost,
+        permission_control: RuntimePermissionControl,
         mcp_tools: Sequence[BaseTool] = (),
         mcp_keywords: Mapping[str, Sequence[str]] | None = None,
-        exec_host: ExecHost | None = None,
     ) -> None:
         if workspace_state.workspace_path != workspace_path:
             raise ValueError("Agent Loop Workspace State must belong to the Workspace")
@@ -258,6 +261,8 @@ class AgentLoop:
         self._monotonic_now = monotonic_now
         self._schedule_now = schedule_service.current_time
         self._tool_gateway = tool_gateway
+        self._exec_host = exec_host
+        self._permission_control = permission_control
         self._baseline_tool_schemas = baseline_tool_schemas
         self._mcp_keywords = selected_mcp_keywords
         self._model_router = model_router
@@ -309,11 +314,19 @@ class AgentLoop:
     def tool_schemas(self) -> tuple[dict[str, Any], ...]:
         return tuple(deepcopy(schema) for schema in self._baseline_tool_schemas)
 
-    def _new_run_gateway(self, *, excluded_names: Sequence[str] = ()) -> ToolGateway:
+    def _new_run_gateway(
+        self,
+        *,
+        excluded_names: Sequence[str] = (),
+        permission_snapshot: PermissionSnapshot | None = None,
+        permission_context: PermissionContext | None = None,
+    ) -> ToolGateway:
         return build_agent_run_gateway(
             self._tool_gateway,
             excluded_names=excluded_names,
             mcp_keywords=self._mcp_keywords,
+            permission_snapshot=permission_snapshot,
+            permission_context=permission_context,
         )
 
     @property
@@ -692,7 +705,13 @@ class AgentLoop:
 
     async def _run_schedule_agent_scoped(self, session: Session, job: ScheduleJob) -> None:
         current_user = {"role": "user", "content": job.message}
-        run_gateway = self._new_run_gateway(excluded_names=("schedule",))
+        run_gateway = self._new_run_gateway(
+            excluded_names=("schedule",),
+            permission_context=PermissionContext(
+                origin="schedule",
+                workspace_root=self._workspace_state.workspace_path,
+            ),
+        )
 
         def project_messages(messages: Sequence[dict[str, Any]]) -> list[dict[str, Any]]:
             return self._context_builder.build_schedule_messages(
@@ -949,6 +968,7 @@ class AgentLoop:
         execution_ready: asyncio.Event,
     ) -> None:
         active_session = self._session
+        permission_snapshot = self._permission_control.snapshot(self._exec_host.resolved_shell)
         skill_state = self._skill_loader.skills
         manual_invocation = self._skill_loader.resolve_manual(inbound.content)
         start_title = not active_session.messages
@@ -972,6 +992,7 @@ class AgentLoop:
                             title_work=None,
                             manual_invocation=manual_invocation,
                             execution_ready=execution_ready,
+                            permission_snapshot=permission_snapshot,
                         )
                 else:
                     assert title_coordination is not None
@@ -983,6 +1004,7 @@ class AgentLoop:
                             title_work=title_work,
                             manual_invocation=manual_invocation,
                             execution_ready=execution_ready,
+                            permission_snapshot=permission_snapshot,
                         )
         finally:
             execution_ready.set()
@@ -1007,6 +1029,7 @@ class AgentLoop:
         title_work: _TitleWork | None,
         manual_invocation: ManualSkillInvocation | None = None,
         execution_ready: asyncio.Event,
+        permission_snapshot: PermissionSnapshot,
     ) -> bool:
         current_user = {"role": "user", "content": inbound.content}
         if title_work is not None:
@@ -1024,6 +1047,7 @@ class AgentLoop:
                 blackboard=staged_blackboard,
                 manual_invocation=manual_invocation,
                 summary="",
+                permission_snapshot=permission_snapshot,
             )
 
         run_context = self._new_agent_run_context(
@@ -1074,7 +1098,7 @@ class AgentLoop:
         else:
             staged_blackboard = None
             framing_usage = None
-        run_gateway = self._new_run_gateway()
+        run_gateway = self._new_run_gateway(permission_snapshot=permission_snapshot)
         try:
             initial_messages = await self._prepare_agent_run(
                 run_context,

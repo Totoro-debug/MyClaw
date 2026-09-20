@@ -6,6 +6,7 @@ from collections.abc import Collection, Mapping, Sequence
 
 from myclaw.agent.tools.base import BaseTool
 from myclaw.agent.tools.core.tool_search import ToolSearchTool
+from myclaw.agent.tools.permission import PermissionContext, PermissionSnapshot
 from myclaw.agent.tools.search import (
     BUILTIN_TOOL_SEARCH_KEYWORDS,
     ToolSearchDocument,
@@ -30,6 +31,8 @@ def build_agent_run_gateway(
     *,
     excluded_names: Collection[str] = (),
     mcp_keywords: Mapping[str, Sequence[str]] | None = None,
+    permission_snapshot: PermissionSnapshot | None = None,
+    permission_context: PermissionContext | None = None,
 ) -> ToolGateway:
     """Build one isolated deferred-exposure Gateway view.
 
@@ -56,6 +59,8 @@ def build_agent_run_gateway(
         excluded_names=excluded_names,
         exposed_names=RUN_BASELINE_TOOL_NAMES,
         run_tools=(ToolSearchTool(search_and_activate),),
+        permission_snapshot=permission_snapshot,
+        permission_context=permission_context,
     )
     baseline_names = frozenset(RUN_BASELINE_TOOL_NAMES)
     documents = tuple(

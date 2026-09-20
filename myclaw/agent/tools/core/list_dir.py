@@ -11,6 +11,7 @@ from myclaw.agent.tools.core._directory import (
     report_path,
     requested_path_has_directory_link,
 )
+from myclaw.agent.tools.permission import FileAccess
 
 
 class ListDirTool(BaseTool):
@@ -38,6 +39,16 @@ class ListDirTool(BaseTool):
     ) -> str | None:
         del recursive, max_entries
         return self.workspace_path_safety_reason(workspace=self._workspace, requested=path)
+
+    def build_file_accesses(self, prepared_arguments: dict[str, object]) -> tuple[FileAccess, ...]:
+        return (
+            self.canonical_file_access(
+                workspace=self._workspace,
+                base=self._workspace,
+                requested=str(prepared_arguments["path"]),
+                role="read",
+            ),
+        )
 
     async def execute(self, *, path: str, recursive: bool, max_entries: int) -> str:
         if requested_path_has_directory_link(self._workspace, path):

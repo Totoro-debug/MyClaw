@@ -14,6 +14,7 @@ from myclaw.agent.loop import AgentLoop, ModelContextOverflowError
 from myclaw.agent.memory.dream import Dream
 from myclaw.agent.memory.manager import MemoryManager
 from myclaw.agent.message_bus import MessageBus
+from myclaw.agent.permission import RuntimePermissionControl
 from myclaw.agent.tools.core.exec_host import (
     EXEC_CAPABILITY_ERROR,
     create_exec_host,
@@ -193,6 +194,9 @@ async def _run_cli_conversation(
     started = False
     primary_error: BaseException | None = None
     cleanup_errors: list[BaseException] = []
+    permission_control = RuntimePermissionControl(
+        getattr(configuration.runtime, "permission_level", "workspace-write")
+    )
 
     async def abort_loop_once(loop: AgentLoop) -> None:
         if any(loop is existing for existing in aborted_loops):
@@ -301,6 +305,7 @@ async def _run_cli_conversation(
                 mcp_tools=selected_mcp_snapshot,
                 mcp_keywords=selected_mcp_keywords,
                 exec_host=exec_host,
+                permission_control=permission_control,
             )
 
         def current_agent_loop() -> AgentLoop:

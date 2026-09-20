@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Annotated
 
 from myclaw.agent.tools.base import BaseTool, ToolError, ToolParam
+from myclaw.agent.tools.permission import FileAccess
 
 
 class EditFileTool(BaseTool):
@@ -38,6 +39,23 @@ class EditFileTool(BaseTool):
     ) -> str | None:
         del old_text, new_text, replace_all
         return self.workspace_path_safety_reason(workspace=self._workspace, requested=path)
+
+    def build_file_accesses(self, prepared_arguments: dict[str, object]) -> tuple[FileAccess, ...]:
+        requested = str(prepared_arguments["path"])
+        return (
+            self.canonical_file_access(
+                workspace=self._workspace,
+                base=self._workspace,
+                requested=requested,
+                role="read",
+            ),
+            self.canonical_file_access(
+                workspace=self._workspace,
+                base=self._workspace,
+                requested=requested,
+                role="write",
+            ),
+        )
 
     async def execute(
         self,

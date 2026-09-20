@@ -32,6 +32,7 @@ from myclaw.agent.tools.core.write_file import WriteFileTool
 from myclaw.agent.tools.mcp import MCPTool
 from myclaw.agent.tools.permission import (
     PermissionContext,
+    PermissionSnapshot,
     ToolAuthorizationSession,
     ToolPermissionPolicy,
 )
@@ -255,6 +256,7 @@ class ToolGateway:
         run_tools: Sequence[BaseTool] = (),
         permission_policy: ToolPermissionPolicy | None = None,
         permission_context: PermissionContext | None = None,
+        permission_snapshot: PermissionSnapshot | None = None,
     ) -> ToolGateway:
         """Create an isolated Run view over this Gateway's reusable Tool instances."""
         excluded = _normalize_tool_names(excluded_names, label="Excluded Tool names")
@@ -276,6 +278,13 @@ class ToolGateway:
             raise ValueError("Exposed Tool names must be available in the Run Catalog")
         exposure = tuple(tool.name for tool in catalog if tool.name in requested)
 
+        if permission_snapshot is not None and permission_context is not None:
+            raise ValueError("Run permission context and snapshot are mutually exclusive")
+        selected_context = (
+            _context_from_snapshot(self._permission_context, permission_snapshot)
+            if permission_snapshot is not None
+            else (self._permission_context if permission_context is None else permission_context)
+        )
         return self._from_catalog(
             catalog,
             exposed_names=exposure,
@@ -283,9 +292,7 @@ class ToolGateway:
             permission_policy=(
                 self._permission_policy if permission_policy is None else permission_policy
             ),
-            permission_context=(
-                self._permission_context if permission_context is None else permission_context
-            ),
+            permission_context=selected_context,
         )
 
     @classmethod
@@ -446,21 +453,22 @@ class ToolGateway:
             )
 
         try:
-            confirmation_details = cast(
-                dict[str, Any], _project_confirmation_details(prepared_arguments)
+            confirmation_details = deepcopy(prepared_arguments)
+            confirmation_reason = getattr(authorization, "confirmation_reason", None)
+            reason = (
+                confirmation_reason()
+                if callable(confirmation_reason)
+                else (
+                    facts.legacy_safety_reason
+                    if facts.legacy_safety_reason is not None
+                    else "Tool confirmation is required."
+                )
             )
-            if tool.name == "exec":
-                for name in ("command", "cwd", "timeout"):
-                    confirmation_details[name] = deepcopy(prepared_arguments[name])
             request = ConfirmationRequest(
                 confirmation_id=uuid4(),
                 tool_call_id=tool_call.id,
                 tool_name=tool_call.name,
-                reason=(
-                    facts.legacy_safety_reason
-                    if facts.legacy_safety_reason is not None
-                    else "Tool confirmation is required."
-                ),
+                reason=reason,
                 summary=f"Confirm {tool.name}"[:240],
                 details=confirmation_details,
             )
@@ -568,16 +576,21 @@ class ToolGateway:
         self._failure_observer(error)
 
 
-def _project_confirmation_details(value: Any) -> Any:
-    if isinstance(value, str):
-        if len(value) <= 256:
-            return value
-        return {"value": value[:256], "original_length": len(value)}
-    if isinstance(value, list):
-        return [_project_confirmation_details(item) for item in value]
-    if isinstance(value, dict):
-        return {name: _project_confirmation_details(item) for name, item in value.items()}
-    return deepcopy(value)
+def _context_from_snapshot(
+    context: PermissionContext,
+    snapshot: PermissionSnapshot,
+) -> PermissionContext:
+    if not isinstance(snapshot, PermissionSnapshot):
+        raise TypeError("Run permission snapshot must be a PermissionSnapshot")
+    workspace_root = context.workspace_root
+    if workspace_root is None:
+        raise ValueError("Run permission snapshots require a workspace root")
+    return PermissionContext.from_snapshot(
+        snapshot,
+        workspace_root=workspace_root,
+        origin=context.origin,
+        configured_schedule_level=context.configured_schedule_level,
+    )
 
 
 def _generic_tool_failure(tool_name: str) -> str:

@@ -548,7 +548,7 @@ async def test_catalog_orders_builtins_servers_and_remote_tools(
 
 
 @pytest.mark.asyncio
-async def test_fixed_gateway_reads_skill_root_without_confirmation(
+async def test_fixed_gateway_reads_skill_root_with_model_file_confirmation(
     workspace: Path,
     agent_home: Path,
 ) -> None:
@@ -557,9 +557,9 @@ async def test_fixed_gateway_reads_skill_root_without_confirmation(
     skill_file.write_bytes(b"---\nname: review\n---\nbody\n")
     requests: list[ConfirmationRequest] = []
 
-    async def unexpected_confirmation(request: ConfirmationRequest) -> ConfirmationDecision:
+    async def approve(request: ConfirmationRequest) -> ConfirmationDecision:
         requests.append(request)
-        return "declined"
+        return "approved"
 
     gateway = _gateway(workspace, agent_home, skill_root=agent_home / "skills")
     result = await gateway.call(
@@ -568,11 +568,11 @@ async def test_fixed_gateway_reads_skill_root_without_confirmation(
             name="read_file",
             arguments=json.dumps({"path": str(skill_file)}),
         ),
-        confirmation=unexpected_confirmation,
+        confirmation=approve,
     )
 
     assert (result.status, result.content) == ("success", "---\nname: review\n---\nbody\n")
-    assert requests == []
+    assert len(requests) == 1
     assert len(gateway.schemas) == 10
 
 

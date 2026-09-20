@@ -7,6 +7,8 @@ import pytest
 from myclaw.agent.loop import AgentLoop
 from myclaw.agent.memory.manager import MemoryManager
 from myclaw.agent.message_bus import MessageBus
+from myclaw.agent.permission import RuntimePermissionControl
+from myclaw.agent.tools.core.exec_host import create_exec_host, resolve_exec_shell
 from myclaw.agent.tools.tool_gateway import ModelToolCall
 from myclaw.agent.workspace_state import WorkspaceState
 from myclaw.config.agent_home import AgentHome
@@ -71,6 +73,8 @@ def _agent_loop(
         now=lambda: NOW,
         new_uuid=uuid4,
         monotonic_now=lambda: 0.0,
+        exec_host=create_exec_host(resolve_exec_shell(configuration.runtime.exec_shell)),
+        permission_control=RuntimePermissionControl(configuration.runtime.permission_level),
     )
     return loop, router, schedule, bus
 

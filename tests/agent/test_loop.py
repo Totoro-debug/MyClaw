@@ -26,10 +26,12 @@ from myclaw.agent.context_budget import estimate_request_tokens
 from myclaw.agent.loop import AgentLoop, ConfirmationRequestView, ModelContextOverflowError
 from myclaw.agent.memory.manager import MemoryManager
 from myclaw.agent.message_bus import InboundMessage, MessageBus, OutboundMessage
+from myclaw.agent.permission import PermissionSnapshot, RuntimePermissionControl
 from myclaw.agent.run_errors import CommittableAgentRunError
 from myclaw.agent.runner import AgentRunner, AgentRunnerResult, AgentRunnerRouter
 from myclaw.agent.session.session import Session
 from myclaw.agent.tools.base import BaseTool
+from myclaw.agent.tools.core.exec_host import create_exec_host, resolve_exec_shell
 from myclaw.agent.tools.deferred import RUN_BASELINE_TOOL_NAMES
 from myclaw.agent.tools.tool_gateway import ModelToolCall, ToolGateway
 from myclaw.agent.workspace_state import WorkspaceState
@@ -354,9 +356,10 @@ def test_agent_loop_constructor_is_the_generation_composition_boundary() -> None
         "now",
         "new_uuid",
         "monotonic_now",
+        "exec_host",
+        "permission_control",
         "mcp_tools",
         "mcp_keywords",
-        "exec_host",
     )
     assert tuple(inspect.signature(AgentLoop.close).parameters) == ("self",)
 
@@ -611,6 +614,8 @@ def _runtime(
         now=_Clock().now,
         new_uuid=uuid4,
         monotonic_now=(lambda: 0.0) if monotonic_now is None else monotonic_now,
+        exec_host=create_exec_host(resolve_exec_shell(configuration.runtime.exec_shell)),
+        permission_control=RuntimePermissionControl(configuration.runtime.permission_level),
         mcp_tools=mcp_tools,
     )
     if title_prompt is None:
@@ -988,12 +993,26 @@ async def test_foreground_context_and_runner_share_exactly_one_run_gateway(
     created_gateways: list[ToolGateway] = []
     context_gateways: list[ToolGateway] = []
     runner_gateways: list[ToolGateway] = []
+    context_snapshots: list[object] = []
+    gateway_snapshots: list[PermissionSnapshot] = []
     original_new_run_gateway = loop._new_run_gateway
     original_prepare = loop._prepare_agent_run
     original_run = AgentRunner.run
+    original_build_foreground = loop._context_builder.build_foreground_messages
 
-    def new_run_gateway(*, excluded_names: Sequence[str] = ()) -> ToolGateway:
-        gateway = original_new_run_gateway(excluded_names=excluded_names)
+    def new_run_gateway(
+        *,
+        excluded_names: Sequence[str] = (),
+        permission_snapshot: PermissionSnapshot | None = None,
+        permission_context: object = None,
+    ) -> ToolGateway:
+        assert permission_snapshot is not None
+        assert permission_context is None
+        gateway_snapshots.append(permission_snapshot)
+        gateway = original_new_run_gateway(
+            excluded_names=excluded_names,
+            permission_snapshot=permission_snapshot,
+        )
         created_gateways.append(gateway)
         return gateway
 
@@ -1011,8 +1030,13 @@ async def test_foreground_context_and_runner_share_exactly_one_run_gateway(
         runner_gateways.append(gateway)
         return await original_run(*args, **kwargs)
 
+    def build_foreground(*args: Any, **kwargs: Any) -> list[dict[str, Any]]:
+        context_snapshots.append(kwargs["permission_snapshot"])
+        return original_build_foreground(*args, **kwargs)
+
     object.__setattr__(loop, "_new_run_gateway", new_run_gateway)
     object.__setattr__(loop, "_prepare_agent_run", prepare)
+    object.__setattr__(loop._context_builder, "build_foreground_messages", build_foreground)
     monkeypatch.setattr(AgentRunner, "run", run)
 
     await loop.start()
@@ -1027,6 +1051,115 @@ async def test_foreground_context_and_runner_share_exactly_one_run_gateway(
     assert len(runner_gateways) == 1
     assert created_gateways[0] is context_gateways[0] is runner_gateways[0]
     assert created_gateways[0].exposed_names == RUN_BASELINE_TOOL_NAMES
+    foreground_snapshots = [snapshot for snapshot in context_snapshots if snapshot is not None]
+    assert foreground_snapshots
+    assert all(snapshot is foreground_snapshots[0] for snapshot in foreground_snapshots)
+    assert gateway_snapshots == [foreground_snapshots[0]]
+    assert foreground_snapshots[0] is created_gateways[0]._permission_context.snapshot
+
+
+@pytest.mark.asyncio
+async def test_foreground_captures_once_before_title_and_framing_and_switches_next_run(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    first_blackboard = Blackboard(goal="First", completion_boundary="Finish first")
+    second_blackboard = Blackboard(goal="Second", completion_boundary="Finish second")
+    loop, _session, bus = _runtime(
+        tmp_path,
+        _Router((_response("first"), _response("second"))),
+        task_framing_outcomes=(
+            _framing_response(first_blackboard, input_tokens=1, output_tokens=1),
+            _framing_response(second_blackboard, input_tokens=1, output_tokens=1),
+        ),
+    )
+    events: list[str] = []
+    captured: list[PermissionSnapshot] = []
+    context_snapshots: list[PermissionSnapshot] = []
+    gateway_snapshots: list[PermissionSnapshot] = []
+    control = loop._permission_control
+    original_snapshot = RuntimePermissionControl.snapshot
+    original_generate = Blackboard.generate
+    original_build_foreground = loop._context_builder.build_foreground_messages
+    original_new_run_gateway = loop._new_run_gateway
+
+    def snapshot(
+        selected_control: RuntimePermissionControl,
+        exec_shell: object,
+    ) -> PermissionSnapshot:
+        events.append(f"snapshot:{selected_control.current()}")
+        result = original_snapshot(selected_control, exec_shell)  # type: ignore[arg-type]
+        captured.append(result)
+        if len(captured) == 1:
+            selected_control.select("read-only")
+        return result
+
+    async def generate(
+        cls: type[Blackboard],
+        router: AgentRunnerRouter,
+        *,
+        previous: Blackboard | None,
+        last_assistant_content: str,
+        current_user_input: str,
+    ) -> object:
+        del cls
+        events.append("framing")
+        return await original_generate(
+            router,
+            previous=previous,
+            last_assistant_content=last_assistant_content,
+            current_user_input=current_user_input,
+        )
+
+    def start_title(_session: Session, _content: str) -> None:
+        events.append("title")
+
+    def build_foreground(*args: Any, **kwargs: Any) -> list[dict[str, Any]]:
+        current = kwargs.get("permission_snapshot")
+        if isinstance(current, PermissionSnapshot):
+            context_snapshots.append(current)
+        return original_build_foreground(*args, **kwargs)
+
+    def new_run_gateway(
+        *,
+        excluded_names: Sequence[str] = (),
+        permission_snapshot: PermissionSnapshot | None = None,
+        permission_context: object = None,
+    ) -> ToolGateway:
+        assert permission_snapshot is not None
+        assert permission_context is None
+        gateway_snapshots.append(permission_snapshot)
+        return original_new_run_gateway(
+            excluded_names=excluded_names,
+            permission_snapshot=permission_snapshot,
+        )
+
+    monkeypatch.setattr(RuntimePermissionControl, "snapshot", snapshot)
+    monkeypatch.setattr(Blackboard, "generate", classmethod(generate))
+    object.__setattr__(loop, "_start_title_if_needed", start_title)
+    object.__setattr__(loop._context_builder, "build_foreground_messages", build_foreground)
+    object.__setattr__(loop, "_new_run_gateway", new_run_gateway)
+
+    await loop.start()
+    try:
+        await bus.put_inbound(InboundMessage("first input"))
+        await _terminals(bus, 1)
+        await bus.put_inbound(InboundMessage("second input"))
+        await _terminals(bus, 1)
+    finally:
+        await loop.close()
+
+    assert [snapshot.level for snapshot in captured] == ["workspace-write", "read-only"]
+    assert control.current() == "read-only"
+    assert gateway_snapshots == captured
+    assert context_snapshots
+    assert context_snapshots[0] is captured[0]
+    assert context_snapshots[-1] is captured[1]
+    assert all(snapshot is captured[0] or snapshot is captured[1] for snapshot in context_snapshots)
+    assert events[:3] == ["snapshot:workspace-write", "title", "framing"]
+    assert events.count("snapshot:workspace-write") == 1
+    assert events.count("snapshot:read-only") == 1
+    assert events.count("framing") == 2
 
 
 @pytest.mark.asyncio
@@ -3444,6 +3577,7 @@ async def test_blank_foreground_input_performs_zero_task_framing_attempts(
         InboundMessage(" \n\t "),
         title_work=None,
         execution_ready=execution_ready,
+        permission_snapshot=loop._permission_control.snapshot(loop._exec_host.resolved_shell),
     )
 
     assert not committed

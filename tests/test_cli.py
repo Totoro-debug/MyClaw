@@ -18,6 +18,7 @@ from typer.testing import CliRunner
 import myclaw.terminal.cli as cli
 from myclaw.agent.loop import ModelContextOverflowError, TerminalAgentLoopControl
 from myclaw.agent.message_bus import MessageBus
+from myclaw.agent.permission import RuntimePermissionControl
 from myclaw.agent.session.session import Session
 from myclaw.agent.workspace_state import WorkspaceState, WorkspaceStateError
 from myclaw.config.agent_home import AgentHome
@@ -627,6 +628,10 @@ def _invoke_cli_resume_preparation_failure(
         def __init__(self, **kwargs: object) -> None:
             session_id = cast(str | None, kwargs["session_id"])
             self.is_target = session_id is not None
+            self.permission_control = cast(
+                RuntimePermissionControl,
+                kwargs["permission_control"],
+            )
             self.session_id = target_id
             self.control = FakeControl(target_id)
             self.skill_metadata = ()
@@ -636,8 +641,11 @@ def _invoke_cli_resume_preparation_failure(
             self.replacement_barrier_held = False
             loops.append(self)
             if not self.is_target:
+                self.permission_control.select("read-only")
                 events.append("old_init")
             else:
+                assert self.permission_control is loops[0].permission_control
+                assert self.permission_control.current() == "read-only"
                 events.append("target_init")
                 if failure_kind == "constructor":
                     raise ModelContextOverflowError(
@@ -880,6 +888,8 @@ def _assert_fatal_resume_preparation(
         <= 1
     )
     assert old.control.confirmation_callback is None
+    assert target.permission_control is old.permission_control
+    assert old.permission_control.current() == "read-only"
     assert probe.current_callback() is old
     unavailable = asyncio.run(probe.dispatcher.resume(probe.target_id))
     assert unavailable.output == "route_unavailable: Runtime Generation is no longer active."
@@ -2386,8 +2396,7 @@ def test_installed_config_command_keeps_fallback_diagnostic_before_later_fatal_e
 
     error = "config_invalid: Configuration field 'models.routes.default.model' is required."
     diagnostic = (
-        "Configuration field 'runtime.permission_level' is invalid; "
-        "using 'workspace-write'."
+        "Configuration field 'runtime.permission_level' is invalid; using 'workspace-write'."
     )
     path = f"Path: {config_path}"
     assert result.returncode == 2

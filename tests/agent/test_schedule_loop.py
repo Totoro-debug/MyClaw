@@ -16,12 +16,15 @@ import myclaw.agent.memory.conversation_compactor as compactor_module
 from myclaw.agent.loop import AgentLoop
 from myclaw.agent.memory.manager import MemoryManager
 from myclaw.agent.message_bus import InboundMessage, MessageBus
+from myclaw.agent.permission import PermissionSnapshot, RuntimePermissionControl
 from myclaw.agent.run_errors import CommittableAgentRunError
 from myclaw.agent.runner import AgentRunner, AgentRunnerResult
 from myclaw.agent.session.session import Session, SessionStoragePartition
 from myclaw.agent.tools.base import BaseTool
+from myclaw.agent.tools.core.exec_host import create_exec_host, resolve_exec_shell
 from myclaw.agent.tools.deferred import RUN_BASELINE_TOOL_NAMES
 from myclaw.agent.tools.mcp import MCPTool, MCPToolSpec
+from myclaw.agent.tools.permission import PermissionContext
 from myclaw.agent.tools.tool_gateway import ModelToolCall, ToolGateway, ToolResult
 from myclaw.agent.workspace_state import WorkspaceState
 from myclaw.config.agent_home import AgentHome
@@ -370,6 +373,8 @@ def _loop(
         now=lambda: NOW,
         new_uuid=lambda: JOB_ID,
         monotonic_now=lambda: 0.0,
+        exec_host=create_exec_host(resolve_exec_shell(configuration.runtime.exec_shell)),
+        permission_control=RuntimePermissionControl(configuration.runtime.permission_level),
         mcp_tools=mcp_tools,
     )
     if skill_loader is not None:
@@ -444,8 +449,17 @@ async def test_schedule_context_and_runner_share_exactly_one_run_gateway(
     original_prepare = loop._prepare_agent_run
     original_run = AgentRunner.run
 
-    def new_run_gateway(*, excluded_names: Sequence[str] = ()) -> ToolGateway:
-        gateway = original_new_run_gateway(excluded_names=excluded_names)
+    def new_run_gateway(
+        *,
+        excluded_names: Sequence[str] = (),
+        permission_snapshot: PermissionSnapshot | None = None,
+        permission_context: PermissionContext | None = None,
+    ) -> ToolGateway:
+        gateway = original_new_run_gateway(
+            excluded_names=excluded_names,
+            permission_snapshot=permission_snapshot,
+            permission_context=permission_context,
+        )
         created_gateways.append(gateway)
         return gateway
 
@@ -1376,6 +1390,8 @@ async def test_schedule_run_uses_isolated_catalog_during_concurrent_foreground_r
         now=lambda: NOW,
         new_uuid=lambda: JOB_ID,
         monotonic_now=lambda: 0.0,
+        exec_host=create_exec_host(resolve_exec_shell(configuration.runtime.exec_shell)),
+        permission_control=RuntimePermissionControl(configuration.runtime.permission_level),
     )
     await loop.start()
     schedule_task = asyncio.create_task(loop.run_schedule_job(_job()))

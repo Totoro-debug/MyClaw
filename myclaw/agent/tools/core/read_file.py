@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Annotated
 
 from myclaw.agent.tools.base import BaseTool, ToolError, ToolParam
+from myclaw.agent.tools.permission import FileAccess
 
 
 class ReadFileTool(BaseTool):
@@ -13,8 +14,7 @@ class ReadFileTool(BaseTool):
 
     name = "read_file"
     description = (
-        "Read UTF-8 text lines from a file. "
-        "Paths outside the Workspace and Skill root require confirmation."
+        "Read UTF-8 text lines from a file. Paths outside the Workspace may require confirmation."
     )
     required = ("path",)
 
@@ -44,6 +44,16 @@ class ReadFileTool(BaseTool):
             workspace=self._workspace,
             requested=path,
             additional_roots=() if self._skill_root is None else (self._skill_root,),
+        )
+
+    def build_file_accesses(self, prepared_arguments: dict[str, object]) -> tuple[FileAccess, ...]:
+        return (
+            self.canonical_file_access(
+                workspace=self._workspace,
+                base=self._workspace,
+                requested=str(prepared_arguments["path"]),
+                role="read",
+            ),
         )
 
     async def execute(self, *, path: str, offset: int, limit: int) -> str:

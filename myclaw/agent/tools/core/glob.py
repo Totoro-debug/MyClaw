@@ -13,6 +13,7 @@ from myclaw.agent.tools.core._directory import (
     report_path,
     requested_path_has_directory_link,
 )
+from myclaw.agent.tools.permission import FileAccess
 
 
 class GlobTool(BaseTool):
@@ -66,6 +67,16 @@ class GlobTool(BaseTool):
     ) -> str | None:
         del pattern, head_limit, offset, kind
         return self.workspace_path_safety_reason(workspace=self._workspace, requested=path)
+
+    def build_file_accesses(self, prepared_arguments: dict[str, object]) -> tuple[FileAccess, ...]:
+        return (
+            self.canonical_file_access(
+                workspace=self._workspace,
+                base=self._workspace,
+                requested=str(prepared_arguments["path"]),
+                role="read",
+            ),
+        )
 
     async def execute(
         self,

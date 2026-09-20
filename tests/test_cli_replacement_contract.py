@@ -15,6 +15,7 @@ from myclaw.agent.loop import (
     TerminalAgentLoopControl,
 )
 from myclaw.agent.message_bus import InboundMessage, MessageBus
+from myclaw.agent.permission import RuntimePermissionControl
 from myclaw.config.agent_home import AgentHome
 from myclaw.config.config import ConfigLoader, UserConfiguration
 from myclaw.management.commands import ManagementCommandDispatcher
@@ -175,6 +176,7 @@ async def test_cli_same_session_replacement_keeps_public_generation_contract(
     workspace.mkdir()
     constructed: list[AgentLoop] = []
     routers: list[object] = []
+    permission_controls: list[RuntimePermissionControl] = []
     original_init = AgentLoop.__init__
     provider = ScriptedFakeProvider(
         streams=(
@@ -198,6 +200,13 @@ async def test_cli_same_session_replacement_keeps_public_generation_contract(
 
     def recording_init(loop: AgentLoop, *args: Any, **kwargs: Any) -> None:
         routers.append(kwargs["model_router"])
+        permission_control = cast(
+            RuntimePermissionControl,
+            kwargs["permission_control"],
+        )
+        if permission_controls:
+            assert permission_control is permission_controls[0]
+        permission_controls.append(permission_control)
         kwargs["model_router"] = TaskFramingRouterAdapter(kwargs["model_router"])
         original_init(loop, *args, **kwargs)
         constructed.append(loop)
@@ -207,6 +216,8 @@ async def test_cli_same_session_replacement_keeps_public_generation_contract(
 
     def update_skills(old: AgentLoop) -> None:
         assert routers
+        assert len(permission_controls) == 1
+        permission_controls[0].select("read-only")
         cast(Any, routers[0]).set_reasoning_effort("max")
         assert [metadata.name for metadata in old.skill_metadata] == ["current", "removed"]
         assert [(metadata.name, metadata.description) for metadata in old.skill_metadata] == [
@@ -224,6 +235,9 @@ async def test_cli_same_session_replacement_keeps_public_generation_contract(
         )
 
     async def assert_refreshed(target: AgentLoop, bus: MessageBus) -> None:
+        assert len(permission_controls) == 2
+        assert permission_controls[1] is permission_controls[0]
+        assert permission_controls[1].current() == "read-only"
         assert [(metadata.name, metadata.description) for metadata in target.skill_metadata] == [
             ("added", "Added"),
             ("current", "Refreshed"),
@@ -261,6 +275,7 @@ async def test_cli_same_session_replacement_keeps_public_generation_contract(
     assert constructed == [constructed[0], target]
     assert len(routers) == 2
     assert routers == [routers[0], routers[0]]
+    assert permission_controls == [permission_controls[0], permission_controls[0]]
 
 
 @pytest.mark.asyncio

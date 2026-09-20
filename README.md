@@ -61,6 +61,8 @@ MCP Server 可在 `[mcp.servers.<name>.tool_keywords]` 下按远端 Tool 原名�
 
 `[runtime].permission_level` 接受 `read-only`、`workspace-write` 和 `full-access`，默认值为 `workspace-write`；`[runtime].exec_shell` 接受 `auto`、`powershell` 和 `pwsh`，默认值为 `auto`。Windows 下 `auto` 优先选择版本至少为 7 的 `pwsh`，否则选择 Windows PowerShell 5.1；显式选择不会交叉回退，POSIX 始终使用 Bash 并忽略该 Windows selector。Exec Host 的检查和执行都禁用 Profile/rc（PowerShell 使用 `-NoLogo -NoProfile -NonInteractive`，Bash 不使用 login/profile/rc），并共享同一个可执行文件、工作目录、最小环境和超时/取消行为。选定 Shell 缺失不会阻止启动，只显示一次安全诊断；Exec 仍在工具目录中，但调用时返回稳定的能力错误。Shell 存在但检查器失败时按不确定结果继续沿用确认语义。
 
+前台 Agent Run 会在标题生成、Skill 解析和 Task Framing 之前捕获当前权限级别与已解析的 Exec Shell，并在本次运行内保持不变。Runtime Context 会显示该快照以及 Tool 调用可能需要确认；确认只绑定到一次规范化后的 Tool 调用，不会缓存到共享 Tool。File Tool 的权限矩阵和主机路径规范化见 [ADR-0026](docs/adr/0026-tool-permission-levels-and-foreground-snapshots.md)。模型发起的 `read_file` 不继承 Skill Root 的内部加载豁免；Dream 私有 Tool 和 Runtime 持久化写入不属于该模型 File 策略。
+
 安全默认值字段包括 Runtime 的 Tool 结果大小、迭代上限、Always-load Skill 开关、`compact_ratio`、权限级别和 Exec Shell，Memory 的 batch size 与 schedule，以及每个 Model Route 的 `reasoning_effort`。缺失字段静默使用默认值；显式非法值使用有效默认值并产生且只产生一条不包含原始值的安全诊断。`compact_ratio` 的默认值为 `0.9`，只接受有限且非布尔的数值 `0.5` 至 `0.95`（含边界）。原始配置不会被自动改写；`myclaw config` 与 `/config` 显示相同的有效值和诊断，以及脱敏后的原始 TOML。已移除的 `compaction_message_threshold` 等未知字段会被忽略。
 
 ## 项目启动

@@ -16,6 +16,8 @@ import myclaw.agent.context as context
 from myclaw.agent.blackboard import Blackboard
 from myclaw.agent.context import ContextBuilder
 from myclaw.agent.memory.manager import MemoryManager
+from myclaw.agent.tools.core.exec_host import resolve_exec_shell
+from myclaw.agent.tools.permission import PermissionSnapshot
 from myclaw.agent.workspace_state import WorkspaceState
 from myclaw.skills.catalog import (
     ManualSkillInvocation,
@@ -24,6 +26,26 @@ from myclaw.skills.catalog import (
 )
 
 FIXED_UTC = datetime(2026, 8, 16, 4, 5, 6, 789000, tzinfo=UTC)
+
+
+def test_foreground_runtime_context_projects_the_permission_snapshot(
+    monkeypatch: pytest.MonkeyPatch,
+    workspace: Path,
+) -> None:
+    builder = _builder(monkeypatch, workspace, "UTC")
+    snapshot = PermissionSnapshot("read-only", resolve_exec_shell("auto"))
+
+    messages = builder.build_foreground_messages(
+        [{"role": "user", "content": "Current question."}],
+        session_id="session-id",
+        permission_snapshot=snapshot,
+    )
+
+    content = messages[-1]["content"]
+    assert isinstance(content, str)
+    assert "- Tool Permission Level: read-only" in content
+    assert f"- Exec Shell: {snapshot.exec_shell.family}" in content
+    assert "- Tool Confirmation: Permission checks may require one confirmation" in content
 
 
 class _FrozenDateTime(datetime):

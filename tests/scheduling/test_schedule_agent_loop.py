@@ -20,8 +20,10 @@ from myclaw.agent.loop import AgentLoop
 from myclaw.agent.memory.dream import Dream
 from myclaw.agent.memory.manager import MemoryManager
 from myclaw.agent.message_bus import MessageBus
+from myclaw.agent.permission import RuntimePermissionControl
 from myclaw.agent.runner import AgentRunner, AgentRunnerResult
 from myclaw.agent.session.session import Session, SessionStoragePartition
+from myclaw.agent.tools.core.exec_host import create_exec_host, resolve_exec_shell
 from myclaw.agent.tools.deferred import RUN_BASELINE_TOOL_NAMES
 from myclaw.agent.tools.tool_gateway import ModelToolCall, ToolGateway
 from myclaw.agent.workspace_state import WorkspaceState
@@ -313,6 +315,8 @@ def _agent_loop(
         now=lambda: NOW,
         new_uuid=lambda: JOB_UUID,
         monotonic_now=schedule_clock.monotonic,
+        exec_host=create_exec_host(resolve_exec_shell(configuration.runtime.exec_shell)),
+        permission_control=RuntimePermissionControl(configuration.runtime.permission_level),
     )
     dispatcher = ManagementCommandDispatcher(
         management_service(

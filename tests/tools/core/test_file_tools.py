@@ -206,7 +206,7 @@ async def test_workspace_state_and_absolute_internal_paths_use_host_permissions(
 
 
 @pytest.mark.asyncio
-async def test_read_file_allows_canonical_skill_root_without_confirmation(
+async def test_read_file_skill_root_requires_model_file_confirmation(
     workspace: Path,
     tmp_path: Path,
 ) -> None:
@@ -217,23 +217,23 @@ async def test_read_file_allows_canonical_skill_root_without_confirmation(
     skill_file.write_bytes(b"---\nname: review\n---\nbody\n")
     requests: list[ConfirmationRequest] = []
 
-    async def unexpected_confirmation(request: ConfirmationRequest) -> ConfirmationDecision:
+    async def approve(request: ConfirmationRequest) -> ConfirmationDecision:
         requests.append(request)
-        return "declined"
+        return "approved"
 
     gateway = _gateway(
         ReadFileTool(workspace=identity, skill_root=skill_root),
-        confirmation=unexpected_confirmation,
+        confirmation=approve,
     )
 
     result = await gateway.call(_call("read_file", {"path": str(skill_file)}))
 
     assert (result.status, result.content) == ("success", "---\nname: review\n---\nbody\n")
-    assert requests == []
+    assert len(requests) == 1
 
 
 @pytest.mark.asyncio
-async def test_read_file_missing_skill_target_skips_confirmation(
+async def test_read_file_missing_skill_target_requires_confirmation(
     workspace: Path,
     tmp_path: Path,
 ) -> None:
@@ -242,20 +242,19 @@ async def test_read_file_missing_skill_target_skips_confirmation(
     missing = skill_root / "review" / "SKILL.md"
     requests: list[ConfirmationRequest] = []
 
-    async def unexpected_confirmation(request: ConfirmationRequest) -> ConfirmationDecision:
+    async def decline(request: ConfirmationRequest) -> ConfirmationDecision:
         requests.append(request)
         return "declined"
 
     gateway = _gateway(
         ReadFileTool(workspace=identity, skill_root=skill_root),
-        confirmation=unexpected_confirmation,
+        confirmation=decline,
     )
 
     result = await gateway.call(_call("read_file", {"path": str(missing)}))
 
-    assert result.status == "error"
-    assert "Read File failed" in result.content
-    assert requests == []
+    assert result.status == "refused"
+    assert len(requests) == 1
     assert not skill_root.exists()
 
 
