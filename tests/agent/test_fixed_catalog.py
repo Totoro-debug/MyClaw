@@ -20,7 +20,7 @@ from myclaw.agent.permission import RuntimePermissionControl
 from myclaw.agent.session.session import Session
 from myclaw.agent.tools.base import BaseTool
 from myclaw.agent.tools.core.exec_host import create_exec_host, resolve_exec_shell
-from myclaw.agent.tools.core.web_fetch import JinaReaderClient
+from myclaw.agent.tools.core.web_fetch import AioHttpWebFetchClient, HTTPResponseBoundary
 from myclaw.agent.tools.deferred import RUN_BASELINE_TOOL_NAMES
 from myclaw.agent.tools.mcp import MCPTool, MCPToolSpec
 from myclaw.agent.tools.tool_gateway import ModelToolCall
@@ -796,21 +796,23 @@ async def test_agent_loop_cancellation_reaches_an_active_fixed_catalog_tool(
     release = asyncio.Event()
 
     async def block_fetch(
-        self: JinaReaderClient,
+        self: AioHttpWebFetchClient,
         url: str,
         *,
-        output_format: str,
-    ) -> str:
-        del self, url, output_format
+        resolved_addresses: tuple[str, ...],
+        connect_timeout_seconds: float,
+        total_timeout_seconds: float,
+    ) -> HTTPResponseBoundary:
+        del self, url, resolved_addresses, connect_timeout_seconds, total_timeout_seconds
         started.set()
         try:
             await release.wait()
         except asyncio.CancelledError:
             cancelled.set()
             raise
-        return "unexpected"
+        raise AssertionError("unreachable")
 
-    monkeypatch.setattr(JinaReaderClient, "fetch", block_fetch)
+    monkeypatch.setattr(AioHttpWebFetchClient, "get", block_fetch)
     provider = _FixedCatalogProvider(
         (
             _response(

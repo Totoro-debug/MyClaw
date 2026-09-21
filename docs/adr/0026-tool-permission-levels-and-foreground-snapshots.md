@@ -39,7 +39,8 @@ The foreground Runtime Context and the foreground run Gateway receive the
 same snapshot object. Runtime Context reports the permission level, resolved
 Exec Shell family, and that permission checks may require confirmation. The
 Gateway uses the snapshot for File policy and the strict PowerShell and Bash
-Exec policies described below; Web confirmation behavior remains unchanged.
+Exec policies described below; Web Search remains direct and Web Fetch uses
+the execution-time per-hop authorization described below.
 
 ## Exec Permission Mapping
 
@@ -100,8 +101,9 @@ focused by default on every attempt. Full-Access removes ordinary permission
 confirmation for foreground File Tools and parseable non-catastrophic
 PowerShell or Bash Exec calls; it is not an operating-system sandbox and does not
 bypass validation, capability checks, business refusals, catastrophic or
-uncertain Exec confirmation, or Tool errors. Web, MCP, and Schedule retain
-their existing behavior. A
+uncertain Exec confirmation, or Tool errors. Web Search is direct at every
+level. Web Fetch uses the per-hop network authorization below. MCP and
+Schedule retain their existing behavior. A
 process startup notice is shown at most once when the configured level is
 Full-Access. `/config` reports the configured level, and `/status` reports both
 configured and current foreground levels.
@@ -128,6 +130,42 @@ invalid arguments, hard errors, capability errors, and execution errors do
 not become permission prompts. A declined confirmation never reaches the
 execution boundary.
 
+## Web Fetch Network Authorization
+
+Web Fetch validates and normalizes the URL during preparation. The normalized
+target records the lowercase HTTP scheme, IDNA host, effective port, and
+request URL; URL credentials and unsupported schemes remain invalid. Execution
+creates no shared Tool state. One per-call authorization session audits the
+initial target and every redirect hop.
+
+For each hop, the controlled asynchronous resolver is called once and its
+complete address set is retained. A target is public only when the set is
+non-empty and every IPv4 or IPv6 address is globally routable. Private,
+loopback, link-local, reserved, unspecified, multicast, IPv4-mapped
+non-global, mixed, empty, DNS-failed, and DNS-timeout results are unsafe or
+uncertain. Read-Only and Workspace-Write request confirmation for an unsafe
+hop; Full-Access skips only that permission prompt. DNS, connection, TLS,
+HTTP status, body, decoding, and timeout failures remain ordinary Web Fetch
+Tool Errors at every level.
+
+The session permits at most one confirmation for the normalized invocation.
+Approval covers only that call and does not create a host, IP, or network
+grant. A declined or unavailable confirmation prevents the connector from
+opening the unsafe hop. If DNS fails, a low-permission approval still returns
+the recorded DNS Tool Error and does not retry resolution.
+
+Redirects are handled by Web Fetch with automatic client redirect following
+disabled. Each `Location` is resolved relative to the current URL, normalized
+and validated, resolved, authorized, and bound before its connection is
+opened. The HTTP adapter receives only the address set audited for the current
+hop; its custom resolver disables a second unconstrained DNS lookup, and
+`trust_env=False` prevents environment proxy settings from bypassing the
+audit. Target retrieval is not delegated to an opaque remote URL reader,
+because such a service could hide target-side redirects from this boundary.
+Requests carry the normalized URL's Host and TLS certificate hostname so
+direct IPv4/IPv6 dialing preserves port, Host, SNI, and certificate validation
+semantics. Web Fetch sends no cross-origin sensitive headers.
+
 ## Scope Boundaries
 
 This decision does not alter the fixed Tool Catalog, Tool Exposure, Tool
@@ -135,8 +173,9 @@ Activation, Tool Search, MCP Tool behavior, or Schedule permission behavior.
 It does not provide an operating-system sandbox. Full-Access removes ordinary
 foreground File and parseable non-catastrophic PowerShell or Bash Exec
 permission confirmation; validation, capability checks, business refusals, catastrophic
-or uncertain Exec confirmation, and Tool errors remain enforced. Web, MCP,
-and Schedule permission behavior is unchanged by this decision.
+or uncertain Exec confirmation, and Tool errors remain enforced. Web Search
+remains direct; Web Fetch applies the per-hop rules above. MCP and Schedule
+permission behavior is unchanged by this decision.
 
 The existing Skill Loader remains responsible for its own internal reads, and
 ADR-0016 no longer defines a confirmation-free boundary for model-issued

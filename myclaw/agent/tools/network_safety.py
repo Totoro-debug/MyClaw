@@ -6,16 +6,12 @@ import asyncio
 import socket
 from dataclasses import dataclass
 from ipaddress import ip_address
-from typing import Literal, Protocol
+from typing import Protocol
 
 from myclaw.agent.tools.base import is_public_ip
+from myclaw.agent.tools.permission import NetworkTargetRisk
 
-type TargetRisk = Literal[
-    "literal_non_global",
-    "dns_failure",
-    "dns_empty",
-    "dns_non_global",
-]
+type TargetRisk = NetworkTargetRisk
 
 
 class DNSResolver(Protocol):
@@ -45,31 +41,63 @@ class TargetAssessment:
     risk: TargetRisk | None = None
 
 
+@dataclass(frozen=True, slots=True)
+class TargetResolution:
+    """One resolver result, including the exact addresses used for one hop."""
+
+    addresses: tuple[str, ...]
+    risk: TargetRisk | None = None
+    error_message: str | None = None
+
+
+async def resolve_target(
+    hostname: str,
+    port: int,
+    resolver: DNSResolver,
+) -> TargetResolution:
+    """Resolve one target once and retain the audited address set."""
+    try:
+        literal = ip_address(hostname)
+    except ValueError:
+        try:
+            answers = await resolver.resolve(hostname, port)
+        except Exception as error:
+            message = str(error).strip() or "DNS resolution failed."
+            return TargetResolution(
+                addresses=(),
+                risk="dns_failure",
+                error_message=message,
+            )
+        addresses = tuple(dict.fromkeys(answers))
+        if not addresses:
+            return TargetResolution(addresses=(), risk="dns_empty")
+        if all(is_public_ip(answer) for answer in addresses):
+            return TargetResolution(addresses=addresses)
+        return TargetResolution(addresses=addresses, risk="dns_non_global")
+
+    address = str(literal)
+    return TargetResolution(
+        addresses=(address,),
+        risk=None if is_public_ip(address) else "literal_non_global",
+    )
+
+
 async def assess_target(
     hostname: str,
     port: int,
     resolver: DNSResolver,
 ) -> TargetAssessment:
     """Assess whether one literal or DNS name resolves only to global addresses."""
-    try:
-        ip_address(hostname)
-    except ValueError:
-        try:
-            answers = await resolver.resolve(hostname, port)
-        except Exception:
-            return TargetAssessment(risk="dns_failure")
-        if answers and all(is_public_ip(answer) for answer in answers):
-            return TargetAssessment()
-        if answers:
-            return TargetAssessment(risk="dns_non_global")
-        return TargetAssessment(risk="dns_empty")
-    return TargetAssessment(risk=None if is_public_ip(hostname) else "literal_non_global")
+    resolution = await resolve_target(hostname, port, resolver)
+    return TargetAssessment(risk=resolution.risk)
 
 
 __all__ = [
     "DNSResolver",
     "SocketDNSResolver",
     "TargetAssessment",
+    "TargetResolution",
     "TargetRisk",
     "assess_target",
+    "resolve_target",
 ]

@@ -31,8 +31,10 @@ from myclaw.agent.tools.core.web_search import WebSearchTool
 from myclaw.agent.tools.core.write_file import WriteFileTool
 from myclaw.agent.tools.mcp import MCPTool
 from myclaw.agent.tools.permission import (
+    NetworkConfirmationDecision,
     PermissionContext,
     PermissionSnapshot,
+    ToolAuthorizationFailure,
     ToolAuthorizationSession,
     ToolPermissionPolicy,
 )
@@ -443,17 +445,49 @@ class ToolGateway:
         if authorization_decision not in {"direct", "confirm"}:
             return _result(tool_call, "error", "Tool authorization returned an invalid decision.")
 
+        confirmation_state: list[ToolConfirmationMetadata | None] = [None]
+
+        async def request_confirmation(reason: str) -> NetworkConfirmationDecision:
+            request = ConfirmationRequest(
+                confirmation_id=uuid4(),
+                tool_call_id=tool_call.id,
+                tool_name=tool_call.name,
+                reason=reason,
+                summary=f"Confirm {tool.name}"[:240],
+                details=deepcopy(prepared_arguments),
+            )
+            if confirmation is None:
+                confirmation_state[0] = ToolConfirmationMetadata(request=request, decision=None)
+                raise ToolAuthorizationFailure("unavailable")
+            try:
+                decision = await confirmation(request)
+            except asyncio.CancelledError:
+                raise
+            except Exception as error:
+                self._record_unexpected_failure(tool, error)
+                confirmation_state[0] = ToolConfirmationMetadata(request=request, decision=None)
+                raise ToolAuthorizationFailure("invalid") from error
+            if decision not in {"approved", "declined"}:
+                confirmation_state[0] = ToolConfirmationMetadata(request=request, decision=None)
+                raise ToolAuthorizationFailure("invalid")
+            confirmation_state[0] = ToolConfirmationMetadata(request=request, decision=decision)
+            return decision
+
         if authorization_decision == "direct":
+            _bind_network_confirmation(
+                authorization,
+                request_confirmation,
+                already_approved=False,
+            )
             return await self._execute(
                 tool_call,
                 tool,
                 prepared_arguments,
                 authorization=authorization,
-                confirmation=None,
+                confirmation_state=confirmation_state,
             )
 
         try:
-            confirmation_details = deepcopy(prepared_arguments)
             confirmation_reason = getattr(authorization, "confirmation_reason", None)
             reason = (
                 confirmation_reason()
@@ -464,14 +498,6 @@ class ToolGateway:
                     else "Tool confirmation is required."
                 )
             )
-            request = ConfirmationRequest(
-                confirmation_id=uuid4(),
-                tool_call_id=tool_call.id,
-                tool_name=tool_call.name,
-                reason=reason,
-                summary=f"Confirm {tool.name}"[:240],
-                details=confirmation_details,
-            )
         except asyncio.CancelledError:
             raise
         except ToolError as error:
@@ -480,47 +506,39 @@ class ToolGateway:
             self._record_unexpected_failure(tool, error)
             return _result(tool_call, "error", _generic_tool_failure(tool.name))
 
-        if confirmation is None:
-            return _refused_confirmation_result(
-                tool_call,
-                "Tool confirmation is unavailable.",
-                request=request,
-                decision=None,
-            )
-
         try:
-            confirmation_decision = await confirmation(request)
-        except asyncio.CancelledError:
-            raise
-        except Exception as error:
-            self._record_unexpected_failure(tool, error)
+            confirmation_decision = await request_confirmation(reason)
+        except ToolAuthorizationFailure as error:
+            metadata = confirmation_state[0]
+            if metadata is None:
+                return _result(tool_call, "error", _generic_tool_failure(tool.name))
             return _refused_confirmation_result(
                 tool_call,
-                "Tool confirmation was expired or invalid.",
-                request=request,
-                decision=None,
+                _authorization_failure_message(error),
+                request=metadata.request,
+                decision=metadata.decision,
             )
-        if confirmation_decision not in {"approved", "declined"}:
-            return _refused_confirmation_result(
-                tool_call,
-                "Tool confirmation was expired or invalid.",
-                request=request,
-                decision=None,
-            )
-        metadata = ToolConfirmationMetadata(request=request, decision=confirmation_decision)
         if confirmation_decision == "declined":
-            return _result(
+            metadata = confirmation_state[0]
+            if metadata is None:
+                return _result(tool_call, "error", _generic_tool_failure(tool.name))
+            return _refused_confirmation_result(
                 tool_call,
-                "refused",
                 "Tool confirmation was declined.",
-                confirmation=metadata,
+                request=metadata.request,
+                decision=metadata.decision,
             )
+        _bind_network_confirmation(
+            authorization,
+            request_confirmation,
+            already_approved=True,
+        )
         return await self._execute(
             tool_call,
             tool,
             prepared_arguments,
             authorization=authorization,
-            confirmation=metadata,
+            confirmation_state=confirmation_state,
         )
 
     @staticmethod
@@ -540,7 +558,7 @@ class ToolGateway:
         prepared_arguments: dict[str, Any],
         *,
         authorization: ToolAuthorizationSession,
-        confirmation: ToolConfirmationMetadata | None,
+        confirmation_state: list[ToolConfirmationMetadata | None],
     ) -> ToolResult:
         try:
             content = await tool.execute_authorized(
@@ -551,19 +569,31 @@ class ToolGateway:
                 raise TypeError("Tool execution must return a string")
         except asyncio.CancelledError:
             raise
+        except ToolAuthorizationFailure as error:
+            return _result(
+                tool_call,
+                "refused",
+                _authorization_failure_message(error),
+                confirmation=confirmation_state[0],
+            )
         except ToolError as error:
             if self._failure_observer is not None:
                 self._failure_observer(error)
-            return _result(tool_call, "error", error.message, confirmation=confirmation)
+            return _result(
+                tool_call,
+                "error",
+                error.message,
+                confirmation=confirmation_state[0],
+            )
         except Exception as error:
             self._record_unexpected_failure(tool, error)
             return _result(
                 tool_call,
                 "error",
                 _generic_tool_failure(tool.name),
-                confirmation=confirmation,
+                confirmation=confirmation_state[0],
             )
-        return _result(tool_call, "success", content, confirmation=confirmation)
+        return _result(tool_call, "success", content, confirmation=confirmation_state[0])
 
     def _record_unexpected_failure(self, tool: BaseTool, error: Exception) -> None:
         if self._failure_observer is None:
@@ -595,6 +625,25 @@ def _context_from_snapshot(
 
 def _generic_tool_failure(tool_name: str) -> str:
     return f"{tool_name} could not complete the request."
+
+
+def _bind_network_confirmation(
+    authorization: ToolAuthorizationSession,
+    requester: Callable[[str], Awaitable[NetworkConfirmationDecision]],
+    *,
+    already_approved: bool,
+) -> None:
+    binder = getattr(authorization, "bind_confirmation_requester", None)
+    if callable(binder):
+        binder(requester, already_approved=already_approved)
+
+
+def _authorization_failure_message(error: ToolAuthorizationFailure) -> str:
+    if error.outcome == "unavailable":
+        return "Tool confirmation is unavailable."
+    if error.outcome == "declined":
+        return "Tool confirmation was declined."
+    return "Tool confirmation was expired or invalid."
 
 
 def _refused_confirmation_result(

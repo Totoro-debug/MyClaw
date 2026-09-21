@@ -3,20 +3,19 @@ from __future__ import annotations
 import asyncio
 import json
 from collections.abc import AsyncIterator
-from types import TracebackType
-from typing import ClassVar, Self, cast
+from pathlib import Path
+from typing import ClassVar, cast
 
 import pytest
-from aiohttp import ClientTimeout
 
 from myclaw.agent.tools.core.web_fetch import (
     HTTPClientBoundary,
     HTTPResponseBoundary,
     JinaReaderBoundary,
-    JinaReaderClient,
     WebFetchTool,
 )
 from myclaw.agent.tools.network_safety import DNSResolver
+from myclaw.agent.tools.permission import PermissionContext
 from myclaw.agent.tools.tool_gateway import (
     ConfirmationDecision,
     ConfirmationRequest,
@@ -61,62 +60,6 @@ class FakeJina:
         return outcome
 
 
-class FakeJinaHTTPResponse:
-    def __init__(self, *, status: int, content: str = "") -> None:
-        self.status = status
-        self._content = content
-        self.entered = False
-        self.exited = False
-        self.text_calls: list[tuple[str, str]] = []
-
-    async def __aenter__(self) -> Self:
-        self.entered = True
-        return self
-
-    async def __aexit__(
-        self,
-        exc_type: type[BaseException] | None,
-        exc: BaseException | None,
-        traceback: TracebackType | None,
-    ) -> None:
-        del exc_type, exc, traceback
-        self.exited = True
-
-    async def text(self, *, encoding: str, errors: str) -> str:
-        self.text_calls.append((encoding, errors))
-        return self._content
-
-
-class FakeJinaHTTPSession:
-    responses: ClassVar[list[FakeJinaHTTPResponse]] = []
-    options: ClassVar[list[dict[str, object]]] = []
-    calls: ClassVar[list[tuple[str, dict[str, str], bool]]] = []
-
-    def __init__(self, **options: object) -> None:
-        self.options.append(options)
-
-    async def __aenter__(self) -> Self:
-        return self
-
-    async def __aexit__(
-        self,
-        exc_type: type[BaseException] | None,
-        exc: BaseException | None,
-        traceback: TracebackType | None,
-    ) -> None:
-        del exc_type, exc, traceback
-
-    def get(
-        self,
-        url: str,
-        *,
-        headers: dict[str, str],
-        allow_redirects: bool,
-    ) -> FakeJinaHTTPResponse:
-        self.calls.append((url, headers, allow_redirects))
-        return self.responses.pop(0)
-
-
 class FakeResponse:
     def __init__(
         self,
@@ -149,9 +92,11 @@ class FakeHTTPClient:
         self,
         url: str,
         *,
+        resolved_addresses: tuple[str, ...],
         connect_timeout_seconds: float,
         total_timeout_seconds: float,
     ) -> HTTPResponseBoundary:
+        del resolved_addresses
         self.calls.append((url, connect_timeout_seconds, total_timeout_seconds))
         response = next(self._responses)
         return response
@@ -165,16 +110,20 @@ def _gateway(
     confirmation: ConfirmationRequester | None = None,
 ) -> SingleToolGateway:
     tool = WebFetchTool(resolver=resolver, jina_reader=jina, http_client=http)
-    return SingleToolGateway((tool,), confirmation=confirmation)
+    return SingleToolGateway(
+        (tool,),
+        confirmation=confirmation,
+        permission_context=PermissionContext(
+            level="workspace-write",
+            workspace_root=Path.cwd(),
+        ),
+    )
 
 
 @pytest.fixture(autouse=True)
 def reset_jina() -> None:
     FakeJina.outcomes = []
     FakeJina.calls = []
-    FakeJinaHTTPSession.responses = []
-    FakeJinaHTTPSession.options = []
-    FakeJinaHTTPSession.calls = []
 
 
 def test_web_fetch_schema_declares_format_and_max_chars() -> None:
@@ -214,31 +163,33 @@ def test_web_fetch_schema_declares_format_and_max_chars() -> None:
 
 
 @pytest.mark.asyncio
-async def test_web_fetch_uses_jina_first_for_public_targets() -> None:
+async def test_web_fetch_uses_the_audited_direct_client_for_public_targets() -> None:
     resolver = FakeResolver(("93.184.216.34",))
     jina = FakeJina()
-    FakeJina.outcomes = ["# Public page"]
-    http = FakeHTTPClient(())
+    FakeJina.outcomes = [RuntimeError("must not run")]
+    response = FakeResponse(
+        headers={"content-type": "text/plain"},
+        chunks=(b"Public page",),
+    )
+    http = FakeHTTPClient((cast(HTTPResponseBoundary, response),))
 
     result = await _gateway(resolver=resolver, jina=jina, http=http).call(
         _call({"url": "  https://public.example/page  "})
     )
 
     assert result.status == "success"
-    assert result.content == "# Public page"
-    assert resolver.calls == [
-        ("public.example", 443),
-        ("public.example", 443),
-    ]
-    assert jina.calls == [("https://public.example/page", "markdown")]
-    assert http.calls == []
+    assert result.content == "Public page"
+    assert resolver.calls == [("public.example", 443)]
+    assert jina.calls == []
+    assert http.calls == [("https://public.example/page", 10.0, 30.0)]
+    assert response.closed
 
 
 @pytest.mark.asyncio
-async def test_web_fetch_falls_back_to_direct_text_after_jina_timeout() -> None:
+async def test_web_fetch_direct_text_preserves_declared_charset() -> None:
     resolver = FakeResolver(("93.184.216.34",))
     jina = FakeJina()
-    FakeJina.outcomes = [TimeoutError()]
+    FakeJina.outcomes = [RuntimeError("must not run")]
     response = FakeResponse(
         headers={"Content-Type": "text/plain; charset=utf-8"},
         chunks=(b"Direct ", b"content"),
@@ -251,26 +202,33 @@ async def test_web_fetch_falls_back_to_direct_text_after_jina_timeout() -> None:
 
     assert result.status == "success"
     assert result.content == "Direct content"
-    assert jina.calls == [("https://public.example/page", "text")]
+    assert jina.calls == []
     assert http.calls == [("https://public.example/page", 10.0, 30.0)]
     assert response.closed
 
 
 @pytest.mark.asyncio
-async def test_web_fetch_cancellation_propagates_from_jina() -> None:
+async def test_web_fetch_cancellation_propagates_from_the_audited_client() -> None:
     started = asyncio.Event()
     release = asyncio.Event()
 
-    class HangingJina:
-        async def fetch(self, url: str, *, output_format: str) -> str:
-            del url, output_format
+    class HangingHTTP:
+        async def get(
+            self,
+            url: str,
+            *,
+            resolved_addresses: tuple[str, ...],
+            connect_timeout_seconds: float,
+            total_timeout_seconds: float,
+        ) -> HTTPResponseBoundary:
+            del url, resolved_addresses, connect_timeout_seconds, total_timeout_seconds
             started.set()
             await release.wait()
-            return "unreachable"
+            raise AssertionError("unreachable")
 
     resolver = FakeResolver(("93.184.216.34",))
     task = asyncio.create_task(
-        _gateway(resolver=resolver, jina=HangingJina(), http=FakeHTTPClient(())).call(
+        _gateway(resolver=resolver, http=HangingHTTP()).call(
             _call({"url": "https://public.example/page"})
         )
     )
@@ -313,32 +271,10 @@ async def test_web_fetch_rejects_invalid_parameters_before_dns(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("failure", (TimeoutError(), RuntimeError("transport")))
-async def test_web_fetch_falls_back_after_jina_failure(failure: BaseException) -> None:
+async def test_web_fetch_does_not_delegate_target_fetching_to_the_remote_reader() -> None:
     resolver = FakeResolver(("93.184.216.34",))
     jina = FakeJina()
-    FakeJina.outcomes = [failure]
-    response = FakeResponse(
-        headers={"content-type": "text/plain"},
-        chunks=(b"fallback",),
-    )
-    http = FakeHTTPClient((cast(HTTPResponseBoundary, response),))
-
-    result = await _gateway(resolver=resolver, jina=jina, http=http).call(
-        _call({"url": "https://public.example/page"})
-    )
-
-    assert result.status == "success"
-    assert result.content == "fallback"
-    assert len(jina.calls) == 1
-    assert len(http.calls) == 1
-
-
-@pytest.mark.asyncio
-async def test_web_fetch_falls_back_after_empty_or_non_success_jina_content() -> None:
-    resolver = FakeResolver(("93.184.216.34",))
-    jina = FakeJina()
-    FakeJina.outcomes = [""]
+    FakeJina.outcomes = ["remote content must not win"]
     response = FakeResponse(
         headers={"content-type": "text/plain"},
         chunks=(b"direct",),
@@ -351,112 +287,8 @@ async def test_web_fetch_falls_back_after_empty_or_non_success_jina_content() ->
 
     assert result.status == "success"
     assert result.content == "direct"
+    assert jina.calls == []
     assert response.closed
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize(
-    ("status", "content", "output_format"),
-    (
-        (302, "redirect", "markdown"),
-        (429, "rate limited", "markdown"),
-        (503, "unavailable", "text"),
-        (200, "  \n", "markdown"),
-    ),
-)
-async def test_web_fetch_falls_back_after_jina_http_response(
-    monkeypatch: pytest.MonkeyPatch,
-    status: int,
-    content: str,
-    output_format: str,
-) -> None:
-    jina_response = FakeJinaHTTPResponse(status=status, content=content)
-    FakeJinaHTTPSession.responses = [jina_response]
-    monkeypatch.setattr(
-        "myclaw.agent.tools.core.web_fetch.ClientSession",
-        FakeJinaHTTPSession,
-    )
-    resolver = FakeResolver(("93.184.216.34",))
-    direct_response = FakeResponse(
-        headers={"content-type": "text/plain"},
-        chunks=(b"direct",),
-    )
-    http = FakeHTTPClient((cast(HTTPResponseBoundary, direct_response),))
-
-    result = await _gateway(
-        resolver=resolver,
-        jina=JinaReaderClient(),
-        http=http,
-    ).call(
-        _call(
-            {
-                "url": "https://public.example/page",
-                "format": output_format,
-            }
-        )
-    )
-
-    assert result.status == "success"
-    assert result.content == "direct"
-    assert FakeJinaHTTPSession.calls == [
-        (
-            "https://r.jina.ai/https://public.example/page",
-            {
-                "Accept": "text/plain",
-                "X-Respond-With": output_format,
-            },
-            False,
-        )
-    ]
-    timeout = FakeJinaHTTPSession.options[0]["timeout"]
-    assert isinstance(timeout, ClientTimeout)
-    assert timeout.total is None
-    assert timeout.connect == 10.0
-    assert timeout.sock_connect == 10.0
-    assert jina_response.entered
-    assert jina_response.exited
-    assert jina_response.text_calls == ([("utf-8", "replace")] if status == 200 else [])
-    assert direct_response.closed
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("output_format", ("markdown", "text"))
-async def test_web_fetch_requests_the_selected_jina_output_format(
-    monkeypatch: pytest.MonkeyPatch,
-    output_format: str,
-) -> None:
-    jina_response = FakeJinaHTTPResponse(status=200, content="Jina content")
-    FakeJinaHTTPSession.responses = [jina_response]
-    monkeypatch.setattr(
-        "myclaw.agent.tools.core.web_fetch.ClientSession",
-        FakeJinaHTTPSession,
-    )
-    http = FakeHTTPClient(())
-
-    result = await _gateway(
-        resolver=FakeResolver(("93.184.216.34",)),
-        jina=JinaReaderClient(),
-        http=http,
-    ).call(
-        _call(
-            {
-                "url": "https://public.example/page",
-                "format": output_format,
-            }
-        )
-    )
-
-    assert result.status == "success"
-    assert result.content == "Jina content"
-    assert FakeJinaHTTPSession.calls[0][1:] == (
-        {
-            "Accept": "text/plain",
-            "X-Respond-With": output_format,
-        },
-        False,
-    )
-    assert "Authorization" not in FakeJinaHTTPSession.calls[0][1]
-    assert http.calls == []
 
 
 @pytest.mark.asyncio
@@ -497,8 +329,6 @@ async def test_concurrent_web_fetch_calls_keep_target_evaluations_isolated() -> 
                 (
                     ("127.0.0.1",),
                     ("93.184.216.34",),
-                    ("93.184.216.34",),
-                    ("127.0.0.1",),
                 )
             )
 
@@ -507,12 +337,21 @@ async def test_concurrent_web_fetch_calls_keep_target_evaluations_isolated() -> 
             return next(self._answers)
 
     jina = FakeJina()
-    FakeJina.outcomes = ["public-via-jina", "cross-call-evaluation"]
-    response = FakeResponse(
+    FakeJina.outcomes = ["must not run"]
+    public_response = FakeResponse(
+        headers={"content-type": "text/plain"},
+        chunks=(b"public-direct",),
+    )
+    private_response = FakeResponse(
         headers={"content-type": "text/plain"},
         chunks=(b"confirmed-private-direct",),
     )
-    http = FakeHTTPClient((cast(HTTPResponseBoundary, response),))
+    http = FakeHTTPClient(
+        (
+            cast(HTTPResponseBoundary, public_response),
+            cast(HTTPResponseBoundary, private_response),
+        )
+    )
     confirmation_requested = asyncio.Event()
     approve_private = asyncio.Event()
     requests: list[ConfirmationRequest] = []
@@ -549,7 +388,7 @@ async def test_concurrent_web_fetch_calls_keep_target_evaluations_isolated() -> 
     private_result = await private_call
 
     assert public_result.status == "success"
-    assert public_result.content == "public-via-jina"
+    assert public_result.content == "public-direct"
     assert private_result.status == "success"
     assert private_result.content == "confirmed-private-direct"
     assert private_result.confirmation is not None
@@ -558,7 +397,7 @@ async def test_concurrent_web_fetch_calls_keep_target_evaluations_isolated() -> 
 
 
 @pytest.mark.asyncio
-async def test_web_fetch_dns_failure_requests_confirmation_and_skips_jina() -> None:
+async def test_web_fetch_dns_failure_requests_confirmation_then_returns_tool_error() -> None:
     resolver = FakeResolver(())
     resolver.failure = OSError("DNS unavailable")
     jina = FakeJina()
@@ -578,10 +417,11 @@ async def test_web_fetch_dns_failure_requests_confirmation_and_skips_jina() -> N
         confirmation=approve,
     ).call(_call({"url": "https://missing.example/page"}))
 
-    assert result.status == "success"
-    assert result.content == "approved"
+    assert result.status == "error"
+    assert "DNS" in result.content
     assert jina.calls == []
-    assert "DNS" in requests[0].reason
+    assert len(requests) == 1
+    assert http.calls == []
 
 
 @pytest.mark.asyncio
@@ -659,7 +499,6 @@ async def test_web_fetch_follows_public_redirects_and_rechecks_each_target() -> 
     assert result.content == "redirected"
     assert resolver.calls == [
         ("public.example", 443),
-        ("public.example", 443),
         ("next.example", 443),
     ]
     assert [call[0] for call in http.calls] == [
@@ -671,7 +510,7 @@ async def test_web_fetch_follows_public_redirects_and_rechecks_each_target() -> 
 
 
 @pytest.mark.asyncio
-async def test_web_fetch_stops_at_a_newly_unsafe_redirect_for_a_separate_call() -> None:
+async def test_web_fetch_authorizes_a_newly_unsafe_redirect_in_the_same_call() -> None:
     resolver = FakeResolver(
         {
             "public.example": ("93.184.216.34",),
@@ -684,22 +523,36 @@ async def test_web_fetch_stops_at_a_newly_unsafe_redirect_for_a_separate_call() 
         status_code=302,
         headers={"location": "http://internal.example/admin"},
     )
-    http = FakeHTTPClient((cast(HTTPResponseBoundary, redirect),))
+    final = FakeResponse(
+        headers={"content-type": "text/plain"},
+        chunks=(b"private result",),
+    )
+    http = FakeHTTPClient((cast(HTTPResponseBoundary, redirect), cast(HTTPResponseBoundary, final)))
+    requests: list[ConfirmationRequest] = []
 
-    result = await _gateway(resolver=resolver, jina=jina, http=http).call(
+    async def approve(request: ConfirmationRequest) -> ConfirmationDecision:
+        requests.append(request)
+        return "approved"
+
+    result = await _gateway(
+        resolver=resolver,
+        jina=jina,
+        http=http,
+        confirmation=approve,
+    ).call(
         _call({"url": "https://public.example/start"})
     )
 
-    assert result.status == "error"
-    assert "separate confirmed invocation" in result.content
-    assert "http://internal.example/admin" in result.content
+    assert result.status == "success"
+    assert result.content == "private result"
+    assert len(requests) == 1
     assert resolver.calls == [
-        ("public.example", 443),
         ("public.example", 443),
         ("internal.example", 80),
     ]
-    assert len(http.calls) == 1
+    assert len(http.calls) == 2
     assert redirect.closed
+    assert final.closed
 
 
 @pytest.mark.asyncio
@@ -724,7 +577,7 @@ async def test_web_fetch_follows_at_most_five_redirects() -> None:
     assert "redirect limit" in result.content
     assert len(http.calls) == 6
     assert all(response.closed for response in redirects)
-    assert len(resolver.calls) == 7
+    assert len(resolver.calls) == 6
 
 
 @pytest.mark.asyncio
@@ -815,11 +668,15 @@ async def test_web_fetch_extracts_readable_html_without_ignored_elements() -> No
 
 
 @pytest.mark.asyncio
-async def test_web_fetch_applies_final_shared_prefix_truncation_to_jina_output() -> None:
+async def test_web_fetch_applies_final_shared_prefix_truncation_to_direct_output() -> None:
     resolver = FakeResolver(("93.184.216.34",))
     jina = FakeJina()
-    FakeJina.outcomes = ["abcdefghijklmnopqrstuvwxyz"]
-    http = FakeHTTPClient(())
+    FakeJina.outcomes = ["must not run"]
+    response = FakeResponse(
+        headers={"content-type": "text/plain"},
+        chunks=(b"abcdefghijklmnopqrstuvwxyz",),
+    )
+    http = FakeHTTPClient((cast(HTTPResponseBoundary, response),))
 
     result = await _gateway(resolver=resolver, jina=jina, http=http).call(
         _call({"url": "https://public.example/page", "maxChars": 20})
@@ -828,7 +685,7 @@ async def test_web_fetch_applies_final_shared_prefix_truncation_to_jina_output()
     assert result.status == "success"
     assert result.content == "abcd\n\n...[truncated]"
     assert len(result.content) == 20
-    assert http.calls == []
+    assert len(http.calls) == 1
 
 
 @pytest.mark.asyncio
@@ -836,19 +693,25 @@ async def test_web_fetch_whole_call_timeout_is_bounded(monkeypatch: pytest.Monke
     started = asyncio.Event()
     release = asyncio.Event()
 
-    class SlowJina:
-        async def fetch(self, url: str, *, output_format: str) -> str:
-            del url, output_format
+    class SlowHTTP:
+        async def get(
+            self,
+            url: str,
+            *,
+            resolved_addresses: tuple[str, ...],
+            connect_timeout_seconds: float,
+            total_timeout_seconds: float,
+        ) -> HTTPResponseBoundary:
+            del url, resolved_addresses, connect_timeout_seconds, total_timeout_seconds
             started.set()
             await release.wait()
-            return "never"
+            raise AssertionError("unreachable")
 
     monkeypatch.setattr("myclaw.agent.tools.core.web_fetch.TOTAL_TIMEOUT_SECONDS", 0.01)
     resolver = FakeResolver(("93.184.216.34",))
     result = await _gateway(
         resolver=resolver,
-        jina=SlowJina(),
-        http=FakeHTTPClient(()),
+        http=SlowHTTP(),
     ).call(_call({"url": "https://public.example/slow"}))
 
     assert result.status == "error"
@@ -866,10 +729,11 @@ async def test_web_fetch_cancellation_propagates_from_direct_client() -> None:
             self,
             url: str,
             *,
+            resolved_addresses: tuple[str, ...],
             connect_timeout_seconds: float,
             total_timeout_seconds: float,
         ) -> HTTPResponseBoundary:
-            del url, connect_timeout_seconds, total_timeout_seconds
+            del url, resolved_addresses, connect_timeout_seconds, total_timeout_seconds
             started.set()
             await release.wait()
             raise AssertionError("unreachable")

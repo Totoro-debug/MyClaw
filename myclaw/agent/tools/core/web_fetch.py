@@ -8,13 +8,35 @@ from collections.abc import AsyncIterator, Mapping
 from dataclasses import dataclass
 from email.message import Message
 from html import unescape
-from typing import Annotated, Protocol
-from urllib.parse import SplitResult, urljoin, urlsplit
+from ipaddress import IPv4Address, IPv6Address, ip_address
+from socket import AF_INET, AF_INET6, AF_UNSPEC, IPPROTO_TCP
+from ssl import SSLContext
+from typing import Annotated, Any, Literal, Protocol, cast
+from urllib.parse import SplitResult, urljoin, urlsplit, urlunsplit
 
-from aiohttp import ClientResponse, ClientSession, ClientTimeout
+from aiohttp import ClientResponse, ClientSession, ClientTimeout, TCPConnector
+from aiohttp.abc import AbstractResolver, ResolveResult
 
-from myclaw.agent.tools.base import BaseTool, ToolError, ToolParam, truncate_text
-from myclaw.agent.tools.network_safety import DNSResolver, SocketDNSResolver, assess_target
+from myclaw.agent.tools.base import (
+    BaseTool,
+    ToolError,
+    ToolParam,
+    is_public_ip,
+    truncate_text,
+)
+from myclaw.agent.tools.network_safety import (
+    DNSResolver,
+    SocketDNSResolver,
+    TargetResolution,
+    resolve_target,
+)
+from myclaw.agent.tools.permission import (
+    NetworkAssessment,
+    NetworkTargetRisk,
+    NormalizedNetworkTarget,
+    ToolAuthorizationSession,
+    ToolInvocationFacts,
+)
 
 CONNECT_TIMEOUT_SECONDS = 10.0
 TOTAL_TIMEOUT_SECONDS = 30.0
@@ -62,9 +84,52 @@ class HTTPClientBoundary(Protocol):
         self,
         url: str,
         *,
+        resolved_addresses: tuple[str, ...],
         connect_timeout_seconds: float,
         total_timeout_seconds: float,
     ) -> HTTPResponseBoundary: ...
+
+
+class _AuditedResolver(AbstractResolver):
+    """Expose only the address set audited by the Web Fetch Tool."""
+
+    def __init__(self, *, hostname: str, addresses: tuple[str, ...]) -> None:
+        self._hostname = hostname
+        self._addresses = addresses
+
+    async def resolve(
+        self,
+        host: str,
+        port: int = 0,
+        family: int = AF_UNSPEC,
+    ) -> list[ResolveResult]:
+        if host.casefold().rstrip(".") != self._hostname.casefold().rstrip("."):
+            raise OSError("Web Fetch connector hostname did not match the audited target")
+        results: list[ResolveResult] = []
+        for address in self._addresses:
+            try:
+                parsed = ip_address(address)
+            except ValueError as error:
+                raise OSError("Web Fetch resolver returned an invalid address") from error
+            address_family = AF_INET6 if isinstance(parsed, IPv6Address) else AF_INET
+            if family not in {AF_UNSPEC, address_family}:
+                continue
+            results.append(
+                {
+                    "hostname": self._hostname,
+                    "host": address,
+                    "port": port,
+                    "family": address_family,
+                    "proto": IPPROTO_TCP,
+                    "flags": 0,
+                }
+            )
+        if not results:
+            raise OSError("Web Fetch audited address set has no compatible address")
+        return results
+
+    async def close(self) -> None:
+        return None
 
 
 class _AioHttpResponse:
@@ -86,13 +151,21 @@ class _AioHttpResponse:
 class AioHttpWebFetchClient:
     """Perform one no-redirect GET with the caller's bounded timeout."""
 
+    def __init__(self, *, ssl_context: SSLContext | None = None) -> None:
+        self._ssl_context = ssl_context
+
     async def get(
         self,
         url: str,
         *,
+        resolved_addresses: tuple[str, ...],
         connect_timeout_seconds: float,
         total_timeout_seconds: float,
     ) -> HTTPResponseBoundary:
+        parsed = _parse_url(url)
+        hostname = parsed.hostname
+        if hostname is None:
+            raise ToolError("Web Fetch URL must contain a hostname.")
         session = ClientSession(
             timeout=ClientTimeout(
                 total=total_timeout_seconds,
@@ -101,6 +174,15 @@ class AioHttpWebFetchClient:
             ),
             auto_decompress=True,
             trust_env=False,
+            connector=TCPConnector(
+                resolver=_AuditedResolver(
+                    hostname=hostname,
+                    addresses=resolved_addresses,
+                ),
+                use_dns_cache=False,
+                force_close=True,
+                ssl=True if self._ssl_context is None else self._ssl_context,
+            ),
         )
         try:
             response = await session.get(url, allow_redirects=False)
@@ -140,11 +222,12 @@ class JinaReaderClient:
 
 @dataclass(frozen=True, slots=True)
 class _TargetEvaluation:
-    safety_reason: str | None
+    target: NormalizedNetworkTarget
+    static_risk: NetworkTargetRisk | None
 
 
 class WebFetchTool(BaseTool):
-    """Fetch readable web content with a Jina-first public path."""
+    """Fetch readable web content through per-hop audited connections."""
 
     name = "web_fetch"
     description = "Fetch readable content from an HTTP or HTTPS URL."
@@ -171,8 +254,21 @@ class WebFetchTool(BaseTool):
         http_client: HTTPClientBoundary | None = None,
     ) -> None:
         self._resolver = SocketDNSResolver() if resolver is None else resolver
-        self._jina_reader = JinaReaderClient() if jina_reader is None else jina_reader
+        # Preserve construction compatibility without delegating target fetches
+        # to a remote service that cannot expose redirect hops for authorization.
+        del jina_reader
         self._http_client = AioHttpWebFetchClient() if http_client is None else http_client
+
+    async def prepare_arguments(self, arguments: dict[str, Any]) -> dict[str, Any]:
+        prepared = await super().prepare_arguments(arguments)
+        url = prepared.get("url")
+        if not isinstance(url, str):
+            raise ToolError("Web Fetch URL is invalid.")
+        try:
+            prepared["url"] = _normalize_url(url.strip()).url
+        except ValueError as error:
+            raise ToolError(f"Web Fetch URL is invalid: {error}") from error
+        return prepared
 
     def validate_arguments(  # type: ignore[override]
         self,
@@ -183,7 +279,7 @@ class WebFetchTool(BaseTool):
     ) -> str | None:
         del maxChars
         try:
-            _parse_url(url.strip())
+            _normalize_url(url.strip())
         except ValueError as error:
             return f"Web Fetch URL is invalid: {error}"
         if format not in {"markdown", "text"}:
@@ -197,32 +293,84 @@ class WebFetchTool(BaseTool):
         format: str,
         maxChars: int,
     ) -> str | None:
-        del format, maxChars
-        normalized_url = url.strip()
-        evaluation = await self._evaluate_target(normalized_url)
-        return evaluation.safety_reason
+        del url, format, maxChars
+        return None
+
+    def build_invocation_facts(
+        self,
+        prepared_arguments: dict[str, Any],
+        *,
+        safety_reason: str | None,
+    ) -> ToolInvocationFacts:
+        url = prepared_arguments.get("url")
+        if not isinstance(url, str):
+            raise ToolError("Web Fetch URL is invalid.")
+        evaluation = self._evaluate_target(url)
+        return ToolInvocationFacts(
+            tool_name=self.name,
+            normalized_arguments=prepared_arguments,
+            legacy_safety_reason=safety_reason,
+            network_targets=(
+                NetworkAssessment(
+                    target=evaluation.target,
+                    static_risk=evaluation.static_risk,
+                ),
+            ),
+        )
+
+    async def execute_authorized(
+        self,
+        arguments: dict[str, object],
+        authorization: ToolAuthorizationSession,
+    ) -> str:
+        url = arguments.get("url")
+        output_format = arguments.get("format")
+        max_chars = arguments.get("maxChars")
+        if (
+            not isinstance(url, str)
+            or not isinstance(output_format, str)
+            or isinstance(max_chars, bool)
+            or not isinstance(max_chars, int)
+        ):
+            raise ToolError("Web Fetch arguments are invalid.")
+        return await self._execute_fetch(
+            url,
+            output_format,
+            max_chars,
+            authorization,
+        )
 
     async def execute(self, *, url: str, format: str, maxChars: int) -> str:
-        normalized_url = url.strip()
-        evaluation = await self._evaluate_target(normalized_url)
+        return await self._execute_fetch(
+            url,
+            format,
+            maxChars,
+            _DirectNetworkAuthorization(),
+        )
+
+    async def _execute_fetch(
+        self,
+        url: str,
+        output_format: str,
+        max_chars: int,
+        authorization: ToolAuthorizationSession,
+    ) -> str:
+        evaluation = self._evaluate_target(url)
+        resolution = await self._resolve_target(evaluation.target)
+        await authorization.authorize_network_target(
+            evaluation.target,
+            resolution.addresses,
+        )
+        _raise_resolution_error(evaluation.target, resolution)
 
         try:
             async with asyncio.timeout(TOTAL_TIMEOUT_SECONDS):
-                if evaluation.safety_reason is None:
-                    try:
-                        jina_content = await self._jina_reader.fetch(
-                            normalized_url,
-                            output_format=format,
-                        )
-                    except asyncio.CancelledError:
-                        raise
-                    except Exception:
-                        jina_content = ""
-                    if isinstance(jina_content, str) and jina_content.strip():
-                        return truncate_text(jina_content, limit=maxChars)
-
-                content = await self._fetch_direct(normalized_url)
-                return truncate_text(content, limit=maxChars)
+                content = await self._fetch_direct(
+                    evaluation.target,
+                    resolution,
+                    authorization,
+                )
+                return truncate_text(content, limit=max_chars)
         except asyncio.CancelledError:
             raise
         except TimeoutError as error:
@@ -230,40 +378,47 @@ class WebFetchTool(BaseTool):
                 f"Web Fetch timed out after {TOTAL_TIMEOUT_SECONDS:g} seconds."
             ) from error
 
-    async def _evaluate_target(self, url: str) -> _TargetEvaluation:
+    def _evaluate_target(self, url: str) -> _TargetEvaluation:
         try:
-            parsed = _parse_url(url)
+            target = _normalize_url(url.strip())
         except ValueError as error:
             raise ToolError(f"Web Fetch URL is invalid: {error}") from error
 
-        hostname = parsed.hostname
-        if hostname is None:
-            raise ToolError("Web Fetch URL must contain a hostname.")
-        port = _effective_port(parsed)
-        assessment = await assess_target(hostname, port, self._resolver)
-        reasons = {
-            "literal_non_global": (
-                "Web Fetch target uses a private or non-global address and requires confirmation."
-            ),
-            "dns_failure": ("Web Fetch target DNS resolution failed and requires confirmation."),
-            "dns_empty": (
-                "Web Fetch target DNS resolution returned no addresses and requires confirmation."
-            ),
-            "dns_non_global": (
-                "Web Fetch target resolves to a private or non-global address and requires "
-                "confirmation."
-            ),
-        }
         return _TargetEvaluation(
-            safety_reason=None if assessment.risk is None else reasons[assessment.risk]
+            target=target,
+            static_risk=(
+                "literal_non_global"
+                if not is_public_ip(target.host) and _is_ip(target.host)
+                else None
+            ),
         )
 
-    async def _fetch_direct(self, url: str) -> str:
-        current_url = url
+    async def _resolve_target(self, target: NormalizedNetworkTarget) -> TargetResolution:
+        try:
+            return await asyncio.wait_for(
+                resolve_target(target.host, target.port, self._resolver),
+                timeout=CONNECT_TIMEOUT_SECONDS,
+            )
+        except asyncio.CancelledError:
+            raise
+        except TimeoutError:
+            return TargetResolution(
+                addresses=(),
+                risk="dns_failure",
+                error_message="DNS resolution timed out.",
+            )
+
+    async def _fetch_direct(
+        self,
+        target: NormalizedNetworkTarget,
+        resolution: TargetResolution,
+        authorization: ToolAuthorizationSession,
+    ) -> str:
         redirects_followed = 0
         while True:
             response = await self._http_client.get(
-                current_url,
+                target.url,
+                resolved_addresses=resolution.addresses,
                 connect_timeout_seconds=CONNECT_TIMEOUT_SECONDS,
                 total_timeout_seconds=TOTAL_TIMEOUT_SECONDS,
             )
@@ -272,15 +427,19 @@ class WebFetchTool(BaseTool):
                 if 300 <= response.status_code < 400 and location:
                     if redirects_followed >= MAX_REDIRECTS:
                         raise ToolError("Web Fetch redirect limit exceeded.")
-                    next_url = urljoin(current_url, location)
-                    next_evaluation = await self._evaluate_target(next_url)
-                    if next_evaluation.safety_reason is not None:
-                        raise ToolError(
-                            "Web Fetch redirect target requires a separate confirmed invocation: "
-                            f"{next_url}"
-                        )
+                    try:
+                        next_target = _normalize_url(urljoin(target.url, location))
+                    except ValueError as error:
+                        raise ToolError(f"Web Fetch redirect URL is invalid: {error}") from error
+                    next_resolution = await self._resolve_target(next_target)
+                    await authorization.authorize_network_target(
+                        next_target,
+                        next_resolution.addresses,
+                    )
+                    _raise_resolution_error(next_target, next_resolution)
                     redirects_followed += 1
-                    current_url = next_url
+                    target = next_target
+                    resolution = next_resolution
                     continue
 
                 content_type = _header(response.headers, "content-type")
@@ -293,6 +452,18 @@ class WebFetchTool(BaseTool):
                 )
             finally:
                 await response.close()
+
+
+class _DirectNetworkAuthorization:
+    def initial_decision(self) -> Literal["direct"]:
+        return "direct"
+
+    async def authorize_network_target(
+        self,
+        target: NormalizedNetworkTarget,
+        resolved_addresses: tuple[str, ...],
+    ) -> None:
+        del target, resolved_addresses
 
 
 async def _read_body(response: HTTPResponseBoundary) -> bytes:
@@ -327,6 +498,117 @@ def _parse_url(url: str) -> SplitResult:
     if port == 0:
         raise ValueError("URL port must not be zero")
     return parsed
+
+
+def _normalize_url(url: str) -> NormalizedNetworkTarget:
+    parsed = _parse_url(url)
+    if parsed.hostname is None:
+        raise ValueError("URL must contain a hostname")
+    scheme = cast(Literal["http", "https"], parsed.scheme.lower())
+    host = _normalize_hostname(parsed.hostname)
+    port = _effective_port(parsed)
+    host_for_url = f"[{host}]" if ":" in host else host
+    authority = host_for_url if parsed.port is None else f"{host_for_url}:{port}"
+    normalized_url = urlunsplit((scheme, authority, parsed.path, parsed.query, ""))
+    return NormalizedNetworkTarget(
+        url=normalized_url,
+        scheme=scheme,
+        host=host,
+        port=port,
+    )
+
+
+def _normalize_hostname(hostname: str) -> str:
+    if "%" in hostname:
+        raise ValueError("URL IPv6 zone identifiers are not supported")
+    try:
+        return str(ip_address(hostname))
+    except ValueError:
+        pass
+
+    ipv4 = _parse_legacy_ipv4(hostname)
+    if ipv4 is not None:
+        return str(ipv4)
+
+    hostname = hostname.rstrip(".")
+    if not hostname:
+        raise ValueError("URL hostname is invalid") from None
+    try:
+        ascii_hostname = hostname.encode("idna").decode("ascii").lower()
+    except UnicodeError as error:
+        raise ValueError("URL hostname is invalid") from error
+    labels = ascii_hostname.split(".")
+    if (
+        len(ascii_hostname) > 253
+        or any(
+            not label
+            or len(label) > 63
+            or label.startswith("-")
+            or label.endswith("-")
+            or re.fullmatch(r"[a-z0-9-]+", label) is None
+            for label in labels
+        )
+    ):
+        raise ValueError("URL hostname is invalid")
+    return ascii_hostname
+
+
+def _parse_legacy_ipv4(hostname: str) -> IPv4Address | None:
+    parts = hostname.split(".")
+    if not 1 <= len(parts) <= 4 or any(not part for part in parts):
+        return None
+
+    values: list[int] = []
+    for part in parts:
+        try:
+            if part.lower().startswith("0x"):
+                if len(part) == 2:
+                    return None
+                value = int(part[2:], 16)
+            elif len(part) > 1 and part.startswith("0"):
+                value = int(part[1:], 8) if part[1:] else 0
+            elif part.isdecimal():
+                value = int(part, 10)
+            else:
+                return None
+        except ValueError as error:
+            raise ValueError("URL IPv4 address is invalid") from error
+        values.append(value)
+
+    widths = {
+        1: (32,),
+        2: (8, 24),
+        3: (8, 8, 16),
+        4: (8, 8, 8, 8),
+    }[len(values)]
+    if any(value >= 1 << width for value, width in zip(values, widths, strict=True)):
+        raise ValueError("URL IPv4 address is invalid")
+
+    packed = 0
+    for value, width in zip(values, widths, strict=True):
+        packed = (packed << width) | value
+    return IPv4Address(packed)
+
+
+def _is_ip(value: str) -> bool:
+    try:
+        ip_address(value)
+    except ValueError:
+        return False
+    return True
+
+
+def _raise_resolution_error(
+    target: NormalizedNetworkTarget,
+    resolution: TargetResolution,
+) -> None:
+    if resolution.risk == "dns_failure":
+        detail = resolution.error_message or "DNS resolution failed."
+        raise ToolError(f"Web Fetch DNS resolution failed: {detail}")
+    if resolution.risk == "dns_empty":
+        raise ToolError(
+            f"Web Fetch DNS resolution returned no addresses for {target.host}."
+        )
 
 
 def _effective_port(parsed: SplitResult) -> int:

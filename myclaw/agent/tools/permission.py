@@ -8,7 +8,7 @@ later policies can replace it with structured classification facts.
 from __future__ import annotations
 
 import os
-from collections.abc import Mapping
+from collections.abc import Awaitable, Callable, Mapping
 from copy import deepcopy
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -37,9 +37,64 @@ type PermissionDecision = Literal["direct", "confirm"]
 type ToolRunOrigin = Literal["foreground", "schedule", "memory"]
 type FileAccessRole = Literal["read", "write"]
 type ScheduleAction = object
-type NetworkAssessment = object
-type NormalizedNetworkTarget = object
 type IPAddress = str
+type NetworkTargetRisk = Literal[
+    "literal_non_global",
+    "dns_failure",
+    "dns_empty",
+    "dns_non_global",
+]
+type NetworkConfirmationDecision = Literal["approved", "declined"]
+type NetworkConfirmationRequester = Callable[
+    [str], Awaitable[NetworkConfirmationDecision]
+]
+
+
+@dataclass(frozen=True, slots=True)
+class NormalizedNetworkTarget:
+    """Immutable URL facts used to authorize one concrete network hop."""
+
+    url: str
+    scheme: Literal["http", "https"]
+    host: str
+    port: int
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.url, str) or not self.url:
+            raise ValueError("Network target URL must be a non-empty string")
+        if self.scheme not in {"http", "https"}:
+            raise ValueError("Network target scheme is invalid")
+        if not isinstance(self.host, str) or not self.host:
+            raise ValueError("Network target host must be a non-empty string")
+        if isinstance(self.port, bool) or not isinstance(self.port, int) or not 1 <= self.port <= 65535:
+            raise ValueError("Network target port is invalid")
+
+
+@dataclass(frozen=True, slots=True)
+class NetworkAssessment:
+    """Static facts for the initial Web Fetch target."""
+
+    target: NormalizedNetworkTarget
+    static_risk: NetworkTargetRisk | None = None
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.target, NormalizedNetworkTarget):
+            raise TypeError("Network assessment target is invalid")
+        if self.static_risk is not None and self.static_risk not in {
+            "literal_non_global",
+            "dns_failure",
+            "dns_empty",
+            "dns_non_global",
+        }:
+            raise ValueError("Network assessment risk is invalid")
+
+
+class ToolAuthorizationFailure(Exception):
+    """A confirmation outcome that must remain a canonical refused Tool result."""
+
+    def __init__(self, outcome: Literal["declined", "unavailable", "invalid"]) -> None:
+        self.outcome = outcome
+        super().__init__(outcome)
 
 
 @dataclass(frozen=True, slots=True)
@@ -247,6 +302,8 @@ class ToolPermissionPolicy:
         context: PermissionContext,
     ) -> ToolAuthorizationSession:
         """Classify one detached invocation without retaining mutable run state."""
+        if facts.network_targets and context.origin != "memory":
+            return _NetworkAuthorizationSession(facts.network_targets, context.level)
         if (
             facts.tool_name == "exec"
             and facts.exec_assessment is not None
@@ -259,6 +316,89 @@ class ToolPermissionPolicy:
             decision, reason = _classify_file_accesses(facts.file_accesses, context)
             return _DecisionAuthorizationSession(decision, reason)
         return _LegacyAuthorizationSession(facts.legacy_safety_reason)
+
+
+class _NetworkAuthorizationSession:
+    """Authorize Web Fetch hops while retaining one call-local approval state."""
+
+    def __init__(
+        self,
+        assessments: tuple[NetworkAssessment, ...],
+        level: ToolPermissionLevel | None,
+    ) -> None:
+        self._level = level
+        self._requester: NetworkConfirmationRequester | None = None
+        self._approved = False
+        static_risk = next(
+            (assessment.static_risk for assessment in assessments if assessment.static_risk is not None),
+            None,
+        )
+        self._initial_reason = _network_confirmation_reason(
+            addresses=(),
+            risk=static_risk,
+        )
+        static_unsafe = any(item.static_risk is not None for item in assessments)
+        self._initial_decision: PermissionDecision = (
+            "confirm"
+            if level != "full-access" and static_unsafe
+            else "direct"
+        )
+
+    def initial_decision(self) -> PermissionDecision:
+        return self._initial_decision
+
+    def confirmation_reason(self) -> str:
+        return self._initial_reason
+
+    def bind_confirmation_requester(
+        self,
+        requester: NetworkConfirmationRequester,
+        *,
+        already_approved: bool,
+    ) -> None:
+        self._requester = requester
+        self._approved = already_approved
+
+    async def authorize_network_target(
+        self,
+        target: NormalizedNetworkTarget,
+        resolved_addresses: tuple[IPAddress, ...],
+    ) -> None:
+        if self._level == "full-access":
+            return
+        if _addresses_are_public(resolved_addresses) or self._approved:
+            return
+        if self._requester is None:
+            raise ToolAuthorizationFailure("unavailable")
+        decision = await self._requester(
+            _network_confirmation_reason(addresses=resolved_addresses)
+        )
+        if decision == "approved":
+            self._approved = True
+            return
+        if decision == "declined":
+            raise ToolAuthorizationFailure("declined")
+        raise ToolAuthorizationFailure("invalid")
+
+
+def _addresses_are_public(addresses: tuple[IPAddress, ...]) -> bool:
+    if not addresses:
+        return False
+    # BaseTool imports this module, so defer the canonical classifier import
+    # until authorization rather than maintaining a second policy copy here.
+    from myclaw.agent.tools.base import is_public_ip
+
+    return all(is_public_ip(address) for address in addresses)
+
+
+def _network_confirmation_reason(
+    *,
+    addresses: tuple[IPAddress, ...],
+    risk: NetworkTargetRisk | None = None,
+) -> str:
+    if not addresses and risk not in {"literal_non_global", "dns_non_global"}:
+        return "Web Fetch target DNS resolution is unavailable or returned no addresses and requires confirmation."
+    return "Web Fetch target resolves to a private or non-global address and requires confirmation."
 
 
 class _DecisionAuthorizationSession:
@@ -592,6 +732,9 @@ __all__ = [
     "FileAccessRole",
     "IPAddress",
     "NetworkAssessment",
+    "NetworkConfirmationDecision",
+    "NetworkConfirmationRequester",
+    "NetworkTargetRisk",
     "NormalizedNetworkTarget",
     "PermissionContext",
     "PermissionDecision",
@@ -599,6 +742,7 @@ __all__ = [
     "ResolvedExecShell",
     "RuntimePermissionControl",
     "ScheduleAction",
+    "ToolAuthorizationFailure",
     "ToolAuthorizationSession",
     "ToolInvocationFacts",
     "ToolPermissionLevel",

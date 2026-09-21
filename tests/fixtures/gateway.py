@@ -6,6 +6,7 @@ from collections.abc import Iterable
 from typing import Any
 
 from myclaw.agent.tools.base import BaseTool
+from myclaw.agent.tools.permission import PermissionContext
 from myclaw.agent.tools.tool_gateway import (
     ConfirmationRequester,
     ModelToolCall,
@@ -22,8 +23,12 @@ class SingleToolGateway(ToolGateway):
         tools: Iterable[BaseTool],
         *,
         confirmation: ConfirmationRequester | None = None,
+        permission_context: PermissionContext | None = None,
     ) -> None:
-        self._gateway = ToolGateway._for_memory(tuple(tools))
+        self._gateway = ToolGateway._for_memory(
+            tuple(tools),
+            permission_context=permission_context,
+        )
         self._confirmation = confirmation
 
     @property
