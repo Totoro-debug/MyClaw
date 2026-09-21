@@ -38,8 +38,39 @@ call-local; it is never cached in a shared Tool instance.
 The foreground Runtime Context and the foreground run Gateway receive the
 same snapshot object. Runtime Context reports the permission level, resolved
 Exec Shell family, and that permission checks may require confirmation. The
-Gateway uses the snapshot for File policy while preserving the existing Exec
-Host and Web confirmation behavior.
+Gateway uses the snapshot for File policy and the strict PowerShell Exec
+policy described below; Web confirmation behavior remains unchanged.
+
+## Exec Permission Mapping
+
+Exec inspection is a detached Host fact collection that happens after
+argument normalization and before authorization. A missing selected shell is
+a capability error at every permission level. When the selected shell exists,
+an unavailable, failed, timed-out, malformed, or inconsistent inspector
+requires one confirmation at every level. Catastrophic Exec matches also
+require one confirmation at every level.
+
+For PowerShell 5.1 and 7, Read-Only and Workspace-Write direct execution is
+limited to the fixed candidate command and parameter grammars recorded in
+ADR-0010. The Host returns canonical command identity, expected Microsoft
+module, resolution count, and static path-role facts. The policy canonicalizes
+those paths using the Exec cwd and Workspace root, accepts only the FileSystem
+Provider, and applies Read-Only or Workspace-Write path rules. Unknown or
+dynamic syntax, untrusted identity, pipeline-fed paths, unknown parameters,
+and external paths require one confirmation. Full-Access directly executes
+parseable non-catastrophic dynamic commands, while still enforcing normal
+argument validation, capability checks, business refusals, and Tool errors.
+
+Approved Git read forms use a unique native executable outside the Workspace.
+The Host fixes Git configuration, pager, external-diff/textconv, fsmonitor,
+hook, prompt, and optional-lock behavior through the process environment and
+adds `--no-ext-diff --no-textconv` to `diff` and `show`. Static inspection does
+not launch Git. After Workspace-aware canonicalization proves the executable
+is external and every repository directory is internal, the exact resolved
+Git executable audits effective local/worktree include and clean/process
+filter configuration. Positive, failed, or ineligible audits, unlisted Git
+forms, and Workspace-resident Git executables require confirmation at the
+lower levels.
 
 ## Foreground Management and Runtime Lifetime
 
@@ -53,9 +84,11 @@ does not change it, and a new process starts from the configured value.
 The selector reports the current level and leaves it unchanged when the same
 level is submitted. An upgrade to `full-access` opens a warning with Cancel
 focused by default on every attempt. Full-Access removes ordinary permission
-confirmation for foreground File Tools only; it is not an operating-system
-sandbox and does not bypass validation, capability checks, business refusals,
-or Tool errors. Exec, Web, MCP, and Schedule retain their existing behavior. A
+confirmation for foreground File Tools and parseable non-catastrophic
+PowerShell Exec calls; it is not an operating-system sandbox and does not
+bypass validation, capability checks, business refusals, catastrophic or
+uncertain Exec confirmation, or Tool errors. Web, MCP, and Schedule retain
+their existing behavior. A
 process startup notice is shown at most once when the configured level is
 Full-Access. `/config` reports the configured level, and `/status` reports both
 configured and current foreground levels.
@@ -87,13 +120,16 @@ execution boundary.
 This decision does not alter the fixed Tool Catalog, Tool Exposure, Tool
 Activation, Tool Search, MCP Tool behavior, or Schedule permission behavior.
 It does not provide an operating-system sandbox. Full-Access removes ordinary
-foreground File permission confirmation only; validation, capability checks,
-business refusals, and Tool errors remain enforced. Exec, Web, MCP, and
-Schedule permission behavior is unchanged by this decision.
+foreground File and parseable non-catastrophic PowerShell Exec permission
+confirmation; validation, capability checks, business refusals, catastrophic
+or uncertain Exec confirmation, and Tool errors remain enforced. Web, MCP,
+and Schedule permission behavior is unchanged by this decision.
 
 The existing Skill Loader remains responsible for its own internal reads, and
 ADR-0016 no longer defines a confirmation-free boundary for model-issued
-`read_file` calls.
+`read_file` calls. Exec uses the same structured, detached authorization facts
+for its PowerShell policy; legacy safety reasons remain only for the existing
+non-PowerShell compatibility path.
 
 Consequences: permission policy is now expressed with structured, detached
 facts while legacy safety reasons continue to support non-File Tools during

@@ -22,7 +22,7 @@ from myclaw.agent.tools.core.exec_policy import (
     requires_legacy_destructive_confirmation,
 )
 from myclaw.agent.tools.network_safety import DNSResolver, SocketDNSResolver, assess_target
-from myclaw.agent.tools.permission import ToolInvocationFacts
+from myclaw.agent.tools.permission import ToolAuthorizationSession, ToolInvocationFacts
 
 _OUTPUT_LIMIT: Final[int] = 4000
 _URL_PATTERN: Final[re.Pattern[str]] = re.compile(
@@ -107,7 +107,10 @@ class ExecTool(BaseTool):
     ) -> str | None:
         del timeout
         reasons: list[str] = []
-        if requires_legacy_destructive_confirmation(command):
+        if (
+            self._host.resolved_shell.family == "bash"
+            and requires_legacy_destructive_confirmation(command)
+        ):
             reasons.append(
                 "The Exec command matches a known destructive operation and requires confirmation."
             )
@@ -123,11 +126,54 @@ class ExecTool(BaseTool):
         return " ".join(dict.fromkeys(reasons)) or None
 
     async def execute(self, *, command: str, cwd: str, timeout: int) -> str:
+        return await self._execute_host(
+            command=command,
+            cwd=cwd,
+            timeout=timeout,
+            assessment=None,
+        )
+
+    async def execute_authorized(
+        self,
+        arguments: dict[str, Any],
+        authorization: ToolAuthorizationSession,
+    ) -> str:
+        """Execute with the immutable assessment owned by this authorization call."""
+        command = arguments.get("command")
+        cwd = arguments.get("cwd")
+        timeout = arguments.get("timeout")
+        if not isinstance(command, str) or not isinstance(cwd, str) or not isinstance(timeout, int):
+            raise ToolError("Exec arguments are invalid.")
+        assessment = getattr(authorization, "exec_assessment", None)
+        return await self._execute_host(
+            command=command,
+            cwd=cwd,
+            timeout=timeout,
+            assessment=assessment if isinstance(assessment, ExecAssessment) else None,
+        )
+
+    async def _execute_host(
+        self,
+        *,
+        command: str,
+        cwd: str,
+        timeout: int,
+        assessment: ExecAssessment | None,
+    ) -> str:
         target = self.resolve_path_argument(workspace=self._workspace, requested=cwd)
         if not target.is_dir():
             raise ToolError("Exec working directory must be a directory.")
         try:
-            outcome = await self._host.execute(command, target, timeout)
+            execute_assessed = getattr(self._host, "execute_assessed", None)
+            if callable(execute_assessed):
+                outcome = await execute_assessed(
+                    command,
+                    target,
+                    timeout,
+                    assessment=assessment,
+                )
+            else:
+                outcome = await self._host.execute(command, target, timeout)
         except asyncio.CancelledError:
             raise
         except ExecCapabilityUnavailable as error:
@@ -160,6 +206,14 @@ class ExecTool(BaseTool):
         target = self.resolve_path_argument(workspace=self._workspace, requested=cwd)
         try:
             assessment = await self._host.inspect(command, target)
+            audit_git_delegation = getattr(self._host, "audit_git_delegation", None)
+            if callable(audit_git_delegation):
+                assessment = await audit_git_delegation(
+                    command,
+                    target,
+                    self._workspace,
+                    assessment,
+                )
         except asyncio.CancelledError:
             raise
         except Exception:

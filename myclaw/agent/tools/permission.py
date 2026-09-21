@@ -21,7 +21,15 @@ from myclaw.agent.permission import (
     ToolPermissionLevel,
     validate_permission_level,
 )
-from myclaw.agent.tools.core.exec_policy import ExecAssessment, ResolvedExecShell
+from myclaw.agent.tools.core.exec_policy import (
+    EXEC_CATASTROPHIC_REASON,
+    EXEC_CONFIRMATION_REASON,
+    ExecAssessment,
+    ExecPathAccess,
+    ResolvedExecShell,
+    classify_powershell_command,
+    requires_legacy_destructive_confirmation,
+)
 
 type PermissionDecision = Literal["direct", "confirm"]
 type ToolRunOrigin = Literal["foreground", "schedule", "memory"]
@@ -237,18 +245,31 @@ class ToolPermissionPolicy:
         context: PermissionContext,
     ) -> ToolAuthorizationSession:
         """Classify one detached invocation without retaining mutable run state."""
+        if (
+            facts.tool_name == "exec"
+            and facts.exec_assessment is not None
+            and context.origin == "foreground"
+        ):
+            return _classify_exec_invocation(facts, context)
         if facts.file_accesses and context.origin != "memory":
             if context.origin == "schedule" and context.level is None:
                 return _LegacyAuthorizationSession(facts.legacy_safety_reason)
             decision, reason = _classify_file_accesses(facts.file_accesses, context)
-            return _FileAuthorizationSession(decision, reason)
+            return _DecisionAuthorizationSession(decision, reason)
         return _LegacyAuthorizationSession(facts.legacy_safety_reason)
 
 
-class _FileAuthorizationSession:
-    def __init__(self, decision: PermissionDecision, reason: str | None = None) -> None:
+class _DecisionAuthorizationSession:
+    def __init__(
+        self,
+        decision: PermissionDecision,
+        reason: str | None = None,
+        *,
+        exec_assessment: ExecAssessment | None = None,
+    ) -> None:
         self._decision = decision
         self._reason = reason or "Tool confirmation is required."
+        self.exec_assessment = exec_assessment
 
     def initial_decision(self) -> PermissionDecision:
         return self._decision
@@ -262,6 +283,151 @@ class _FileAuthorizationSession:
         resolved_addresses: tuple[IPAddress, ...],
     ) -> None:
         del target, resolved_addresses
+
+
+def _classify_exec_invocation(
+    facts: ToolInvocationFacts,
+    context: PermissionContext,
+) -> ToolAuthorizationSession:
+    assessment = facts.exec_assessment
+    if assessment is None:
+        return _LegacyAuthorizationSession(facts.legacy_safety_reason)
+    if assessment.catastrophic_matches:
+        return _DecisionAuthorizationSession(
+            "confirm",
+            EXEC_CATASTROPHIC_REASON,
+            exec_assessment=assessment,
+        )
+    if assessment.uncertain or assessment.syntax_confidence != "high":
+        return _DecisionAuthorizationSession(
+            "confirm",
+            EXEC_CONFIRMATION_REASON,
+            exec_assessment=assessment,
+        )
+
+    shell = context.exec_shell
+    if shell is None:
+        command = facts.normalized_arguments.get("command")
+        if isinstance(command, str) and requires_legacy_destructive_confirmation(command):
+            return _DecisionAuthorizationSession(
+                "confirm",
+                "The Exec command matches a known destructive operation and requires confirmation.",
+                exec_assessment=assessment,
+            )
+        return _LegacyAuthorizationSession(facts.legacy_safety_reason)
+    if shell.family not in {"powershell", "pwsh"}:
+        return _LegacyAuthorizationSession(facts.legacy_safety_reason)
+
+    if context.level == "full-access":
+        return _DecisionAuthorizationSession("direct", exec_assessment=assessment)
+
+    workspace_root = context.workspace_root
+    if workspace_root is not None and any(
+        identity.requested.casefold() in {"git", "git.exe"}
+        and _is_workspace_git_identity(identity, workspace_root)
+        for identity in assessment.command_identities
+    ):
+        return _DecisionAuthorizationSession(
+            "confirm",
+            "The Git executable resolves inside the Workspace and requires confirmation.",
+            exec_assessment=assessment,
+        )
+
+    arguments = facts.normalized_arguments
+    command = arguments.get("command")
+    if not isinstance(command, str):
+        return _DecisionAuthorizationSession(
+            "confirm",
+            "Exec command facts are incomplete.",
+            exec_assessment=assessment,
+        )
+    grammar = classify_powershell_command(command, assessment)
+    if not grammar.accepted:
+        return _DecisionAuthorizationSession(
+            "confirm",
+            grammar.reason,
+            exec_assessment=assessment,
+        )
+
+    path_decision, path_reason = _classify_exec_paths(
+        grammar.file_accesses,
+        facts=facts,
+        context=context,
+    )
+    if path_decision == "confirm":
+        return _DecisionAuthorizationSession(
+            "confirm",
+            path_reason,
+            exec_assessment=assessment,
+        )
+    if context.level == "read-only" and any(
+        access.role == "write" for access in grammar.file_accesses
+    ):
+        return _DecisionAuthorizationSession(
+            "confirm",
+            "Write access requires confirmation in read-only mode.",
+            exec_assessment=assessment,
+        )
+    return _DecisionAuthorizationSession("direct", exec_assessment=assessment)
+
+
+def _is_workspace_git_identity(identity: object, workspace_root: Path) -> bool:
+    resolved = getattr(identity, "resolved", None)
+    if not isinstance(resolved, str) or not os.path.isabs(resolved):
+        return True
+    try:
+        canonical = Path(resolved).resolve(strict=False)
+        root = workspace_root.resolve(strict=True)
+    except (OSError, RuntimeError, ValueError):
+        return True
+    return _is_host_path_within(canonical, root)
+
+
+def _classify_exec_paths(
+    accesses: tuple[ExecPathAccess, ...],
+    *,
+    facts: ToolInvocationFacts,
+    context: PermissionContext,
+) -> tuple[PermissionDecision, str | None]:
+    if context.level == "full-access":
+        return "direct", None
+    workspace_root = context.workspace_root
+    cwd = facts.normalized_arguments.get("cwd")
+    if workspace_root is None or not isinstance(cwd, str):
+        return "confirm", "Exec path facts are incomplete and require confirmation."
+    base = Path(cwd)
+    try:
+        canonical_cwd = canonicalize_file_access(
+            workspace=workspace_root,
+            base=base,
+            requested=".",
+            role="read",
+        )
+    except (OSError, RuntimeError, ValueError):
+        return "confirm", "Exec working directory could not be classified."
+    if not _is_host_path_within(canonical_cwd.path, canonical_cwd.workspace_root):
+        return "confirm", "The Exec working directory is outside the Workspace."
+    for access in accesses:
+        candidate = Path(access.path)
+        if not candidate.is_absolute():
+            candidate = base / candidate
+        if access.role == "read" and not os.path.lexists(str(candidate)):
+            return "confirm", "An Exec read path has an unknown parent and requires confirmation."
+        try:
+            canonical = canonicalize_file_access(
+                workspace=workspace_root,
+                base=base,
+                requested=access.path,
+                role=access.role,
+            )
+        except (OSError, RuntimeError, ValueError):
+            return "confirm", "Exec path could not be classified and requires confirmation."
+        if not _is_host_path_within(canonical.path, canonical.workspace_root):
+            return (
+                "confirm",
+                "The requested path resolves outside the Workspace and requires confirmation.",
+            )
+    return "direct", None
 
 
 def _classify_file_accesses(
