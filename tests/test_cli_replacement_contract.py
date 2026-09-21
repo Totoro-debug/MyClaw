@@ -238,6 +238,9 @@ async def test_cli_same_session_replacement_keeps_public_generation_contract(
         assert len(permission_controls) == 2
         assert permission_controls[1] is permission_controls[0]
         assert permission_controls[1].current() == "read-only"
+        assert target._tool_gateway._permission_context.configured_schedule_level == (
+            configuration.runtime.permission_level
+        )
         assert [(metadata.name, metadata.description) for metadata in target.skill_metadata] == [
             ("added", "Added"),
             ("current", "Refreshed"),

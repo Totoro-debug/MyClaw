@@ -112,6 +112,37 @@ process startup notice is shown at most once when the configured level is
 Full-Access. `/config` reports the configured level, and `/status` reports both
 configured and current foreground levels.
 
+## Foreground Schedule Management
+
+The fixed Schedule Tool remains catalogued, exposed, searchable, and schema-
+identical at every permission level. Its `list` action is direct for every
+foreground Run. Its `add` and `remove` actions require one confirmation in
+Read-Only and are direct in Workspace-Write and Full-Access. The confirmation
+is still required for a mutation even when the configured level is lower than
+the current foreground level.
+
+The generation-owned Gateway retains the immutable startup configured Schedule
+level. A foreground Run captures the selected current level in its
+`PermissionSnapshot`. For `add` only, a configured level strictly above the
+captured current level adds an escalation reason. If the Run is Read-Only,
+that reason is merged with the CRUD reason into one stable, duplicate-free
+confirmation. `remove` never uses the configured-versus-current escalation
+rule. The total order is Read-Only < Workspace-Write < Full-Access.
+
+Schedule Tool facts are collected after argument normalization, validation,
+business refusal, and the existing missing-Job preflight. Confirmation details
+contain only the canonical invocation: `action` plus normalized `message`,
+`title`, and `schedule` for `add`; `action` plus `job_id` for `remove`; and
+`action` for `list`. A declined request performs no Store or Service mutation,
+and approval is limited to that call. Invalid input, missing or nonexistent
+Jobs, Store/Service failures, and other hard Tool errors remain errors at every
+level; Full-Access does not bypass them. Schedule Job persistence and public
+JSON contain no permission level or snapshot.
+
+The existing User Schedule Agent Run continues to use its direct non-foreground
+path, and Dream Schedule Job and other System Schedule Job mutations remain
+internal direct operations.
+
 ## File Facts and Host Paths
 
 Read File, List Dir, Glob, and Grep emit canonical host `FileAccess` facts with
@@ -174,8 +205,9 @@ semantics. Web Fetch sends no cross-origin sensitive headers.
 ## Scope Boundaries
 
 This decision does not alter the fixed Tool Catalog, Tool Exposure, Tool
-Activation, Tool Search, MCP discovery, transport, schema projection, or
-Schedule permission behavior. Foreground MCP invocation authorization requires
+Activation, Tool Search, MCP discovery, transport, or schema projection.
+Foreground Schedule behavior is defined in the Foreground Schedule Management
+section above. Foreground MCP invocation authorization requires
 lower levels to confirm every call while Full-Access calls directly; neither
 path changes ordinary MCP hard-error behavior.
 It does not provide an operating-system sandbox. Full-Access removes ordinary

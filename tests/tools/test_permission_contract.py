@@ -9,6 +9,7 @@ from myclaw.agent.tools.base import BaseTool, ToolError
 from myclaw.agent.tools.permission import (
     PermissionContext,
     PermissionDecision,
+    ScheduleAction,
     ToolAuthorizationSession,
     ToolInvocationFacts,
     ToolPermissionPolicy,
@@ -367,3 +368,86 @@ def test_invocation_facts_detach_normalized_arguments() -> None:
     detached["nested"]["value"] = 3
 
     assert facts.normalized_arguments == {"nested": {"value": 1}}
+
+
+@pytest.mark.parametrize("action", ["list", "add", "remove"])
+@pytest.mark.parametrize("level", ["read-only", "workspace-write", "full-access"])
+def test_schedule_policy_maps_every_action_and_current_level(
+    action: str,
+    level: str,
+) -> None:
+    facts = ToolInvocationFacts(
+        tool_name="schedule",
+        normalized_arguments={"action": action},
+        schedule_action=ScheduleAction(action=action),  # type: ignore[arg-type]
+    )
+    authorization = ToolPermissionPolicy().open(
+        facts,
+        PermissionContext(
+            level=level,  # type: ignore[arg-type]
+            configured_schedule_level="read-only",
+            origin="foreground",
+        ),
+    )
+
+    expected = "direct" if action == "list" or level != "read-only" else "confirm"
+    assert authorization.initial_decision() == expected
+
+
+@pytest.mark.parametrize(
+    ("configured", "current", "expects_escalation"),
+    [
+        (configured, current, configured_index > current_index)
+        for configured_index, configured in enumerate(
+            ("read-only", "workspace-write", "full-access")
+        )
+        for current_index, current in enumerate(
+            ("read-only", "workspace-write", "full-access")
+        )
+    ],
+)
+def test_schedule_add_policy_compares_all_configured_and_current_levels(
+    configured: str,
+    current: str,
+    expects_escalation: bool,
+) -> None:
+    facts = ToolInvocationFacts(
+        tool_name="schedule",
+        normalized_arguments={"action": "add"},
+        schedule_action=ScheduleAction(action="add"),
+    )
+    authorization = ToolPermissionPolicy().open(
+        facts,
+        PermissionContext(
+            level=current,  # type: ignore[arg-type]
+            configured_schedule_level=configured,  # type: ignore[arg-type]
+            origin="foreground",
+        ),
+    )
+
+    expected = "confirm" if current == "read-only" or expects_escalation else "direct"
+    assert authorization.initial_decision() == expected
+    reason = getattr(authorization, "confirmation_reason", lambda: "")()
+    assert ("configured Schedule level" in reason) is expects_escalation
+
+
+def test_schedule_add_merges_crud_and_escalation_reasons_once() -> None:
+    facts = ToolInvocationFacts(
+        tool_name="schedule",
+        normalized_arguments={"action": "add"},
+        schedule_action=ScheduleAction(action="add"),
+    )
+    authorization = ToolPermissionPolicy().open(
+        facts,
+        PermissionContext(
+            level="read-only",
+            configured_schedule_level="full-access",
+            origin="foreground",
+        ),
+    )
+
+    assert authorization.initial_decision() == "confirm"
+    reason = authorization.confirmation_reason()  # type: ignore[attr-defined]
+    assert "persistent scheduled work" in reason
+    assert "configured Schedule level 'full-access'" in reason
+    assert reason.count("requires confirmation") == 2

@@ -235,6 +235,10 @@ class AgentLoop:
             skill_root=skill_loader.root,
             additional_tools=tuple(mcp_tools),
             exec_host=exec_host,
+            permission_context=PermissionContext(
+                workspace_root=workspace_path,
+                configured_schedule_level=permission_control.configured(),
+            ),
         )
         selected_mcp_keywords = {} if mcp_keywords is None else dict(mcp_keywords)
         baseline_gateway = build_agent_run_gateway(

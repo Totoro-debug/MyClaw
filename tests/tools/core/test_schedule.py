@@ -1,17 +1,19 @@
 from __future__ import annotations
 
+import asyncio
 import json
 from datetime import UTC, datetime
 from pathlib import Path
-from uuid import UUID
+from uuid import UUID, uuid4
 
 import pytest
 
 from myclaw.agent.tools.core.schedule import ScheduleTool
-from myclaw.agent.tools.tool_gateway import ModelToolCall
+from myclaw.agent.tools.permission import PermissionContext
+from myclaw.agent.tools.tool_gateway import ConfirmationDecision, ConfirmationRequest, ModelToolCall
 from myclaw.agent.workspace_state import WorkspaceState
 from myclaw.schedule.model import JobSchedule, ScheduleJob
-from myclaw.schedule.service import ScheduleService
+from myclaw.schedule.service import ScheduleService, ScheduleStaleRemovalError
 from myclaw.schedule.store import WorkspaceScheduleStore
 from tests.fixtures import SingleToolGateway, write_schedule_state
 
@@ -134,6 +136,491 @@ async def test_add_uses_the_common_gateway_without_confirmation_and_ignores_lowe
     jobs = await store.snapshot()
     assert len(jobs) == 1
     assert jobs[0].message == "Run it"
+
+
+@pytest.mark.asyncio
+async def test_add_confirmation_uses_the_canonical_invocation_and_decline_does_not_mutate(
+    workspace: Path,
+    agent_home: Path,
+) -> None:
+    store = _store(workspace, agent_home)
+    requests = []
+
+    async def decline(request: ConfirmationRequest) -> ConfirmationDecision:
+        requests.append(request)
+        return "declined"
+
+    gateway = SingleToolGateway(
+        (
+            ScheduleTool(
+                schedule_service=_service(store),
+                now=lambda: NOW,
+                new_uuid=lambda: JOB_UUID,
+            ),
+        ),
+        confirmation=decline,
+        permission_context=PermissionContext(
+            level="read-only",
+            configured_schedule_level="full-access",
+            origin="foreground",
+        ),
+    )
+
+    result = await gateway.call(
+        ModelToolCall(
+            id="call_add_declined",
+            name="schedule",
+            arguments=json.dumps(
+                {
+                    "action": "add",
+                    "message": "  Run it  ",
+                    "title": "  Weekly run  ",
+                    "every_seconds": 60,
+                    "job_id": "ignored",
+                }
+            ),
+        )
+    )
+
+    assert result.status == "refused"
+    assert len(requests) == 1
+    assert requests[0].details == {
+        "action": "add",
+        "message": "Run it",
+        "title": "Weekly run",
+        "schedule": {"type": "every", "every_seconds": 60},
+    }
+    assert await store.snapshot() == ()
+
+
+@pytest.mark.parametrize(
+    ("action", "level", "expects_confirmation"),
+    [
+        (action, level, action != "list" and level == "read-only")
+        for action in ("list", "add", "remove")
+        for level in ("read-only", "workspace-write", "full-access")
+    ],
+)
+@pytest.mark.asyncio
+async def test_schedule_gateway_covers_every_action_and_current_level(
+    workspace: Path,
+    agent_home: Path,
+    action: str,
+    level: str,
+    expects_confirmation: bool,
+) -> None:
+    store = _store(workspace, agent_home)
+    if action == "remove":
+        await store.add_user_job(
+            ScheduleJob(
+                job_id=str(JOB_UUID),
+                message="Remove this Job",
+                schedule=JobSchedule.every(60),
+                created_at_ms=1,
+                updated_at_ms=1,
+            )
+        )
+    requests = []
+
+    async def approve(request: ConfirmationRequest) -> ConfirmationDecision:
+        requests.append(request)
+        return "approved"
+
+    arguments: dict[str, object]
+    if action == "list":
+        arguments = {"action": "list"}
+    elif action == "add":
+        arguments = {"action": "add", "message": "Create this Job", "every_seconds": 60}
+    else:
+        arguments = {"action": "remove", "job_id": str(JOB_UUID)}
+    gateway = SingleToolGateway(
+        (
+            ScheduleTool(
+                schedule_service=_service(store),
+                now=lambda: NOW,
+                new_uuid=lambda: JOB_UUID,
+            ),
+        ),
+        confirmation=approve,
+        permission_context=PermissionContext(
+            level=level,  # type: ignore[arg-type]
+            configured_schedule_level=level,  # type: ignore[arg-type]
+            origin="foreground",
+        ),
+    )
+
+    result = await gateway.call(
+        ModelToolCall(
+            id=f"call_{action}_{level}",
+            name="schedule",
+            arguments=json.dumps(arguments),
+        )
+    )
+
+    assert result.status == "success"
+    assert len(requests) == int(expects_confirmation)
+
+
+@pytest.mark.parametrize(
+    ("configured", "current", "expects_escalation"),
+    [
+        (configured, current, configured_index > current_index)
+        for configured_index, configured in enumerate(
+            ("read-only", "workspace-write", "full-access")
+        )
+        for current_index, current in enumerate(
+            ("read-only", "workspace-write", "full-access")
+        )
+    ],
+)
+@pytest.mark.asyncio
+async def test_schedule_gateway_compares_every_configured_and_current_level(
+    workspace: Path,
+    agent_home: Path,
+    configured: str,
+    current: str,
+    expects_escalation: bool,
+) -> None:
+    store = _store(workspace, agent_home)
+    requests: list[ConfirmationRequest] = []
+
+    async def approve(request: ConfirmationRequest) -> ConfirmationDecision:
+        requests.append(request)
+        return "approved"
+
+    gateway = SingleToolGateway(
+        (
+            ScheduleTool(
+                schedule_service=_service(store),
+                now=lambda: NOW,
+                new_uuid=lambda: JOB_UUID,
+            ),
+        ),
+        confirmation=approve,
+        permission_context=PermissionContext(
+            level=current,  # type: ignore[arg-type]
+            configured_schedule_level=configured,  # type: ignore[arg-type]
+            origin="foreground",
+        ),
+    )
+
+    result = await gateway.call(
+        ModelToolCall(
+            id=f"call_add_{configured}_{current}",
+            name="schedule",
+            arguments=json.dumps(
+                {"action": "add", "message": "  Create this Job  ", "every_seconds": 60}
+            ),
+        )
+    )
+
+    expects_confirmation = current == "read-only" or expects_escalation
+    assert result.status == "success"
+    assert len(requests) == int(expects_confirmation)
+    if requests:
+        assert requests[0].details == {
+            "action": "add",
+            "message": "Create this Job",
+            "title": "Create this Job",
+            "schedule": {"type": "every", "every_seconds": 60},
+        }
+        assert ("persistent scheduled work" in requests[0].reason) is (
+            current == "read-only"
+        )
+        assert ("configured Schedule level" in requests[0].reason) is expects_escalation
+    assert len(await store.snapshot()) == 1
+
+
+@pytest.mark.asyncio
+async def test_remove_decline_does_not_mutate_the_store(
+    workspace: Path,
+    agent_home: Path,
+) -> None:
+    job = ScheduleJob(
+        job_id=str(JOB_UUID),
+        message="Keep this Job",
+        schedule=JobSchedule.every(60),
+        created_at_ms=1,
+        updated_at_ms=1,
+    )
+    store = _store(workspace, agent_home)
+    await store.add_user_job(job)
+    requests = []
+
+    async def decline(request: ConfirmationRequest) -> ConfirmationDecision:
+        requests.append(request)
+        return "declined"
+
+    gateway = SingleToolGateway(
+        (ScheduleTool(schedule_service=_service(store), now=lambda: NOW),),
+        confirmation=decline,
+        permission_context=PermissionContext(
+            level="read-only",
+            configured_schedule_level="read-only",
+            origin="foreground",
+        ),
+    )
+
+    result = await gateway.call(
+        ModelToolCall(
+            id="call_remove_declined",
+            name="schedule",
+            arguments=json.dumps({"action": "remove", "job_id": str(JOB_UUID)}),
+        )
+    )
+
+    assert result.status == "refused"
+    assert len(requests) == 1
+    assert requests[0].details == {"action": "remove", "job_id": str(JOB_UUID)}
+    assert await store.snapshot() == (job,)
+
+
+@pytest.mark.asyncio
+async def test_approved_remove_stale_failure_is_canonical_and_not_retried(
+    workspace: Path,
+    agent_home: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    job = ScheduleJob(
+        job_id=str(JOB_UUID),
+        message="Keep this Job",
+        schedule=JobSchedule.every(60),
+        created_at_ms=1,
+        updated_at_ms=1,
+    )
+    store = _store(workspace, agent_home)
+    await store.add_user_job(job)
+    service = _service(store)
+    requests: list[ConfirmationRequest] = []
+    removal_calls = 0
+
+    async def approve(request: ConfirmationRequest) -> ConfirmationDecision:
+        requests.append(request)
+        return "approved"
+
+    async def stale_remove(
+        job_id: str,
+        *,
+        expected: ScheduleJob | None = None,
+    ) -> bool:
+        nonlocal removal_calls
+        del job_id, expected
+        removal_calls += 1
+        raise ScheduleStaleRemovalError("changed")
+
+    monkeypatch.setattr(service, "remove_user_job", stale_remove)
+    gateway = SingleToolGateway(
+        (ScheduleTool(schedule_service=service, now=lambda: NOW),),
+        confirmation=approve,
+        permission_context=PermissionContext(
+            level="read-only",
+            configured_schedule_level="read-only",
+            origin="foreground",
+        ),
+    )
+
+    result = await gateway.call(
+        ModelToolCall(
+            id="call_remove_stale",
+            name="schedule",
+            arguments=json.dumps({"action": "remove", "job_id": str(JOB_UUID)}),
+        )
+    )
+
+    assert result.status == "error"
+    assert result.content == "Schedule Job changed before removal. Request removal again."
+    assert len(requests) == 1
+    assert requests[0].details == {"action": "remove", "job_id": str(JOB_UUID)}
+    assert removal_calls == 1
+    assert await store.snapshot() == (job,)
+
+
+@pytest.mark.asyncio
+async def test_concurrent_schedule_gateways_keep_permission_contexts_isolated(
+    workspace: Path,
+    agent_home: Path,
+) -> None:
+    store = _store(workspace, agent_home)
+    tool = ScheduleTool(
+        schedule_service=_service(store),
+        now=lambda: NOW,
+        new_uuid=uuid4,
+    )
+    low_requests: list[ConfirmationRequest] = []
+    low_requested = asyncio.Event()
+    release_low = asyncio.Event()
+
+    async def approve_low(request: ConfirmationRequest) -> ConfirmationDecision:
+        low_requests.append(request)
+        low_requested.set()
+        await release_low.wait()
+        return "approved"
+
+    async def unexpected_high(request: ConfirmationRequest) -> ConfirmationDecision:
+        raise AssertionError(f"Full-Access call must remain direct: {request}")
+
+    low_gateway = SingleToolGateway(
+        (tool,),
+        confirmation=approve_low,
+        permission_context=PermissionContext(
+            level="read-only",
+            configured_schedule_level="full-access",
+            origin="foreground",
+        ),
+    )
+    high_gateway = SingleToolGateway(
+        (tool,),
+        confirmation=unexpected_high,
+        permission_context=PermissionContext(
+            level="full-access",
+            configured_schedule_level="read-only",
+            origin="foreground",
+        ),
+    )
+    low_call = asyncio.create_task(
+        low_gateway.call(
+            ModelToolCall(
+                id="call_low",
+                name="schedule",
+                arguments='{"action":"add","message":"low","every_seconds":60}',
+            )
+        )
+    )
+    await asyncio.wait_for(low_requested.wait(), timeout=1)
+    try:
+        high_result = await high_gateway.call(
+            ModelToolCall(
+                id="call_high",
+                name="schedule",
+                arguments='{"action":"add","message":"high","every_seconds":60}',
+            )
+        )
+    finally:
+        release_low.set()
+    low_result = await asyncio.wait_for(low_call, timeout=1)
+
+    assert high_result.status == low_result.status == "success"
+    assert len(low_requests) == 1
+    assert "persistent scheduled work" in low_requests[0].reason
+    assert "configured Schedule level 'full-access'" in low_requests[0].reason
+    assert {job.message for job in await store.snapshot()} == {"low", "high"}
+
+
+@pytest.mark.asyncio
+async def test_known_store_failure_precedes_schedule_confirmation(
+    workspace: Path,
+    agent_home: Path,
+) -> None:
+    store = _store(workspace, agent_home)
+    service = _service(store)
+    store._faulted = True
+    requests = []
+
+    async def unexpected(request: ConfirmationRequest) -> ConfirmationDecision:
+        requests.append(request)
+        raise AssertionError("A known Store failure must not request confirmation")
+
+    gateway = SingleToolGateway(
+        (ScheduleTool(schedule_service=service, now=lambda: NOW),),
+        confirmation=unexpected,
+        permission_context=PermissionContext(
+            level="read-only",
+            configured_schedule_level="full-access",
+            origin="foreground",
+        ),
+    )
+
+    result = await gateway.call(
+        ModelToolCall(
+            id="call_store_failure",
+            name="schedule",
+            arguments='{"action":"add","message":"message","every_seconds":60}',
+        )
+    )
+
+    assert result.status == "error"
+    assert result.content == "Schedule state could not be updated."
+    assert requests == []
+
+
+@pytest.mark.parametrize("level", ["read-only", "workspace-write", "full-access"])
+@pytest.mark.asyncio
+async def test_schedule_hard_errors_precede_permission_at_every_level(
+    workspace: Path,
+    agent_home: Path,
+    level: str,
+) -> None:
+    store = _store(workspace, agent_home)
+    requests = []
+
+    async def unexpected(request: ConfirmationRequest) -> ConfirmationDecision:
+        requests.append(request)
+        raise AssertionError("Schedule hard errors must not request confirmation")
+
+    gateway = SingleToolGateway(
+        (ScheduleTool(schedule_service=_service(store), now=lambda: NOW),),
+        confirmation=unexpected,
+        permission_context=PermissionContext(
+            level=level,  # type: ignore[arg-type]
+            configured_schedule_level=level,  # type: ignore[arg-type]
+            origin="foreground",
+        ),
+    )
+    invalid_json = await gateway.call(ModelToolCall("invalid-json", "schedule", "not-json"))
+    invalid_schema = await gateway.call(
+        ModelToolCall("invalid-schema", "schedule", '{"action":"add"}')
+    )
+    invalid_title = await gateway.call(
+        ModelToolCall(
+            "invalid-title",
+            "schedule",
+            '{"action":"add","message":"message","title":null,"every_seconds":60}',
+        )
+    )
+    invalid_schedule = await gateway.call(
+        ModelToolCall(
+            "invalid-schedule",
+            "schedule",
+            '{"action":"add","message":"message","every_seconds":0}',
+        )
+    )
+    invalid_message = await gateway.call(
+        ModelToolCall(
+            "invalid-message",
+            "schedule",
+            '{"action":"add","message":"   ","every_seconds":60}',
+        )
+    )
+    unknown_action = await gateway.call(
+        ModelToolCall("unknown-action", "schedule", '{"action":"change"}')
+    )
+    invalid_job_id = await gateway.call(
+        ModelToolCall("invalid-job-id", "schedule", '{"action":"remove","job_id":"bad"}')
+    )
+    missing_job = await gateway.call(
+        ModelToolCall(
+            "missing-job",
+            "schedule",
+            json.dumps({"action": "remove", "job_id": str(JOB_UUID)}),
+        )
+    )
+
+    assert all(
+        result.status == "error"
+        for result in (
+            invalid_json,
+            invalid_schema,
+            invalid_title,
+            invalid_schedule,
+            invalid_message,
+            unknown_action,
+            invalid_job_id,
+        )
+    )
+    assert missing_job.status == "error"
+    assert missing_job.content == "Schedule Job was not found."
+    assert requests == []
+    assert await store.snapshot() == ()
 
 
 @pytest.mark.asyncio

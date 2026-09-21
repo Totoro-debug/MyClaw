@@ -16,7 +16,7 @@ import pytest
 
 import myclaw.agent.context as context
 from myclaw.agent.context import ContextBuilder
-from myclaw.agent.loop import AgentLoop
+from myclaw.agent.loop import AgentLoop, ConfirmationRequestView
 from myclaw.agent.memory.dream import Dream
 from myclaw.agent.memory.manager import MemoryManager
 from myclaw.agent.message_bus import MessageBus
@@ -487,6 +487,61 @@ async def test_agent_loop_manages_schedule_jobs_without_confirmation(
         assert _tool_json(loop)[-1]["action"] == "remove"
     finally:
         await _close_components(loop, router, schedule, dream)
+
+
+@pytest.mark.asyncio
+async def test_foreground_schedule_add_uses_configured_level_and_current_override(
+    agent_home: Path,
+    workspace: Path,
+) -> None:
+    provider = _ScheduleProvider(
+        chat_responses=(
+            _schedule_tool_response(
+                "call_add",
+                {"action": "add", "message": "  Run it  ", "every_seconds": 60},
+            ),
+            _response("Added."),
+        )
+    )
+    loop, router, schedule, dream, _dispatcher, bus = _agent_loop(
+        agent_home,
+        workspace,
+        provider,
+        schedule_clock=_BlockingClock(NOW),
+    )
+    loop._permission_control.select("read-only")
+    confirmations: list[ConfirmationRequestView] = []
+
+    def approve(request: ConfirmationRequestView) -> None:
+        confirmations.append(request)
+        loop.respond_to_confirmation(request.confirmation_id, "approved")
+
+    loop.bind_confirmation_callback(approve)
+    await loop.start()
+    try:
+        await collect_foreground_outbound(bus, "Schedule the report.")
+    finally:
+        await _close_components(loop, router, schedule, dream)
+
+    assert len(confirmations) == 1
+    assert confirmations[0].details == {
+        "action": "add",
+        "message": "Run it",
+        "title": "Run it",
+        "schedule": {"type": "every", "every_seconds": 60},
+    }
+    assert confirmations[0].reason.count("requires confirmation.") == 2
+    assert "persistent scheduled work" in confirmations[0].reason
+    assert "configured Schedule level 'workspace-write'" in confirmations[0].reason
+    jobs = await _schedule_state(workspace).public_snapshot()
+    assert len(jobs) == 1
+    assert {
+        "permission",
+        "level",
+        "current",
+        "configured",
+        "snapshot",
+    }.isdisjoint(jobs[0].to_dict())
 
 
 @pytest.mark.asyncio

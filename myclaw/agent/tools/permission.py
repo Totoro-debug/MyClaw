@@ -36,7 +36,7 @@ from myclaw.agent.tools.core.exec_policy import (
 type PermissionDecision = Literal["direct", "confirm"]
 type ToolRunOrigin = Literal["foreground", "schedule", "memory"]
 type FileAccessRole = Literal["read", "write"]
-type ScheduleAction = object
+type ScheduleActionName = Literal["list", "add", "remove"]
 type IPAddress = str
 type NetworkTargetRisk = Literal[
     "literal_non_global",
@@ -48,6 +48,17 @@ type NetworkConfirmationDecision = Literal["approved", "declined"]
 type NetworkConfirmationRequester = Callable[
     [str], Awaitable[NetworkConfirmationDecision]
 ]
+
+
+@dataclass(frozen=True, slots=True)
+class ScheduleAction:
+    """Typed action facts emitted by the normalized Schedule Tool call."""
+
+    action: ScheduleActionName
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.action, str) or self.action not in {"list", "add", "remove"}:
+            raise ValueError("Schedule action is invalid")
 
 
 @dataclass(frozen=True, slots=True)
@@ -332,6 +343,8 @@ class ToolPermissionPolicy:
         context: PermissionContext,
     ) -> ToolAuthorizationSession:
         """Classify one detached invocation without retaining mutable run state."""
+        if facts.schedule_action is not None:
+            return _classify_schedule_invocation(facts, context)
         if facts.mcp_identity is not None:
             if context.origin != "foreground":
                 return _DecisionAuthorizationSession("direct")
@@ -474,6 +487,49 @@ def _mcp_confirmation_reason(identity: MCPToolIdentity) -> str:
         f"server={identity.server_name} remote_tool={identity.remote_name} "
         f"model_tool={identity.model_name} requires confirmation for this call."
     )
+
+
+_SCHEDULE_CRUD_CONFIRMATION_REASON = (
+    "Schedule add/remove changes persistent scheduled work and requires confirmation."
+)
+
+
+def _classify_schedule_invocation(
+    facts: ToolInvocationFacts,
+    context: PermissionContext,
+) -> ToolAuthorizationSession:
+    action = facts.schedule_action
+    if action is None or context.origin != "foreground":
+        return _DecisionAuthorizationSession("direct")
+    if context.level is None:
+        return _LegacyAuthorizationSession(facts.legacy_safety_reason)
+    if action.action == "list":
+        return _DecisionAuthorizationSession("direct")
+
+    reasons: list[str] = []
+    if context.level == "read-only":
+        reasons.append(_SCHEDULE_CRUD_CONFIRMATION_REASON)
+
+    configured = context.configured_schedule_level
+    if (
+        action.action == "add"
+        and configured is not None
+        and PERMISSION_LEVELS.index(configured) > PERMISSION_LEVELS.index(context.level)
+    ):
+        reasons.append(
+            "Schedule add creates a future Job with configured Schedule level "
+            f"'{configured}' above current foreground level '{context.level}' "
+            "and requires confirmation."
+        )
+
+    if not reasons:
+        return _DecisionAuthorizationSession("direct")
+    return _DecisionAuthorizationSession("confirm", _merge_confirmation_reasons(reasons))
+
+
+def _merge_confirmation_reasons(reasons: list[str]) -> str:
+    """Keep one stable, duplicate-free reason string for one Tool call."""
+    return " ".join(dict.fromkeys(reason for reason in reasons if reason))
 
 
 def _classify_exec_invocation(
@@ -792,6 +848,7 @@ __all__ = [
     "ResolvedExecShell",
     "RuntimePermissionControl",
     "ScheduleAction",
+    "ScheduleActionName",
     "ToolAuthorizationFailure",
     "ToolAuthorizationSession",
     "ToolInvocationFacts",

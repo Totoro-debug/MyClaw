@@ -5,10 +5,15 @@ from __future__ import annotations
 import json
 from collections.abc import Callable, Mapping
 from datetime import UTC, datetime
-from typing import Any, cast
+from typing import Any, Literal, cast
 from uuid import UUID, uuid4
 
 from myclaw.agent.tools.base import BaseTool, ToolError
+from myclaw.agent.tools.permission import (
+    ScheduleAction,
+    ScheduleActionName,
+    ToolInvocationFacts,
+)
 from myclaw.agent.tools.schema import Schema
 from myclaw.schedule.model import JobSchedule, ScheduleJob
 from myclaw.schedule.service import ScheduleService, ScheduleStaleRemovalError
@@ -130,7 +135,42 @@ class ScheduleTool(BaseTool):
             and arguments["title"] is None
         ):
             raise ToolError(_INVALID_ARGUMENTS)
-        return await super().prepare_arguments(arguments)
+        prepared = await super().prepare_arguments(arguments)
+        if prepared.get("action") == "remove":
+            job_id = prepared.get("job_id")
+            if isinstance(job_id, str):
+                try:
+                    require_uuid4_string(job_id, field="job_id")
+                except ValueError:
+                    return prepared
+                if await self._current_public_job(job_id) is None:
+                    raise ToolError(_NOT_FOUND)
+        return prepared
+
+    def build_invocation_facts(
+        self,
+        prepared_arguments: dict[str, Any],
+        *,
+        safety_reason: str | None,
+    ) -> ToolInvocationFacts:
+        action = prepared_arguments.get("action")
+        if not isinstance(action, str) or action not in {"list", "add", "remove"}:
+            raise ToolError(_INVALID_ARGUMENTS)
+        if (
+            action in {"add", "remove"}
+            and self._schedule_service.status_snapshot().status == "faulted"
+        ):
+            raise ToolError(_STATE_UPDATE_FAILED)
+        normalized_arguments = self._normalized_invocation_arguments(
+            prepared_arguments,
+            action=cast(Literal["list", "add", "remove"], action),
+        )
+        return ToolInvocationFacts(
+            tool_name=self.name,
+            normalized_arguments=normalized_arguments,
+            legacy_safety_reason=safety_reason,
+            schedule_action=ScheduleAction(action=cast(ScheduleActionName, action)),
+        )
 
     def validate_arguments(  # type: ignore[override]
         self,
@@ -297,6 +337,34 @@ class ScheduleTool(BaseTool):
         except Exception as error:
             raise ToolError(_STATE_READ_FAILED) from error
         return next((job for job in jobs if job.job_id == job_id), None)
+
+    def _normalized_invocation_arguments(
+        self,
+        prepared_arguments: dict[str, Any],
+        *,
+        action: Literal["list", "add", "remove"],
+    ) -> dict[str, Any]:
+        if action == "list":
+            return {"action": "list"}
+        if action == "remove":
+            job_id = prepared_arguments.get("job_id")
+            if not isinstance(job_id, str):
+                raise ToolError(_INVALID_ARGUMENTS)
+            return {"action": "remove", "job_id": job_id}
+        normalized_message, normalized_title, schedule = self._normalize_add(
+            message=cast(str | None, prepared_arguments.get("message")),
+            title=cast(str | None, prepared_arguments.get("title")),
+            every_seconds=cast(int | None, prepared_arguments.get("every_seconds")),
+            cron_expr=cast(str | None, prepared_arguments.get("cron_expr")),
+            timezone=cast(str | None, prepared_arguments.get("timezone")),
+            at_time=cast(str | None, prepared_arguments.get("at_time")),
+        )
+        return {
+            "action": "add",
+            "message": normalized_message,
+            "title": normalized_title,
+            "schedule": _public_schedule(schedule),
+        }
 
 
 def _public_schedule(schedule: JobSchedule) -> dict[str, Any]:

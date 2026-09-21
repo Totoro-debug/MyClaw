@@ -463,7 +463,7 @@ class ToolGateway:
                 tool_name=tool_call.name,
                 reason=reason,
                 summary=f"Confirm {tool.name}"[:240],
-                details=deepcopy(prepared_arguments),
+                details=facts.normalized_arguments,
                 mcp_identity=facts.mcp_identity,
             )
             if confirmation is None:
