@@ -17,6 +17,11 @@ from myclaw.agent.context_budget import (
     project_next_request_tokens,
 )
 from myclaw.agent.memory.dream import DreamResult
+from myclaw.agent.permission import (
+    RuntimePermissionControl,
+    ToolPermissionLevel,
+    validate_permission_level,
+)
 from myclaw.agent.session.session import Session, SessionStoragePartition
 from myclaw.agent.workspace_state import WorkspaceState
 from myclaw.config.agent_home import AgentHome
@@ -130,6 +135,8 @@ class RuntimeStatus:
     last_compacted: int
     cumulative_usage: dict[str, int]
     schedule: dict[str, object] | None = None
+    configured_permission_level: ToolPermissionLevel = "workspace-write"
+    current_permission_level: ToolPermissionLevel = "workspace-write"
 
     def __post_init__(self) -> None:
         require_nonnegative_int(self.uptime_seconds, field="uptime_seconds")
@@ -154,6 +161,8 @@ class RuntimeStatus:
         )
         require_nonnegative_int(self.session_message_count, field="session_message_count")
         require_nonnegative_int(self.last_compacted, field="last_compacted")
+        validate_permission_level(self.configured_permission_level)
+        validate_permission_level(self.current_permission_level)
 
     def to_dict(self) -> dict[str, object]:
         result: dict[str, object] = {
@@ -171,6 +180,8 @@ class RuntimeStatus:
             "input_budget_used_percent": self.input_budget_used_percent,
             "session_message_count": self.session_message_count,
             "last_compacted": self.last_compacted,
+            "configured_permission_level": self.configured_permission_level,
+            "current_permission_level": self.current_permission_level,
             "cumulative_usage": dict(self.cumulative_usage),
         }
         if self.schedule is not None:
@@ -217,6 +228,7 @@ class ManagementViewService:
         now: Callable[[], datetime],
         monotonic: Callable[[], float],
         reasoning_effort_control: _ReasoningEffortControl,
+        permission_control: RuntimePermissionControl,
     ) -> None:
         self._config = ConfigLoader(agent_home)
         self._current_agent_loop = current_agent_loop
@@ -229,6 +241,7 @@ class ManagementViewService:
         self._memory_reader = memory_manager
         self._dream = dream
         self._reasoning_effort_control = reasoning_effort_control
+        self._permission_control = permission_control
         self._aborted = False
 
     async def reload_skill(self) -> tuple[SkillMetadata, ...]:
@@ -321,6 +334,24 @@ class ManagementViewService:
             logger.warning("Reasoning Effort persistence failed type={}", type(error).__name__)
         return await self.reasoning_effort()
 
+    async def permission_level(self) -> ToolPermissionLevel:
+        """Return the current process-local foreground Tool Permission Level."""
+        self._ensure_active()
+        return self._permission_control.current()
+
+    async def update_permission_level(self, level: ToolPermissionLevel) -> ToolPermissionLevel:
+        """Select a foreground level without changing User Configuration."""
+        self._ensure_active()
+        try:
+            validated = validate_permission_level(level)
+        except ValueError as error:
+            raise ManagementError(
+                ErrorInfo("config_invalid", "Foreground Tool Permission Level is invalid.")
+            ) from error
+        if self._permission_control.current() != validated:
+            self._permission_control.select(validated)
+        return self._permission_control.current()
+
     async def status(self) -> RuntimeStatus:
         """Return all required runtime and current-session status fields."""
         self._ensure_active()
@@ -353,6 +384,12 @@ class ManagementViewService:
             )
             started_at = projection.generation_started_at
             uptime = 0 if started_at is None else max(0, int(self._monotonic() - started_at))
+            schedule_snapshot = self._schedule_status()
+            schedule_status = {
+                key: schedule_snapshot[key]
+                for key in ("status", "active_job_count")
+                if key in schedule_snapshot
+            }
             return RuntimeStatus(
                 version=__version__,
                 chat_model=projection.chat_model,
@@ -371,7 +408,9 @@ class ManagementViewService:
                 session_message_count=projection.session_message_count,
                 last_compacted=projection.last_compacted,
                 cumulative_usage=dict(projection.cumulative_usage),
-                schedule=dict(self._schedule_status()),
+                configured_permission_level=self._permission_control.configured(),
+                current_permission_level=self._permission_control.current(),
+                schedule=schedule_status,
             )
         except ManagementError:
             raise

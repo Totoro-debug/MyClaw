@@ -9,6 +9,7 @@ from typing import Protocol
 from loguru import logger
 
 from myclaw.agent.memory.dream import DreamResult
+from myclaw.agent.permission import ToolPermissionLevel
 from myclaw.config.config import ConfigView
 from myclaw.logging.session import without_session_log
 from myclaw.management.service import (
@@ -35,6 +36,10 @@ class ManagementCommandDefinition:
 _CONFIG_COMMAND = ManagementCommandDefinition("/config", "View User Configuration")
 _STATUS_COMMAND = ManagementCommandDefinition("/status", "View Runtime Status")
 _EFFORT_COMMAND = ManagementCommandDefinition("/effort", "Set Chat Reasoning Effort")
+_PERMISSION_COMMAND = ManagementCommandDefinition(
+    "/permission",
+    "Set Foreground Tool Permission Level",
+)
 RESUME_MANAGEMENT_COMMAND = ManagementCommandDefinition("/resume", "Resume a Conversation Session")
 _MEMORY_COMMAND = ManagementCommandDefinition("/memory", "View Long-term Memory")
 _DREAM_COMMAND = ManagementCommandDefinition(
@@ -49,6 +54,7 @@ MANAGEMENT_COMMANDS = (
     _CONFIG_COMMAND,
     _STATUS_COMMAND,
     _EFFORT_COMMAND,
+    _PERMISSION_COMMAND,
     RESUME_MANAGEMENT_COMMAND,
     _MEMORY_COMMAND,
     _DREAM_COMMAND,
@@ -68,6 +74,10 @@ class ManagementPort(Protocol):
 
     async def update_reasoning_effort(self, effort: ReasoningEffort) -> ReasoningEffort: ...
 
+    async def permission_level(self) -> ToolPermissionLevel: ...
+
+    async def update_permission_level(self, level: ToolPermissionLevel) -> ToolPermissionLevel: ...
+
     async def memory_view(self) -> str: ...
 
     async def dream(self) -> DreamResult: ...
@@ -86,6 +96,7 @@ class ManagementCommandResult:
     handled: bool
     output: str | None
     effort_selection: ReasoningEffort | None = None
+    permission_selection: ToolPermissionLevel | None = None
     resume_sessions: tuple[SessionListingEntry, ...] | None = None
     resumed_session_id: str | None = None
     resume_skipped_count: int = 0
@@ -124,6 +135,19 @@ class ManagementCommandDispatcher:
                     handled=True,
                     output=None,
                     effort_selection=effort,
+                )
+            if parsed_command is _PERMISSION_COMMAND:
+                try:
+                    level = await management.permission_level()
+                except ManagementError as management_error:
+                    return ManagementCommandResult(
+                        handled=True,
+                        output=f"{management_error.error.code}: {management_error.error.message}",
+                    )
+                return ManagementCommandResult(
+                    handled=True,
+                    output=None,
+                    permission_selection=level,
                 )
             if parsed_command is RESUME_MANAGEMENT_COMMAND:
                 try:
@@ -240,6 +264,24 @@ class ManagementCommandDispatcher:
             return ManagementCommandResult(
                 handled=True,
                 output=f"Chat reasoning effort: {published}",
+            )
+
+    async def update_permission_level(
+        self,
+        level: ToolPermissionLevel,
+    ) -> ManagementCommandResult:
+        """Commit a selected process-local foreground Tool Permission Level."""
+        with without_session_log():
+            try:
+                published = await self._management.update_permission_level(level)
+            except ManagementError as management_error:
+                return ManagementCommandResult(
+                    handled=True,
+                    output=f"{management_error.error.code}: {management_error.error.message}",
+                )
+            return ManagementCommandResult(
+                handled=True,
+                output=f"Foreground permission level: {published}",
             )
 
     async def resume(self, session_id: str, *, force: bool = False) -> ManagementCommandResult:

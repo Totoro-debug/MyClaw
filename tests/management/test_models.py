@@ -47,6 +47,8 @@ def test_runtime_status_exposes_the_documented_management_fields() -> None:
         "input_budget_used_percent": 2.1,
         "session_message_count": 12,
         "last_compacted": 4,
+        "configured_permission_level": "workspace-write",
+        "current_permission_level": "workspace-write",
         "cumulative_usage": {
             "model_calls": 5,
             "input_tokens": 6100,

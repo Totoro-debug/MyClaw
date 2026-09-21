@@ -682,6 +682,7 @@ def test_composition_and_store_signatures_match_current_contracts() -> None:
         "now",
         "monotonic",
         "reasoning_effort_control",
+        "permission_control",
     )
     assert management_init.args.defaults == []
     assert all(default is None for default in management_init.args.kw_defaults)

@@ -41,6 +41,25 @@ Exec Shell family, and that permission checks may require confirmation. The
 Gateway uses the snapshot for File policy while preserving the existing Exec
 Host and Web confirmation behavior.
 
+## Foreground Management and Runtime Lifetime
+
+The CLI owns one `RuntimePermissionControl` for the process Runtime Lifetime
+and reuses it for every foreground generation. The `/permission` command
+selects one of the three levels for later foreground Agent Runs only. The
+selection is not persisted to User Configuration, Conversation Session, or
+Schedule; a successful generation replacement retains it, a failed replacement
+does not change it, and a new process starts from the configured value.
+
+The selector reports the current level and leaves it unchanged when the same
+level is submitted. An upgrade to `full-access` opens a warning with Cancel
+focused by default on every attempt. Full-Access removes ordinary permission
+confirmation for foreground File Tools only; it is not an operating-system
+sandbox and does not bypass validation, capability checks, business refusals,
+or Tool errors. Exec, Web, MCP, and Schedule retain their existing behavior. A
+process startup notice is shown at most once when the configured level is
+Full-Access. `/config` reports the configured level, and `/status` reports both
+configured and current foreground levels.
+
 ## File Facts and Host Paths
 
 Read File, List Dir, Glob, and Grep emit canonical host `FileAccess` facts with
@@ -67,8 +86,10 @@ execution boundary.
 
 This decision does not alter the fixed Tool Catalog, Tool Exposure, Tool
 Activation, Tool Search, MCP Tool behavior, or Schedule permission behavior.
-It does not add a `/permission` command, a Full-Access warning, or an
-operating-system sandbox. Those concerns require separate accepted changes.
+It does not provide an operating-system sandbox. Full-Access removes ordinary
+foreground File permission confirmation only; validation, capability checks,
+business refusals, and Tool errors remain enforced. Exec, Web, MCP, and
+Schedule permission behavior is unchanged by this decision.
 
 The existing Skill Loader remains responsible for its own internal reads, and
 ADR-0016 no longer defines a confirmation-free boundary for model-issued

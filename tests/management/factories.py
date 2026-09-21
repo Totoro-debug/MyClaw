@@ -6,6 +6,7 @@ from typing import Any
 
 from myclaw.agent.memory.dream import DreamResult
 from myclaw.agent.memory.manager import MemoryManager
+from myclaw.agent.permission import RuntimePermissionControl
 from myclaw.agent.workspace_state import WorkspaceState
 from myclaw.config.agent_home import AgentHome
 from myclaw.management.service import (
@@ -67,6 +68,7 @@ def management_service(
     memory_manager: Any | None = None,
     dream: Any | None = None,
     reasoning_effort_control: Any | None = None,
+    permission_control: RuntimePermissionControl | None = None,
     schedule_status: Callable[[], dict[str, object]] = lambda: {
         "status": "available",
         "active_job_count": 0,
@@ -89,6 +91,7 @@ def management_service(
         memory_manager=memory_manager or MemoryManager(state),
         dream=dream or _DefaultDream(),
         reasoning_effort_control=reasoning_effort_control or _DefaultReasoningEffortControl(),
+        permission_control=permission_control or RuntimePermissionControl("workspace-write"),
         schedule_status=schedule_status,
         now=now,
         monotonic=monotonic,

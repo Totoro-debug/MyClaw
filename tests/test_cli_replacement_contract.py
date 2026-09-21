@@ -279,6 +279,58 @@ async def test_cli_same_session_replacement_keeps_public_generation_contract(
 
 
 @pytest.mark.asyncio
+async def test_cli_full_access_startup_notice_is_process_lifetime_and_not_repeated_on_replacement(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    agent_home = AgentHome(tmp_path / "agent-home")
+    configuration = _configuration(
+        agent_home,
+        VALID_CONFIG.replace(
+            "[runtime]\n",
+            '[runtime]\npermission_level = "full-access"\n',
+        ),
+    )
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+
+    await _exercise_cli_contract(
+        agent_home=agent_home,
+        workspace=workspace,
+        configuration=configuration,
+        monkeypatch=monkeypatch,
+    )
+
+    output = capsys.readouterr().out
+    assert output.count("Full-Access is enabled") == 1
+    assert "ordinary permission confirmation" in output
+    assert "not an OS sandbox" in output
+    assert "Validation and Tool errors still apply" in output
+
+
+@pytest.mark.asyncio
+async def test_cli_non_full_access_prints_no_permission_startup_notice(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    agent_home = AgentHome(tmp_path / "agent-home")
+    configuration = _configuration(agent_home)
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+
+    await _exercise_cli_contract(
+        agent_home=agent_home,
+        workspace=workspace,
+        configuration=configuration,
+        monkeypatch=monkeypatch,
+    )
+
+    assert "Full-Access is enabled" not in capsys.readouterr().out
+
+
+@pytest.mark.asyncio
 async def test_cli_force_replacement_cancels_framing_without_old_session_late_writes(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

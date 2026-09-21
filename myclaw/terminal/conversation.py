@@ -21,6 +21,7 @@ from uuid import UUID, uuid4
 from markdown_it import MarkdownIt
 from markdown_it.rules_core.state_core import StateCore
 from markdown_it.token import Token
+from rich.style import Style
 from rich.text import Text
 from textual import on
 from textual.app import App, ComposeResult, ScreenStackError
@@ -45,6 +46,7 @@ from myclaw.agent.loop import (
     TerminalAgentLoopControl,
 )
 from myclaw.agent.message_bus import InboundMessage, MessageBus, OutboundMessage
+from myclaw.agent.permission import PERMISSION_LEVELS, ToolPermissionLevel
 from myclaw.management.commands import (
     MANAGEMENT_COMMANDS,
     RELOAD_SKILL_MANAGEMENT_COMMAND,
@@ -89,6 +91,11 @@ _TERMINAL_MODE_RESETS: Final = (
     ("\x1b[?1004h", "\x1b[?1004l"),
     ("\x1b[?1049h", "\x1b[?1049l"),
     ("\x1b[?25l", "\x1b[?25h"),
+)
+_PERMISSION_LABELS: Final[tuple[str, ...]] = (
+    "Read-Only",
+    "Workspace-Write",
+    "Full-Access",
 )
 type _ControlAction = Literal["cancel_active_turn", "clear_draft", "drain_pending", "exit"]
 type ConfirmationDecision = Literal["approved", "declined"]
@@ -414,6 +421,200 @@ class _ReasoningEffortSelector(Static):
             self.post_message(self.Cancelled())
             return
         await super()._on_key(event)
+
+
+class _PermissionSelector(Static):
+    """Focused horizontal selector for the foreground Tool Permission Level."""
+
+    can_focus = True
+
+    class Confirmed(Message):
+        def __init__(self, selector: _PermissionSelector) -> None:
+            super().__init__()
+            self.permission_level = selector.selected_permission_level
+
+    class Cancelled(Message):
+        pass
+
+    def __init__(
+        self,
+        permission_level: ToolPermissionLevel = "workspace-write",
+        *,
+        id: str | None = None,
+    ) -> None:
+        super().__init__("", id=id, markup=False)
+        self._selected_index = 0
+        self.set_permission_level(permission_level)
+
+    @property
+    def selected_permission_level(self) -> ToolPermissionLevel:
+        return PERMISSION_LEVELS[self._selected_index]
+
+    def set_permission_level(self, permission_level: ToolPermissionLevel) -> None:
+        self._selected_index = PERMISSION_LEVELS.index(permission_level)
+        self._refresh_content()
+
+    def _refresh_content(self) -> None:
+        available_width = self.content_region.width
+        inline_width = sum(map(len, _PERMISSION_LABELS)) + 2 * (len(_PERMISSION_LABELS) - 1)
+        separator = "\n" if available_width and available_width < inline_width else "  "
+        content = Text(no_wrap=True)
+        for index, (level, label) in enumerate(
+            zip(PERMISSION_LEVELS, _PERMISSION_LABELS, strict=True)
+        ):
+            if index:
+                content.append(separator)
+            content.append(
+                label,
+                style=Style(
+                    bold=index == self._selected_index,
+                    reverse=index == self._selected_index,
+                    meta={"permission_level": level},
+                ),
+            )
+        self.update(content)
+
+    def on_resize(self, event: Resize) -> None:
+        del event
+        self._refresh_content()
+
+    @on(Click)
+    async def _on_click(self, event: Click) -> None:
+        if event.widget is not self:
+            return
+        selected = event.style.meta.get("permission_level")
+        if selected not in PERMISSION_LEVELS:
+            return
+        event.stop()
+        event.prevent_default()
+        self.set_permission_level(cast(ToolPermissionLevel, selected))
+        self.post_message(self.Confirmed(self))
+
+    async def _on_key(self, event: Key) -> None:
+        if event.key in {"left", "right"}:
+            event.stop()
+            event.prevent_default()
+            direction = -1 if event.key == "left" else 1
+            self._selected_index = max(
+                0,
+                min(len(PERMISSION_LEVELS) - 1, self._selected_index + direction),
+            )
+            self._refresh_content()
+            return
+        if event.key == "enter":
+            event.stop()
+            event.prevent_default()
+            self.post_message(self.Confirmed(self))
+            return
+        if event.key in {"escape", "ctrl+c"}:
+            event.stop()
+            event.prevent_default()
+            self.post_message(self.Cancelled())
+            return
+        await super()._on_key(event)
+
+
+class _FullAccessWarningScreen(ModalScreen[bool]):
+    """Require an explicit foreground Full-Access risk acknowledgement."""
+
+    CSS = """
+    _FullAccessWarningScreen {
+        align: center middle;
+        padding: 1 2;
+    }
+
+    #permission-warning-panel {
+        width: 80%;
+        max-width: 72;
+        height: auto;
+        max-height: 90%;
+        padding: 1 2;
+        border: round $warning;
+        background: $surface;
+        overflow-y: auto;
+    }
+
+    #permission-warning-heading,
+    #permission-warning-message,
+    #permission-warning-details {
+        width: 100%;
+        height: auto;
+        margin-bottom: 1;
+    }
+
+    #permission-warning-heading {
+        text-style: bold;
+    }
+
+    #permission-warning-details {
+        color: $text-warning;
+    }
+
+    #permission-warning-actions {
+        width: 100%;
+        height: 3;
+        align: center middle;
+    }
+
+    #permission-warning-actions Button {
+        width: 1fr;
+        min-width: 0;
+        margin: 0;
+        height: 3;
+    }
+    """
+
+    BINDINGS: ClassVar[list[Binding | tuple[str, str] | tuple[str, str, str]]] = [
+        Binding("escape", "cancel", "Cancel", show=False),
+        Binding("ctrl+c", "cancel", "Cancel", show=False, priority=True),
+        Binding("left,up", "focus_cancel", "Cancel", show=False),
+        Binding("right,down", "focus_confirm", "Enable Full-Access", show=False),
+    ]
+
+    def __init__(self) -> None:
+        super().__init__(id="permission-warning")
+
+    def compose(self) -> ComposeResult:
+        with Center():
+            with Vertical(id="permission-warning-panel"):
+                yield Static("Enable Full-Access?", id="permission-warning-heading", markup=False)
+                yield Static(
+                    "Full-Access cancels ordinary permission confirmation for valid foreground"
+                    " File Tool calls. It is process-local and is not persisted.",
+                    id="permission-warning-message",
+                    markup=False,
+                )
+                yield Static(
+                    "This is not an OS sandbox. Validation, unavailable capabilities, business"
+                    " refusals, and Tool errors still apply. Exec, Web, MCP, and Schedule keep"
+                    " their existing behavior.",
+                    id="permission-warning-details",
+                    markup=False,
+                )
+                with Horizontal(id="permission-warning-actions"):
+                    yield Button("Cancel", id="permission-warning-cancel")
+                    yield Button(
+                        "Enable",
+                        variant="warning",
+                        id="permission-warning-confirm",
+                    )
+
+    def on_mount(self) -> None:
+        self.query_one("#permission-warning-cancel", Button).focus()
+
+    @on(Button.Pressed)
+    def _button_pressed(self, event: Button.Pressed) -> None:
+        event.stop()
+        self.dismiss(event.button.id == "permission-warning-confirm")
+
+    def action_cancel(self) -> None:
+        self.dismiss(False)
+
+    def action_focus_cancel(self) -> None:
+        self.query_one("#permission-warning-cancel", Button).focus()
+
+    def action_focus_confirm(self) -> None:
+        self.query_one("#permission-warning-confirm", Button).focus()
 
 
 class _SessionPickerScreen(ModalScreen[str | None]):
@@ -1745,6 +1946,22 @@ class TerminalConversationApp(App[None]):
         background: transparent;
     }
 
+    #permission-selector {
+        display: none;
+        height: auto;
+        min-height: 3;
+        max-height: 5;
+        width: 100%;
+        border-top: solid $panel;
+        padding: 0 1;
+        overflow: hidden;
+        text-wrap: nowrap;
+        content-align: center middle;
+        text-align: center;
+        background: transparent;
+        pointer: pointer;
+    }
+
     .message {
         width: 72%;
         max-width: 100%;
@@ -1809,9 +2026,9 @@ class TerminalConversationApp(App[None]):
     #command-completion {
         display: none;
         overlay: screen;
-        offset: 0 -8;
+        offset: 0 -9;
         width: 100%;
-        max-height: 8;
+        max-height: 9;
         text-wrap: nowrap;
         text-overflow: ellipsis;
         background: transparent;
@@ -1922,6 +2139,8 @@ class TerminalConversationApp(App[None]):
         self._draining_inputs = False
         self._completion_options: tuple[_CompletionCandidate, ...] = ()
         self._completion_dismissed_text: str | None = None
+        self._permission_current_level: ToolPermissionLevel | None = None
+        self._permission_warning_result: asyncio.Future[bool | None] | None = None
         self._closing = False
         self._presentation_quiesced = False
         self._bus_callback: Callable[[tuple[InboundMessage, ...]], None] | None = None
@@ -2051,6 +2270,7 @@ class TerminalConversationApp(App[None]):
             Static("", id="pending-queue", markup=False),
             Static("Working", id="turn-status", markup=False),
             _ReasoningEffortSelector(id="reasoning-effort-selector"),
+            _PermissionSelector(id="permission-selector"),
             _ConversationInput(id="conversation-input", placeholder="Message MyClaw"),
             id="conversation-input-region",
         )
@@ -2080,6 +2300,9 @@ class TerminalConversationApp(App[None]):
         confirmation_result = self._confirmation_result
         if confirmation_result is not None and not confirmation_result.done():
             confirmation_result.cancel()
+        permission_warning_result = self._permission_warning_result
+        if permission_warning_result is not None and not permission_warning_result.done():
+            permission_warning_result.cancel()
         session_switch_result = self._session_switch_result
         if session_switch_result is not None and not session_switch_result.done():
             session_switch_result.cancel()
@@ -2112,6 +2335,8 @@ class TerminalConversationApp(App[None]):
         self._active_confirmation_id = None
         self._confirmation_result = None
         self._session_switch_result = None
+        self._permission_current_level = None
+        self._permission_warning_result = None
         self._completion_options = ()
         self._completion_dismissed_text = None
         self._outbound_worker = None
@@ -2215,6 +2440,12 @@ class TerminalConversationApp(App[None]):
         session_switch_result = self._session_switch_result
         if session_switch_result is not None and not session_switch_result.done():
             session_switch_result.cancel()
+        permission_warning_result = self._permission_warning_result
+        if permission_warning_result is not None and not permission_warning_result.done():
+            if isinstance(self.screen, _FullAccessWarningScreen):
+                await self.screen.dismiss(False)
+            else:
+                permission_warning_result.cancel()
         self._unbind_confirmation_callback(self._control)
         self._unbind_bus_callback(self._bus)
         await self._stop_outbound_worker()
@@ -2234,6 +2465,11 @@ class TerminalConversationApp(App[None]):
         self._active_run_projection = None
         self._active_confirmation_id = None
         self._completion_dismissed_text = None
+        self._permission_current_level = None
+        self._permission_warning_result = None
+        with suppress(NoMatches, NoScreen, ScreenStackError):
+            self.query_one("#permission-selector", _PermissionSelector).display = False
+            self.query_one("#conversation-input", _ConversationInput).display = True
         confirmation_result = self._confirmation_result
         self._confirmation_result = None
         if confirmation_result is not None and not confirmation_result.done():
@@ -2340,6 +2576,46 @@ class TerminalConversationApp(App[None]):
         message.stop()
         self._close_reasoning_effort_selector()
 
+    @on(_PermissionSelector.Confirmed)
+    def _permission_confirmed(
+        self,
+        message: _PermissionSelector.Confirmed,
+    ) -> None:
+        message.stop()
+        selected = message.permission_level
+        current = self._permission_current_level
+        self._close_permission_selector()
+        if current is None or selected == current:
+            return
+        self.run_worker(
+            self._apply_permission_selection(selected, current),
+            name="permission-selection",
+            group="permission-selection",
+            exclusive=True,
+            exit_on_error=False,
+        )
+
+    async def _apply_permission_selection(
+        self,
+        selected: ToolPermissionLevel,
+        current: ToolPermissionLevel,
+    ) -> None:
+        if selected == "full-access" and current != "full-access":
+            if not await self._confirm_full_access_warning():
+                return
+        try:
+            result = await self._management_dispatcher.update_permission_level(selected)
+        except Exception as error:
+            self._handle_exception(error)
+            return
+        if result.output is not None:
+            await self._mount_management_rows("/permission", result.output)
+
+    @on(_PermissionSelector.Cancelled)
+    def _permission_cancelled(self, message: _PermissionSelector.Cancelled) -> None:
+        message.stop()
+        self._close_permission_selector()
+
     @on(_ActivityGroupHeading.Clicked)
     def _activity_group_clicked(self, message: _ActivityGroupHeading.Clicked) -> None:
         message.stop()
@@ -2401,9 +2677,15 @@ class TerminalConversationApp(App[None]):
         if len(self.screen_stack) != 1:
             return
         with suppress(Exception):
-            selector = self.query_one("#reasoning-effort-selector", _ReasoningEffortSelector)
-            if selector.display:
-                selector.focus()
+            effort_selector = self.query_one(
+                "#reasoning-effort-selector",
+                _ReasoningEffortSelector,
+            )
+            permission_selector = self.query_one("#permission-selector", _PermissionSelector)
+            if effort_selector.display:
+                effort_selector.focus()
+            elif permission_selector.display:
+                permission_selector.focus()
             else:
                 self.query_one(_ConversationInput).focus()
 
@@ -2501,6 +2783,49 @@ class TerminalConversationApp(App[None]):
         input_area.text = ""
         input_area.focus()
 
+    def _open_permission_selector(
+        self,
+        permission_level: ToolPermissionLevel,
+        input_area: _ConversationInput,
+    ) -> None:
+        selector = self.query_one("#permission-selector", _PermissionSelector)
+        self._hide_command_completion()
+        self._permission_current_level = permission_level
+        selector.set_permission_level(permission_level)
+        input_area.text = ""
+        input_area.display = False
+        selector.display = True
+        selector.focus()
+
+    def _close_permission_selector(self) -> None:
+        selector = self.query_one("#permission-selector", _PermissionSelector)
+        input_area = self.query_one("#conversation-input", _ConversationInput)
+        selector.display = False
+        input_area.display = True
+        input_area.text = ""
+        input_area.focus()
+        self._permission_current_level = None
+
+    async def _confirm_full_access_warning(self) -> bool:
+        if self._permission_warning_result is not None:
+            return False
+        await self._viable_size.wait()
+        result = asyncio.get_running_loop().create_future()
+        self._permission_warning_result = result
+
+        def on_dismissed(value: bool | None) -> None:
+            if self._permission_warning_result is result:
+                self._permission_warning_result = None
+            if not result.done():
+                result.set_result(value)
+
+        try:
+            await self.push_screen(_FullAccessWarningScreen(), callback=on_dismissed)
+            return (await result) is True
+        finally:
+            if self._permission_warning_result is result:
+                self._permission_warning_result = None
+
     @on(_ConversationDisplay.Resized)
     def _display_resized(self, message: _ConversationDisplay.Resized) -> None:
         compact = message.width <= _COMPACT_MESSAGE_MAX_WIDTH
@@ -2529,6 +2854,10 @@ class TerminalConversationApp(App[None]):
             if result.effort_selection is not None:
                 message.text_area.remember_submission(text)
                 self._open_reasoning_effort_selector(result.effort_selection, message.text_area)
+                return
+            if result.permission_selection is not None:
+                message.text_area.remember_submission(text)
+                self._open_permission_selector(result.permission_selection, message.text_area)
                 return
             if result.skill_metadata is not None:
                 self._skill_metadata = tuple(result.skill_metadata)

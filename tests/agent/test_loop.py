@@ -3046,6 +3046,117 @@ async def test_loop_confirmation_uses_one_direct_pending_future_and_cancels_it(
 
 
 @pytest.mark.asyncio
+async def test_permission_upgrade_does_not_approve_an_active_run_confirmation(
+    tmp_path: Path,
+) -> None:
+    outside = tmp_path / "outside.txt"
+    outside.write_text("outside", encoding="utf-8")
+    router = _Router(
+        (
+            _response(
+                "",
+                tool_call=ModelToolCall(
+                    id="call_confirmation",
+                    name="read_file",
+                    arguments=json.dumps({"path": str(outside)}),
+                ),
+            ),
+            _response("Declined as expected."),
+        )
+    )
+    loop, _session, bus = _runtime(tmp_path, router)
+    requested = asyncio.Event()
+    requests: list[ConfirmationRequestView] = []
+
+    def on_confirmation(request: ConfirmationRequestView) -> None:
+        requests.append(request)
+        requested.set()
+
+    loop.bind_confirmation_callback(on_confirmation)
+    await loop.start()
+    try:
+        await bus.put_inbound(InboundMessage("confirm this"))
+        await asyncio.wait_for(requested.wait(), timeout=1)
+
+        loop._permission_control.select("full-access")
+        await asyncio.sleep(0)
+
+        assert loop.control.has_active_run
+        assert len(requests) == 1
+        loop.respond_to_confirmation(requests[0].confirmation_id, "declined")
+        terminal = (await asyncio.wait_for(_terminals(bus, 1), timeout=1))[0]
+
+        assert terminal.metadata == {"_streamed": True}
+        assert loop._permission_control.current() == "full-access"
+    finally:
+        await loop.close()
+
+
+@pytest.mark.asyncio
+async def test_permission_downgrade_does_not_revoke_the_admitted_full_access_run(
+    tmp_path: Path,
+) -> None:
+    outside = tmp_path / "outside.txt"
+    outside.write_text("outside", encoding="utf-8")
+    model_started = asyncio.Event()
+    release_model = asyncio.Event()
+
+    class BlockingPermissionRouter(_Router):
+        def stream(
+            self,
+            route: Literal["chat", "schedule"],
+            *,
+            messages: Sequence[dict[str, Any]],
+            tools: Sequence[dict[str, Any]],
+            continuation: ModelContinuation | None = None,
+        ) -> AsyncIterator[ModelStreamEvent]:
+            del route, tools, continuation
+            self.calls.append(str(messages[-1]["content"]))
+            outcome = self._outcomes.popleft()
+
+            async def replay() -> AsyncIterator[ModelStreamEvent]:
+                if not model_started.is_set():
+                    model_started.set()
+                    await release_model.wait()
+                assert not isinstance(outcome, BaseException)
+                yield ModelCompleted(response=outcome)
+
+            return replay()
+
+    router = BlockingPermissionRouter(
+        (
+            _response(
+                "",
+                tool_call=ModelToolCall(
+                    id="call_direct",
+                    name="read_file",
+                    arguments=json.dumps({"path": str(outside)}),
+                ),
+            ),
+            _response("Read without a retroactive confirmation."),
+        )
+    )
+    loop, _session, bus = _runtime(tmp_path, router)
+    requests: list[ConfirmationRequestView] = []
+    loop.bind_confirmation_callback(requests.append)
+    loop._permission_control.select("full-access")
+    await loop.start()
+    try:
+        await bus.put_inbound(InboundMessage("read this"))
+        await asyncio.wait_for(model_started.wait(), timeout=1)
+
+        loop._permission_control.select("read-only")
+        release_model.set()
+        terminal = (await asyncio.wait_for(_terminals(bus, 1), timeout=1))[0]
+
+        assert terminal.metadata == {"_streamed": True}
+        assert requests == []
+        assert loop._permission_control.current() == "read-only"
+    finally:
+        await loop.close()
+
+
+@pytest.mark.asyncio
 async def test_preparation_cancellation_publishes_the_cancelled_terminal(
     tmp_path: Path,
 ) -> None:

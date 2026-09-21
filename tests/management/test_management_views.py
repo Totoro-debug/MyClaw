@@ -6,6 +6,7 @@ import pytest
 
 from myclaw.agent.memory.dream import DreamResult
 from myclaw.agent.memory.manager import MemoryManager
+from myclaw.agent.permission import RuntimePermissionControl
 from myclaw.agent.session.session import Session
 from myclaw.agent.workspace_state import WorkspaceState
 from myclaw.config.agent_home import AgentHome
@@ -483,6 +484,79 @@ async def test_status_projects_the_current_runtime_reasoning_effort(
 
     assert status.chat_reasoning_effort == "xhigh"
     assert status.to_dict()["chat_reasoning_effort"] == "xhigh"
+
+
+@pytest.mark.asyncio
+async def test_status_reports_configured_and_current_foreground_permission_only(
+    agent_home: Path,
+) -> None:
+    home = AgentHome(agent_home)
+    home.initialize()
+    permission_control = RuntimePermissionControl("full-access")
+    permission_control.select("read-only")
+    service = management_service(
+        home,
+        permission_control=permission_control,
+        schedule_status=lambda: {
+            "status": "available",
+            "active_job_count": 4,
+            "permission_level": "full-access",
+            "background_confirmation_count": 2,
+            "future_field": "must remain private",
+        },
+    )
+
+    status = await service.status()
+
+    assert status.configured_permission_level == "full-access"
+    assert status.current_permission_level == "read-only"
+    rendered = status.to_dict()
+    assert rendered["configured_permission_level"] == "full-access"
+    assert rendered["current_permission_level"] == "read-only"
+    assert status.schedule == {"status": "available", "active_job_count": 4}
+    assert "background_confirmation_count" not in rendered
+
+
+@pytest.mark.asyncio
+async def test_permission_update_is_process_local_and_same_level_is_stable(
+    agent_home: Path,
+) -> None:
+    home = AgentHome(agent_home)
+    home.initialize()
+    config_path = home.path / "config.toml"
+    config_path.write_text(
+        """[runtime]
+permission_level = "full-access"
+
+[models.providers.primary]
+protocol = "anthropic"
+base_url = "https://api.anthropic.com"
+api_key = "secret"
+models = ["model-id"]
+
+[models.routes.default]
+provider_id = "primary"
+model = "model-id"
+context_window = 4096
+max_output = 512
+temperature = 0
+timeout = 60
+""",
+        encoding="utf-8",
+    )
+    permission_control = RuntimePermissionControl("full-access")
+    service = management_service(home, permission_control=permission_control)
+    original = config_path.read_text(encoding="utf-8")
+
+    assert await service.update_permission_level("read-only") == "read-only"
+    assert await service.update_permission_level("read-only") == "read-only"
+
+    assert permission_control.configured() == "full-access"
+    assert permission_control.current() == "read-only"
+    assert config_path.read_text(encoding="utf-8") == original
+    config_view = await service.config_view()
+    assert "Effective runtime.permission_level: full-access" in config_view.header_text()
+    assert "Effective runtime.exec_shell: auto" in config_view.header_text()
 
 
 @pytest.mark.asyncio

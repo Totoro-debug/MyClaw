@@ -107,6 +107,7 @@ def test_management_command_catalog_owns_ordered_tokens_and_descriptions() -> No
         ("/config", "View User Configuration"),
         ("/status", "View Runtime Status"),
         ("/effort", "Set Chat Reasoning Effort"),
+        ("/permission", "Set Foreground Tool Permission Level"),
         ("/resume", "Resume a Conversation Session"),
         ("/memory", "View Long-term Memory"),
         ("/dream", "Process pending Conversation Summaries"),
@@ -145,6 +146,38 @@ async def test_effort_command_returns_current_selection_and_commits_a_neutral_re
     assert committed.output == "Chat reasoning effort: xhigh"
     assert committed.effort_selection is None
     assert management.updated == ["xhigh"]
+
+
+class _PermissionManagement:
+    def __init__(self, level: str = "workspace-write") -> None:
+        self.level = level
+        self.updated: list[str] = []
+
+    async def permission_level(self) -> str:
+        return self.level
+
+    async def update_permission_level(self, level: str) -> str:
+        self.updated.append(level)
+        self.level = level
+        return level
+
+
+@pytest.mark.asyncio
+async def test_permission_command_returns_current_selection_and_commits_only_selected_level() -> None:
+    management = _PermissionManagement("read-only")
+    dispatcher = ManagementCommandDispatcher(cast(Any, management))
+
+    selection = await dispatcher.dispatch("/permission")
+    assert management.updated == []
+    committed = await dispatcher.update_permission_level("full-access")
+
+    assert selection.handled is True
+    assert selection.output is None
+    assert selection.permission_selection == "read-only"
+    assert committed.handled is True
+    assert committed.output == "Foreground permission level: full-access"
+    assert committed.permission_selection is None
+    assert management.updated == ["full-access"]
 
 
 @pytest.mark.asyncio
@@ -853,6 +886,8 @@ async def test_status_command_renders_actual_runtime_and_session_state(
         "input_budget_used_percent": 12.5,
         "session_message_count": 2,
         "last_compacted": 1,
+        "configured_permission_level": "workspace-write",
+        "current_permission_level": "workspace-write",
         "cumulative_usage": {
             "model_calls": 1,
             "input_tokens": 10,
@@ -875,6 +910,9 @@ async def test_status_command_renders_actual_runtime_and_session_state(
         "/effort high",
         "/effort ",
         "/EFFORT",
+        "/permission full-access",
+        "/permission ",
+        "/PERMISSION",
     ],
 )
 async def test_unknown_or_inexact_slash_command_is_left_unhandled(

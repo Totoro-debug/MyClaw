@@ -63,6 +63,8 @@ MCP Server 可在 `[mcp.servers.<name>.tool_keywords]` 下按远端 Tool 原名�
 
 前台 Agent Run 会在标题生成、Skill 解析和 Task Framing 之前捕获当前权限级别与已解析的 Exec Shell，并在本次运行内保持不变。Runtime Context 会显示该快照以及 Tool 调用可能需要确认；确认只绑定到一次规范化后的 Tool 调用，不会缓存到共享 Tool。File Tool 的权限矩阵和主机路径规范化见 [ADR-0026](docs/adr/0026-tool-permission-levels-and-foreground-snapshots.md)。模型发起的 `read_file` 不继承 Skill Root 的内部加载豁免；Dream 私有 Tool 和 Runtime 持久化写入不属于该模型 File 策略。
 
+`/permission` 只修改当前 Runtime Lifetime 后续前台 Agent Run 的权限级别，不写入 User Configuration、Conversation Session 或 Schedule。成功的 `/resume` replacement 会保留当前选择；失败的 replacement 不会改变它；新进程从配置值开始。选择 `full-access` 前必须通过默认聚焦 Cancel 的警告；当前该级别只取消前台 File Tool 的普通权限确认，不是操作系统沙箱，也不绕过参数校验、能力错误、业务拒绝或 Tool 执行错误。Exec、Web、MCP 和 Schedule 保持现有行为。进程启动时最多显示一次 Full-Access 安全提示；`/config` 显示 configured level，`/status` 同时显示 configured/current foreground level。
+
 安全默认值字段包括 Runtime 的 Tool 结果大小、迭代上限、Always-load Skill 开关、`compact_ratio`、权限级别和 Exec Shell，Memory 的 batch size 与 schedule，以及每个 Model Route 的 `reasoning_effort`。缺失字段静默使用默认值；显式非法值使用有效默认值并产生且只产生一条不包含原始值的安全诊断。`compact_ratio` 的默认值为 `0.9`，只接受有限且非布尔的数值 `0.5` 至 `0.95`（含边界）。原始配置不会被自动改写；`myclaw config` 与 `/config` 显示相同的有效值和诊断，以及脱敏后的原始 TOML。已移除的 `compaction_message_threshold` 等未知字段会被忽略。
 
 ## 项目启动
@@ -91,6 +93,7 @@ Workspace 的 `.myclaw/schedule.json` 使用严格 canonical Schedule Job schema
 | `/resume` | 从当前 Workspace 的会话列表选择并恢复历史会话 |
 | `/status` | 查看运行状态与上下文用量 |
 | `/config` | 查看脱敏后的配置 |
+| `/permission` | 选择前台 Tool 权限级别 |
 | `/effort` | 选择对话模型的推理强度 |
 | `/memory` | 查看长期记忆 |
 | `/dream` | 将待处理的会话摘要整理为长期记忆 |

@@ -5499,6 +5499,7 @@ async def test_management_completion_supports_keyboard_filtering_and_escape() ->
                     "/config - ",
                     "/status - ",
                     "/effort - ",
+                    "/permission - ",
                     "/resume - ",
                     "/memory - ",
                     "/dream - ",
@@ -5509,6 +5510,7 @@ async def test_management_completion_supports_keyboard_filtering_and_escape() ->
             "/config - View User Configuration",
             "/status - View Runtime Status",
             "/effort - Set Chat Reasoning Effort",
+            "/permission - Set Foreground Tool Permission Level",
             "/resume - Resume a Conversation Session",
             "/memory - View Long-term Memory",
             "/dream - Process pending Conversation Summaries",
@@ -5538,6 +5540,7 @@ async def test_management_completion_supports_keyboard_filtering_and_escape() ->
                     "/config - ",
                     "/status - ",
                     "/effort - ",
+                    "/permission - ",
                     "/resume - ",
                     "/memory - ",
                     "/dream - ",
@@ -5593,6 +5596,7 @@ async def test_management_completion_keeps_the_composer_visible(
                         "/config - ",
                         "/status - ",
                         "/effort - ",
+                        "/permission - ",
                         "/resume - ",
                         "/memory - ",
                         "/dream - ",
@@ -5602,6 +5606,7 @@ async def test_management_completion_keeps_the_composer_visible(
                 "/config - View User Configuration",
                 "/status - View Runtime Status",
                 "/effort - Set Chat Reasoning Effort",
+                "/permission - Set Foreground Tool Permission Level",
                 "/resume - Resume a Conversation Session",
                 "/memory - View Long-term Memory",
                 "/dream - Process pending Conversation Summaries",
@@ -5669,6 +5674,7 @@ async def test_skill_completion_merges_after_management_commands_with_safe_label
             "/config - View User Configuration",
             "/status - View Runtime Status",
             "/effort - Set Chat Reasoning Effort",
+            "/permission - Set Foreground Tool Permission Level",
             "/resume - Resume a Conversation Session",
             "/memory - View Long-term Memory",
             "/dream - Process pending Conversation Summaries",
@@ -5998,6 +6004,20 @@ class _EffortManagement:
         return effort
 
 
+class _PermissionManagement:
+    def __init__(self, level: str) -> None:
+        self.level = level
+        self.updated: list[str] = []
+
+    async def permission_level(self) -> str:
+        return self.level
+
+    async def update_permission_level(self, level: str) -> str:
+        self.updated.append(level)
+        self.level = level
+        return level
+
+
 class _BlockingEffortManagement(_EffortManagement):
     def __init__(self, effort: str) -> None:
         super().__init__(effort)
@@ -6148,6 +6168,246 @@ async def test_effort_selector_clamps_navigation_at_both_boundaries() -> None:
         await pilot.press("escape")
         await pilot.pause()
         assert management.updated == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("initial", ("read-only", "workspace-write", "full-access"))
+async def test_permission_selector_reflects_current_level_and_cancels_without_update(
+    initial: str,
+) -> None:
+    conversation = ScriptedRunSource()
+    runtime = _terminal_backend(conversation)
+    management = _PermissionManagement(initial)
+    app = _terminal_app(
+        cast(Any, runtime),
+        management_dispatcher=ManagementCommandDispatcher(cast(Any, management)),
+    )
+
+    async with app.run_test(size=(24, 12)) as pilot:
+        await pilot.press(*list("/permission"), "enter")
+        await pilot.pause()
+
+        input_area = app.query_one("#conversation-input", TextArea)
+        selector = cast(Any, app.query_one("#permission-selector", Static))
+        assert not input_area.display
+        assert selector.display
+        assert selector.selected_permission_level == initial
+        assert all(
+            label in selector.render().plain
+            for label in ("Read-Only", "Workspace-Write", "Full-Access")
+        )
+        rendered_lines = selector.render().plain.splitlines()
+        assert rendered_lines == ["Read-Only", "Workspace-Write", "Full-Access"]
+        assert max(map(len, rendered_lines)) <= selector.content_region.width
+        assert selector.outer_size.height <= 5
+        assert app.screen.focused is selector
+
+        await pilot.press("escape")
+        await pilot.pause()
+
+        assert management.updated == []
+        assert management.level == initial
+        assert input_area.display
+        assert not selector.display
+        assert app.screen.focused is input_area
+
+
+@pytest.mark.asyncio
+async def test_permission_full_access_requires_cancel_focused_warning_and_explicit_confirmation() -> None:
+    conversation = ScriptedRunSource()
+    runtime = _terminal_backend(conversation)
+    management = _PermissionManagement("workspace-write")
+    app = _terminal_app(
+        cast(Any, runtime),
+        management_dispatcher=ManagementCommandDispatcher(cast(Any, management)),
+    )
+
+    async with app.run_test(size=(80, 24)) as pilot:
+        await pilot.press(*list("/permission"), "enter")
+        await pilot.pause()
+        await pilot.press("right", "enter")
+        await pilot.pause()
+
+        assert app.screen.id == "permission-warning"
+        assert app.screen.focused is not None
+        assert app.screen.focused.id == "permission-warning-cancel"
+        warning = _visible_screen_text(app)
+        assert "Full-Access" in warning
+        assert "ordinary permission confirmation" in warning
+        assert "OS sandbox" in warning
+        assert "validation" in warning.casefold()
+        assert management.updated == []
+
+        await pilot.press("enter")
+        await pilot.pause()
+        assert management.level == "workspace-write"
+        assert management.updated == []
+        assert app.screen.id == "_default"
+
+        await pilot.press(*list("/permission"), "enter")
+        await pilot.pause()
+        await pilot.press("right", "enter")
+        await pilot.pause()
+        assert app.screen.id == "permission-warning"
+        await pilot.press("right", "enter")
+        await pilot.pause()
+
+        assert management.level == "full-access"
+        assert management.updated == ["full-access"]
+        assert app.screen.id == "_default"
+        assert "Foreground permission level: full-access" in _visible_screen_text(app)
+
+
+@pytest.mark.asyncio
+async def test_permission_selector_and_warning_support_mouse_without_narrow_overlap() -> None:
+    conversation = ScriptedRunSource()
+    runtime = _terminal_backend(conversation)
+    management = _PermissionManagement("workspace-write")
+    app = _terminal_app(
+        cast(Any, runtime),
+        management_dispatcher=ManagementCommandDispatcher(cast(Any, management)),
+    )
+
+    async with app.run_test(size=(80, 24)) as pilot:
+        async def click_full_access() -> None:
+            await pilot.press(*list("/permission"), "enter")
+            await pilot.pause()
+            selector = cast(Any, app.query_one("#permission-selector", Static))
+            rendered = selector.render().plain
+            content_x = selector.content_region.x - selector.region.x
+            aligned_x = max(0, (selector.content_region.width - len(rendered)) // 2)
+            full_access_x = content_x + aligned_x + rendered.index("Full-Access") + 1
+            assert await pilot.click("#permission-selector", offset=(full_access_x, 1))
+            await pilot.pause()
+
+        await click_full_access()
+        assert app.screen.id == "permission-warning"
+        assert management.updated == []
+        cancel = app.screen.query_one("#permission-warning-cancel", Button)
+        confirm = app.screen.query_one("#permission-warning-confirm", Button)
+        assert not cancel.region.overlaps(confirm.region)
+        assert await pilot.click(
+            cancel,
+            offset=(cancel.size.width // 2, cancel.size.height // 2),
+        )
+        await pilot.pause()
+        assert management.updated == []
+
+        await click_full_access()
+        assert app.screen.id == "permission-warning"
+        confirm = app.screen.query_one("#permission-warning-confirm", Button)
+        assert await pilot.click(
+            confirm,
+            offset=(confirm.size.width // 2, confirm.size.height // 2),
+        )
+        await pilot.pause()
+
+        assert management.level == "full-access"
+        assert management.updated == ["full-access"]
+
+
+@pytest.mark.asyncio
+async def test_permission_warning_external_dismiss_and_unmount_leave_selection_unchanged() -> None:
+    conversation = ScriptedRunSource()
+    runtime = _terminal_backend(conversation)
+    management = _PermissionManagement("workspace-write")
+    app = _terminal_app(
+        cast(Any, runtime),
+        management_dispatcher=ManagementCommandDispatcher(cast(Any, management)),
+    )
+
+    async with app.run_test(size=(80, 24)) as pilot:
+        await pilot.press(*list("/permission"), "enter")
+        await pilot.pause()
+        await pilot.press("right", "enter")
+        await pilot.pause()
+        assert app.screen.id == "permission-warning"
+
+        await app.screen.dismiss(None)
+        await pilot.pause()
+        assert app.screen.id == "_default"
+        assert management.updated == []
+
+        await pilot.press(*list("/permission"), "enter")
+        await pilot.pause()
+        await pilot.press("right", "enter")
+        await pilot.pause()
+        assert app.screen.id == "permission-warning"
+
+    assert management.level == "workspace-write"
+    assert management.updated == []
+    assert app._permission_warning_result is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("open_warning", [False, True], ids=["selector", "warning"])
+async def test_permission_presenter_is_cleared_before_generation_rebind(
+    open_warning: bool,
+) -> None:
+    bus = MessageBus()
+    initial_control = _DirectControl()
+    target_control = _DirectControl()
+    management = _PermissionManagement("workspace-write")
+    app = TerminalConversationApp(
+        bus=bus,
+        control=initial_control,
+        management_dispatcher=ManagementCommandDispatcher(cast(Any, management)),
+    )
+
+    async with app.run_test(size=(80, 24)) as pilot:
+        await pilot.press(*list("/permission"), "enter")
+        await pilot.pause()
+        if open_warning:
+            await pilot.press("right", "enter")
+            await pilot.pause()
+            assert app.screen.id == "permission-warning"
+
+        await app.rebind_agent_loop(
+            control=target_control,
+            skill_metadata=(),
+            session_projection=ForegroundConversationProjection(
+                session_id="target-session",
+                messages=(),
+            ),
+        )
+        await pilot.pause()
+
+        assert len(app.screen_stack) == 1
+        assert app.screen.id == "_default"
+        assert app.query_one("#conversation-input", TextArea).display
+        assert not app.query_one("#permission-selector", Static).display
+        assert app._permission_warning_result is None
+        assert management.updated == []
+
+
+@pytest.mark.asyncio
+async def test_permission_downgrade_skips_warning_and_same_level_is_stable() -> None:
+    conversation = ScriptedRunSource()
+    runtime = _terminal_backend(conversation)
+    management = _PermissionManagement("full-access")
+    app = _terminal_app(
+        cast(Any, runtime),
+        management_dispatcher=ManagementCommandDispatcher(cast(Any, management)),
+    )
+
+    async with app.run_test(size=(80, 24)) as pilot:
+        await pilot.press(*list("/permission"), "enter")
+        await pilot.pause()
+        await pilot.press("left", "enter")
+        await pilot.pause()
+
+        assert app.screen.id == "_default"
+        assert management.level == "workspace-write"
+        assert management.updated == ["workspace-write"]
+
+        await pilot.press(*list("/permission"), "enter")
+        await pilot.pause()
+        await pilot.press("enter")
+        await pilot.pause()
+
+        assert app.screen.id == "_default"
+        assert management.level == "workspace-write"
+        assert management.updated == ["workspace-write"]
 
 
 @pytest.mark.asyncio

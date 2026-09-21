@@ -114,6 +114,17 @@ def _print_exec_notice(message: str) -> None:
     console.print(message, markup=False, highlight=False, soft_wrap=True)
 
 
+def _print_permission_startup_notice() -> None:
+    console.print(
+        "Full-Access is enabled for this process. It cancels ordinary permission confirmation "
+        "for valid foreground File Tool calls; it is not an OS sandbox. Validation and Tool "
+        "errors still apply. Exec, Web, MCP, and Schedule keep their existing behavior.",
+        markup=False,
+        highlight=False,
+        soft_wrap=True,
+    )
+
+
 def _report_mcp_generation(
     report: MCPStartupReport | MCPSnapshotReport,
 ) -> None:
@@ -197,6 +208,8 @@ async def _run_cli_conversation(
     permission_control = RuntimePermissionControl(
         getattr(configuration.runtime, "permission_level", "workspace-write")
     )
+    if permission_control.configured() == "full-access":
+        _print_permission_startup_notice()
 
     async def abort_loop_once(loop: AgentLoop) -> None:
         if any(loop is existing for existing in aborted_loops):
@@ -509,6 +522,7 @@ async def _run_cli_conversation(
             now=local_now,
             monotonic=monotonic,
             reasoning_effort_control=router,
+            permission_control=permission_control,
         )
         dispatcher = ManagementCommandDispatcher(management)
         terminal_app = TerminalConversationApp(
