@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import ntpath
+import os
 import posixpath
 import re
 import shlex
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Final, Literal
@@ -28,7 +30,6 @@ type ExecIdentityKind = Literal[
     "ambiguous",
     "unknown",
 ]
-
 EXEC_CONFIRMATION_REASON: Final = (
     "Exec inspection was unavailable or uncertain and requires confirmation."
 )
@@ -282,12 +283,14 @@ def catastrophic_matches(command: str) -> tuple[CatastrophicMatch, ...]:
             "restart-computer",
         }:
             add("shutdown-or-reboot", evidence)
-        if (
-            name in {"systemctl", "loginctl"}
-            and len(invocation) > 1
-            and invocation[1].lower() in {"reboot", "poweroff", "halt"}
-        ):
+        if name in {"systemctl", "loginctl"} and _control_command_verb(
+            invocation[1:]
+        ) in {"reboot", "poweroff", "halt"}:
             add("shutdown-or-reboot", evidence)
+
+        if name in {"eval", "exec"} and len(invocation) > 1:
+            for nested_match in catastrophic_matches(" ".join(invocation[1:])):
+                add(nested_match.rule, nested_match.evidence)
 
         nested = _nested_shell_command(invocation)
         if nested is not None:
@@ -302,6 +305,22 @@ def catastrophic_matches(command: str) -> tuple[CatastrophicMatch, ...]:
     if fork_bomb is not None:
         add("fork-bomb", fork_bomb.group(0))
     return tuple(matches)
+
+
+def bash_recursive_forced_delete_targets(command: str) -> tuple[str, ...]:
+    """Return statically tokenized targets from recursive forced Bash rm calls."""
+    targets: list[str] = []
+    for segment in _command_segments(command):
+        invocation = _unwrap_invocation(segment)
+        if not invocation or _command_basename(invocation[0]) != "rm":
+            continue
+        deletion = _deletion_facts(invocation)
+        if deletion is None:
+            continue
+        recursive, force, invocation_targets = deletion
+        if recursive and force:
+            targets.extend(invocation_targets)
+    return tuple(targets)
 
 
 def requires_legacy_destructive_confirmation(command: str) -> bool:
@@ -411,10 +430,9 @@ def _unwrap_invocation(tokens: tuple[str, ...]) -> tuple[str, ...]:
     if not values:
         return ()
     name = _command_basename(values[0])
-    if name == "sudo":
+    if name in {"sudo", "doas"}:
         values.pop(0)
-        while values and values[0].startswith("-"):
-            values.pop(0)
+        _consume_privilege_wrapper_options(values)
     elif name == "env":
         values.pop(0)
         while values and (
@@ -427,6 +445,53 @@ def _unwrap_invocation(tokens: tuple[str, ...]) -> tuple[str, ...]:
         while values and values[0].startswith("-"):
             values.pop(0)
     return tuple(values)
+
+
+_PRIVILEGE_VALUE_OPTIONS: Final[frozenset[str]] = frozenset(
+    {
+        "--chdir",
+        "--chroot",
+        "--close-from",
+        "--group",
+        "--host",
+        "--prompt",
+        "--role",
+        "--type",
+        "--user",
+        "-C",
+        "-D",
+        "-g",
+        "-h",
+        "-p",
+        "-r",
+        "-t",
+        "-u",
+    }
+)
+
+
+def _consume_privilege_wrapper_options(values: list[str]) -> None:
+    while values:
+        argument = values[0]
+        if argument == "--":
+            values.pop(0)
+            return
+        name = argument.split("=", maxsplit=1)[0]
+        if name in _PRIVILEGE_VALUE_OPTIONS:
+            values.pop(0)
+            if "=" not in argument and values:
+                values.pop(0)
+            continue
+        if any(
+            argument.startswith(option) and argument != option
+            for option in ("-C", "-D", "-g", "-h", "-p", "-r", "-t", "-u")
+        ):
+            values.pop(0)
+            continue
+        if argument.startswith("-"):
+            values.pop(0)
+            continue
+        return
 
 
 def _command_basename(value: str) -> str:
@@ -454,6 +519,73 @@ def _option_flags(arguments: tuple[str, ...]) -> tuple[set[str], set[str], tuple
     return short, long, tuple(targets)
 
 
+_CONTROL_VALUE_OPTIONS: Final[frozenset[str]] = frozenset(
+    {
+        "--host",
+        "--image",
+        "--job-mode",
+        "--kill-who",
+        "--kill-whom",
+        "--lines",
+        "--machine",
+        "--output",
+        "--property",
+        "--root",
+        "--signal",
+        "--state",
+        "--type",
+        "-H",
+        "-M",
+        "-n",
+        "-o",
+        "-p",
+        "-s",
+        "-t",
+    }
+)
+
+
+def _control_command_verb(arguments: tuple[str, ...]) -> str | None:
+    index = 0
+    while index < len(arguments):
+        argument = arguments[index]
+        if argument == "--":
+            return arguments[index + 1].casefold() if index + 1 < len(arguments) else None
+        option_name = argument.split("=", maxsplit=1)[0]
+        if option_name in _CONTROL_VALUE_OPTIONS and "=" not in argument:
+            index += 2
+            continue
+        if argument.startswith("-"):
+            index += 1
+            continue
+        return argument.casefold()
+    return None
+
+
+_RM_LONG_OPTIONS: Final[frozenset[str]] = frozenset(
+    {
+        "dir",
+        "force",
+        "help",
+        "interactive",
+        "no-preserve-root",
+        "one-file-system",
+        "preserve-root",
+        "recursive",
+        "verbose",
+        "version",
+    }
+)
+
+
+def _is_unambiguous_rm_long_option(argument: str, canonical: str) -> bool:
+    if not argument.startswith("--") or "=" in argument:
+        return False
+    requested = argument[2:].casefold()
+    matches = tuple(option for option in _RM_LONG_OPTIONS if option.startswith(requested))
+    return len(matches) == 1 and matches[0] == canonical
+
+
 def _deletion_facts(
     invocation: tuple[str, ...],
 ) -> tuple[bool, bool, tuple[str, ...]] | None:
@@ -479,9 +611,15 @@ def _deletion_facts(
             attached := _powershell_attached_parameter(argument, ("path", "literalpath"))
         ) is not None:
             targets.append(attached)
-        elif not options_done and lowered in {"-r", "-s", "/s", "--recursive", "--recurse"}:
+        elif not options_done and (
+            lowered in {"-r", "-s", "/s", "--recursive", "--recurse"}
+            or (name == "rm" and _is_unambiguous_rm_long_option(lowered, "recursive"))
+        ):
             recursive = True
-        elif not options_done and lowered in {"-f", "-q", "/f", "/q", "--force"}:
+        elif not options_done and (
+            lowered in {"-f", "-q", "/f", "/q", "--force"}
+            or (name == "rm" and _is_unambiguous_rm_long_option(lowered, "force"))
+        ):
             force = True
         elif not options_done and _powershell_switch_enabled(argument, "recurse"):
             recursive = True
@@ -862,6 +1000,8 @@ def assess_command(
     git_delegation_safe: bool | None = None,
     diagnostics: tuple[str, ...] = (),
     inspector_status: ExecInspectorStatus = "available",
+    dynamic_constructs: tuple[ExecDynamicConstruct, ...] | None = None,
+    file_accesses: tuple[ExecPathAccess, ...] | None = None,
 ) -> ExecAssessment:
     """Build a shared assessment from parser facts and conservative text roles."""
     names = command_names or _command_names(command)
@@ -878,12 +1018,20 @@ def assess_command(
         )
         for name in names
     )
-    dynamic = _dynamic_constructs(command, family=family)
+    dynamic = (
+        _dynamic_constructs(command, family=family)
+        if dynamic_constructs is None
+        else tuple(dynamic_constructs)
+    )
     return ExecAssessment(
         syntax_confidence=syntax_confidence,
         syntax_uncertain=syntax_uncertain,
         command_identities=identities,
-        file_accesses=_path_accesses(command, names, family=family),
+        file_accesses=(
+            _path_accesses(command, names, family=family)
+            if file_accesses is None
+            else tuple(file_accesses)
+        ),
         network_targets=tuple(match.group(0).rstrip(".,;:!?)]}") for match in _URL_PATTERN.finditer(command)),
         dynamic_constructs=dynamic,
         catastrophic_matches=catastrophic_matches(command),
@@ -982,6 +1130,460 @@ _BUILTINS: Final[dict[ExecShellFamily, frozenset[str]]] = {
     "bash": frozenset({"cd", "echo", "printf", "pwd", "read", "test", "true", "false"}),
     "powershell": frozenset({"echo", "cd", "pwd", "where", "write-output"}),
 }
+
+
+@dataclass(frozen=True, slots=True)
+class _BashGrammar:
+    switches: frozenset[str] = frozenset()
+    values: frozenset[str] = frozenset()
+    optional_values: frozenset[str] = frozenset()
+    minimum_operands: int = 0
+    maximum_operands: int | None = None
+
+
+def _bash_grammar(
+    *,
+    switches: tuple[str, ...] = (),
+    values: tuple[str, ...] = (),
+    optional_values: tuple[str, ...] = (),
+    minimum_operands: int = 0,
+    maximum_operands: int | None = None,
+) -> _BashGrammar:
+    return _BashGrammar(
+        switches=frozenset(switches),
+        values=frozenset(values),
+        optional_values=frozenset(optional_values),
+        minimum_operands=minimum_operands,
+        maximum_operands=maximum_operands,
+    )
+
+
+BASH_APPROVED_BUILTINS: Final[frozenset[str]] = frozenset({"pwd"})
+BASH_READ_CANDIDATES: Final[frozenset[str]] = frozenset(
+    {
+        "pwd",
+        "ls",
+        "cat",
+        "head",
+        "tail",
+        "wc",
+        "stat",
+        "file",
+        "grep",
+        "rg",
+        "find",
+        "sort",
+        "uniq",
+        "cut",
+        "diff",
+    }
+)
+BASH_WRITE_CANDIDATES: Final[frozenset[str]] = frozenset(
+    {"mkdir", "touch", "cp", "mv", "rm"}
+)
+
+_BASH_GRAMMAR: Final[dict[str, _BashGrammar]] = {
+    "pwd": _bash_grammar(
+        switches=("-L", "-P", "--logical", "--physical"),
+        maximum_operands=0,
+    ),
+    "ls": _bash_grammar(
+        switches=(
+            "-a",
+            "-A",
+            "-d",
+            "-F",
+            "-h",
+            "-l",
+            "-R",
+            "-r",
+            "-S",
+            "-t",
+            "-U",
+            "-1",
+            "--all",
+            "--almost-all",
+            "--classify",
+            "--directory",
+            "--human-readable",
+            "--reverse",
+            "--recursive",
+        ),
+        values=("--format", "--quoting-style", "--sort", "--time-style"),
+        optional_values=("--color",),
+        maximum_operands=None,
+    ),
+    "cat": _bash_grammar(
+        switches=(
+            "-A",
+            "-b",
+            "-E",
+            "-n",
+            "-s",
+            "-T",
+            "-v",
+            "--number",
+            "--show-all",
+            "--show-ends",
+            "--show-nonprinting",
+            "--show-tabs",
+            "--squeeze-blank",
+        ),
+        minimum_operands=1,
+    ),
+    "head": _bash_grammar(
+        switches=("-q", "-v", "--quiet", "--silent", "--verbose"),
+        values=("-n", "-c", "--lines", "--bytes"),
+        minimum_operands=1,
+    ),
+    "tail": _bash_grammar(
+        switches=("-q", "-v", "--quiet", "--silent", "--verbose"),
+        values=("-n", "-c", "--lines", "--bytes"),
+        minimum_operands=1,
+    ),
+    "wc": _bash_grammar(
+        switches=("-c", "-m", "-l", "-L", "-w", "--bytes", "--chars", "--lines", "--max-line-length", "--words"),
+        minimum_operands=1,
+    ),
+    "stat": _bash_grammar(
+        switches=("-f", "-L", "-t", "--dereference", "--file-system", "--terse"),
+        values=("-c", "--format", "--printf"),
+        minimum_operands=1,
+    ),
+    "file": _bash_grammar(
+        switches=(
+            "-b",
+            "-c",
+            "-h",
+            "-i",
+            "-k",
+            "-L",
+            "-n",
+            "-N",
+            "-z",
+            "--brief",
+            "--dereference",
+            "--mime",
+            "--mime-type",
+            "--no-buffer",
+            "--preserve-date",
+            "--raw",
+            "--zero",
+        ),
+        values=("-e", "--exclude"),
+        minimum_operands=1,
+    ),
+    "grep": _bash_grammar(),
+    "rg": _bash_grammar(),
+    "find": _bash_grammar(),
+    "sort": _bash_grammar(
+        switches=(
+            "-b",
+            "-d",
+            "-f",
+            "-g",
+            "-h",
+            "-i",
+            "-M",
+            "-n",
+            "-r",
+            "-s",
+            "-u",
+            "-z",
+            "--debug",
+            "--dictionary-order",
+            "--general-numeric-sort",
+            "--human-numeric-sort",
+            "--ignore-case",
+            "--ignore-nonprinting",
+            "--month-sort",
+            "--numeric-sort",
+            "--reverse",
+            "--stable",
+            "--unique",
+            "--zero-terminated",
+        ),
+        values=("-k", "-S", "-t", "--batch-size", "--field-separator", "--key"),
+        minimum_operands=1,
+    ),
+    "uniq": _bash_grammar(
+        switches=("-c", "-d", "-D", "-i", "-u", "--all-repeated", "--count", "--ignore-case", "--repeated", "--unique"),
+        values=("-f", "-s", "-w", "--fields", "--skip-chars", "--check-chars"),
+        minimum_operands=1,
+        maximum_operands=2,
+    ),
+    "cut": _bash_grammar(
+        switches=("-s", "--complement", "--only-delimited"),
+        values=(
+            "-b",
+            "-c",
+            "-d",
+            "-f",
+            "--bytes",
+            "--characters",
+            "--delimiter",
+            "--fields",
+        ),
+        minimum_operands=1,
+        maximum_operands=1,
+    ),
+    "diff": _bash_grammar(
+        switches=(
+            "-a",
+            "-b",
+            "-B",
+            "-c",
+            "-d",
+            "-i",
+            "-N",
+            "-q",
+            "-r",
+            "-s",
+            "-t",
+            "-T",
+            "-u",
+            "-w",
+            "-W",
+            "--brief",
+            "--color",
+            "--expand-tabs",
+            "--ignore-all-space",
+            "--ignore-blank-lines",
+            "--ignore-case",
+            "--ignore-file-name-case",
+            "--ignore-space-change",
+            "--minimal",
+            "--new-file",
+            "--recursive",
+            "--report-identical-files",
+            "--strip-trailing-cr",
+            "--text",
+            "--unified",
+            "--width",
+        ),
+        values=("-D", "--ifdef", "--label", "--palette"),
+        optional_values=("--color",),
+        minimum_operands=2,
+        maximum_operands=2,
+    ),
+    "mkdir": _bash_grammar(
+        switches=("-p", "-v", "--parents", "--verbose"),
+        values=("-m", "--mode"),
+        minimum_operands=1,
+    ),
+    "touch": _bash_grammar(
+        switches=("-a", "-c", "-m", "--no-create"),
+        values=("-d", "-t", "--date", "--reference", "-r"),
+        minimum_operands=1,
+    ),
+    "rm": _bash_grammar(
+        switches=(
+            "-d",
+            "-f",
+            "-i",
+            "-I",
+            "-r",
+            "-R",
+            "-v",
+            "--dir",
+            "--force",
+            "--interactive",
+            "--one-file-system",
+            "--preserve-root",
+            "--no-preserve-root",
+            "--recursive",
+            "--verbose",
+        ),
+        optional_values=("--interactive",),
+        minimum_operands=1,
+    ),
+    "cp": _bash_grammar(
+        switches=(
+            "-a",
+            "-f",
+            "-i",
+            "-l",
+            "-n",
+            "-p",
+            "-P",
+            "-r",
+            "-R",
+            "-s",
+            "-u",
+            "-v",
+            "-T",
+            "--archive",
+            "--attributes-only",
+            "--backup",
+            "--force",
+            "--interactive",
+            "--link",
+            "--no-clobber",
+            "--no-target-directory",
+            "--parents",
+            "--preserve",
+            "--recursive",
+            "--reflink",
+            "--symbolic-link",
+            "--update",
+            "--verbose",
+        ),
+        values=("-S", "-t", "--suffix", "--target-directory"),
+        optional_values=("--backup", "--preserve", "--reflink"),
+        minimum_operands=2,
+    ),
+    "mv": _bash_grammar(
+        switches=(
+            "-f",
+            "-i",
+            "-n",
+            "-T",
+            "-u",
+            "-v",
+            "--backup",
+            "--force",
+            "--interactive",
+            "--no-clobber",
+            "--no-target-directory",
+            "--strip-trailing-slashes",
+            "--update",
+            "--verbose",
+        ),
+        values=("-S", "-t", "--suffix", "--target-directory"),
+        optional_values=("--backup",),
+        minimum_operands=2,
+    ),
+}
+
+_BASH_GREP_SWITCHES: Final[frozenset[str]] = frozenset(
+    {
+        "-i",
+        "-n",
+        "-v",
+        "-w",
+        "-x",
+        "-c",
+        "-l",
+        "-L",
+        "-q",
+        "-s",
+        "-h",
+        "-H",
+        "-r",
+        "-E",
+        "-F",
+        "-G",
+        "-P",
+        "-o",
+        "--count",
+        "--ignore-case",
+        "--line-buffered",
+        "--line-number",
+        "--no-filename",
+        "--no-messages",
+        "--only-matching",
+        "--quiet",
+        "--text",
+        "--with-filename",
+        "--word-regexp",
+    }
+)
+_BASH_GREP_VALUES: Final[frozenset[str]] = frozenset(
+    {
+        "-A",
+        "-B",
+        "-C",
+        "-e",
+        "-m",
+        "--after-context",
+        "--before-context",
+        "--binary-files",
+        "--context",
+        "--directories",
+        "--exclude",
+        "--exclude-dir",
+        "--include",
+        "--max-count",
+        "--regexp",
+    }
+)
+_BASH_GREP_OPTIONAL_VALUES: Final[frozenset[str]] = frozenset(
+    {"--color", "--colour"}
+)
+_BASH_RG_SWITCHES: Final[frozenset[str]] = frozenset(
+    {
+        "-i",
+        "-n",
+        "-v",
+        "-w",
+        "-x",
+        "-c",
+        "-l",
+        "-q",
+        "-s",
+        "-H",
+        "-F",
+        "-P",
+        "-o",
+        "--count",
+        "--files",
+        "--files-with-matches",
+        "--files-without-match",
+        "--glob-case-insensitive",
+        "--heading",
+        "--hidden",
+        "--ignore-case",
+        "--line-buffered",
+        "--line-number",
+        "--no-filename",
+        "--no-ignore",
+        "--no-messages",
+        "--only-matching",
+        "--quiet",
+        "--text",
+        "--with-filename",
+        "--word-regexp",
+    }
+)
+_BASH_RG_VALUES: Final[frozenset[str]] = frozenset(
+    {
+        "-A",
+        "-B",
+        "-C",
+        "-E",
+        "-e",
+        "-g",
+        "-t",
+        "-T",
+        "--after-context",
+        "--before-context",
+        "--color",
+        "--context",
+        "--encoding",
+        "--glob",
+        "--max-count",
+        "--regexp",
+        "--type",
+        "--type-not",
+    }
+)
+_BASH_FORBIDDEN_PATTERN_OPTIONS: Final[frozenset[str]] = frozenset(
+    {"-f", "--file", "--pre", "--pre-glob", "--config", "--ignore-file"}
+)
+_BASH_FIND_ACTIONS: Final[frozenset[str]] = frozenset(
+    {
+        "-delete",
+        "-exec",
+        "-execdir",
+        "-ok",
+        "-okdir",
+        "-fprint",
+        "-fprint0",
+        "-fprintf",
+        "-fls",
+        "-ls",
+    }
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -1339,6 +1941,483 @@ def classify_powershell_command(
     return ExecGrammarClassification(True, "", tuple(dict.fromkeys(accesses)))
 
 
+def classify_bash_command(
+    command: str,
+    assessment: ExecAssessment,
+) -> ExecGrammarClassification:
+    """Classify a parseable Bash command against the fixed low-permission grammar."""
+    if assessment.uncertain or assessment.syntax_confidence != "high":
+        return ExecGrammarClassification(False, "Bash command syntax is uncertain.")
+    if assessment.dynamic_constructs:
+        return ExecGrammarClassification(False, "Bash command contains dynamic syntax.")
+    segments = _split_bash_pipeline(command)
+    if segments is None:
+        return ExecGrammarClassification(False, "Bash command syntax is outside the direct grammar.")
+    if len(segments) != len(assessment.command_identities):
+        return ExecGrammarClassification(False, "Bash command identity facts are incomplete.")
+
+    accesses: list[ExecPathAccess] = []
+    for index, (tokens, identity) in enumerate(
+        zip(segments, assessment.command_identities, strict=True)
+    ):
+        if not tokens:
+            return ExecGrammarClassification(False, "Bash pipeline contains an empty command.")
+        name = tokens[0]
+        if name in {"git", "git.exe"}:
+            if index != 0:
+                return ExecGrammarClassification(False, "Git is not the first command in the Bash pipeline.")
+            if not _is_trusted_bash_git_identity(identity, requested=name):
+                return ExecGrammarClassification(False, "The Git executable identity is not trusted.")
+            if assessment.git_delegation_safe is not True:
+                return ExecGrammarClassification(False, "Git repository configuration may delegate execution.")
+            git_result = _classify_git_arguments(
+                tuple(tokens[1:]),
+                path_validator=_is_static_bash_path,
+                value_validator=_is_static_bash_value,
+            )
+            if not git_result.accepted:
+                return git_result
+            accesses.extend(git_result.file_accesses)
+            continue
+
+        grammar = _BASH_GRAMMAR.get(name)
+        if grammar is None:
+            return ExecGrammarClassification(False, "The Bash command is not on the fixed candidate list.")
+        if not _is_trusted_bash_identity(identity, requested=name):
+            return ExecGrammarClassification(False, "The Bash command identity is not trusted.")
+        parsed = _parse_bash_candidate(
+            name,
+            tuple(tokens[1:]),
+            grammar,
+            allow_stdin=index > 0,
+        )
+        if not parsed.accepted:
+            return parsed
+        accesses.extend(parsed.file_accesses)
+
+    return ExecGrammarClassification(True, "", tuple(dict.fromkeys(accesses)))
+
+
+def _parse_bash_candidate(
+    name: str,
+    arguments: tuple[str, ...],
+    grammar: _BashGrammar,
+    *,
+    allow_stdin: bool = False,
+) -> ExecGrammarClassification:
+    if name in {"grep", "rg"}:
+        return _parse_bash_pattern_command(name, arguments, allow_stdin=allow_stdin)
+    if name == "find":
+        return _parse_bash_find(arguments)
+    if name in {"cp", "mv"}:
+        return _parse_bash_copy_move(arguments, grammar)
+    if name == "touch":
+        return _parse_bash_touch(arguments, grammar)
+    if name == "uniq":
+        return _parse_bash_uniq(arguments, grammar, allow_stdin=allow_stdin)
+    if name in BASH_WRITE_CANDIDATES:
+        return _parse_bash_write(arguments, grammar)
+    parsed = _parse_bash_options(arguments, grammar)
+    if not parsed[0]:
+        return ExecGrammarClassification(False, parsed[1])
+    _options, operands = parsed[2], parsed[3]
+    if len(operands) < grammar.minimum_operands and not (
+        allow_stdin and not operands
+    ):
+        return ExecGrammarClassification(False, "The Bash command is missing a path operand.")
+    if grammar.maximum_operands is not None and len(operands) > grammar.maximum_operands:
+        return ExecGrammarClassification(False, "The Bash command contains an unknown operand.")
+    accesses: list[ExecPathAccess] = []
+    for operand in operands:
+        if not _is_static_bash_path(operand):
+            return ExecGrammarClassification(False, "The Bash path operand is dynamic or comes from stdin.")
+        accesses.append(ExecPathAccess(path=operand, role="read"))
+    return ExecGrammarClassification(True, "", tuple(accesses))
+
+
+def _parse_bash_write(
+    arguments: tuple[str, ...],
+    grammar: _BashGrammar,
+) -> ExecGrammarClassification:
+    parsed = _parse_bash_options(arguments, grammar)
+    if not parsed[0]:
+        return ExecGrammarClassification(False, parsed[1])
+    _options, operands = parsed[2], parsed[3]
+    if len(operands) < grammar.minimum_operands:
+        return ExecGrammarClassification(False, "The Bash write command is missing a target path.")
+    if grammar.maximum_operands is not None and len(operands) > grammar.maximum_operands:
+        return ExecGrammarClassification(False, "The Bash write command contains an unknown operand.")
+    accesses: list[ExecPathAccess] = []
+    for operand in operands:
+        if not _is_static_bash_path(operand):
+            return ExecGrammarClassification(False, "The Bash write path operand is dynamic.")
+        accesses.append(ExecPathAccess(path=operand, role="write"))
+    return ExecGrammarClassification(True, "", tuple(accesses))
+
+
+def _parse_bash_copy_move(
+    arguments: tuple[str, ...],
+    grammar: _BashGrammar,
+) -> ExecGrammarClassification:
+    parsed = _parse_bash_options(arguments, grammar)
+    if not parsed[0]:
+        return ExecGrammarClassification(False, parsed[1])
+    _accepted, _reason, options, raw_operands = parsed
+    operands = list(raw_operands)
+    target_option = next(
+        (value for name, value in options if name in {"-t", "--target-directory"}),
+        None,
+    )
+    if target_option is not None:
+        if not operands:
+            return ExecGrammarClassification(False, "The Bash copy command is missing a source path.")
+        if not _is_static_bash_path(target_option):
+            return ExecGrammarClassification(False, "The Bash destination path is dynamic.")
+        source_paths = operands
+        destination = target_option
+    else:
+        if len(operands) < 2:
+            return ExecGrammarClassification(False, "The Bash copy command needs a source and destination.")
+        source_paths = operands[:-1]
+        destination = operands[-1]
+    if any(not _is_static_bash_path(path) for path in (*source_paths, destination)):
+        return ExecGrammarClassification(False, "The Bash copy path operand is dynamic.")
+    return ExecGrammarClassification(
+        True,
+        "",
+        tuple(
+            [*(ExecPathAccess(path=path, role="read") for path in source_paths),
+             ExecPathAccess(path=destination, role="write")]
+        ),
+    )
+
+
+def _parse_bash_touch(
+    arguments: tuple[str, ...],
+    grammar: _BashGrammar,
+) -> ExecGrammarClassification:
+    parsed = _parse_bash_options(arguments, grammar)
+    if not parsed[0]:
+        return ExecGrammarClassification(False, parsed[1])
+    _accepted, _reason, options, operands = parsed
+    if len(operands) < grammar.minimum_operands:
+        return ExecGrammarClassification(False, "Touch is missing a target path.")
+    accesses: list[ExecPathAccess] = []
+    for option, value in options:
+        if option not in {"-r", "--reference"} or value is None:
+            continue
+        if not _is_static_bash_path(value):
+            return ExecGrammarClassification(False, "The touch reference path is dynamic.")
+        accesses.append(ExecPathAccess(path=value, role="read"))
+    for operand in operands:
+        if not _is_static_bash_path(operand):
+            return ExecGrammarClassification(False, "The touch target path is dynamic.")
+        accesses.append(ExecPathAccess(path=operand, role="write"))
+    return ExecGrammarClassification(True, "", tuple(accesses))
+
+
+def _parse_bash_uniq(
+    arguments: tuple[str, ...],
+    grammar: _BashGrammar,
+    *,
+    allow_stdin: bool,
+) -> ExecGrammarClassification:
+    parsed = _parse_bash_options(arguments, grammar)
+    if not parsed[0]:
+        return ExecGrammarClassification(False, parsed[1])
+    operands = parsed[3]
+    if not operands and not allow_stdin:
+        return ExecGrammarClassification(False, "Uniq would consume its input from stdin.")
+    if len(operands) > 2:
+        return ExecGrammarClassification(False, "Uniq contains an unknown operand.")
+    if any(not _is_static_bash_path(operand) for operand in operands):
+        return ExecGrammarClassification(False, "A uniq path operand is dynamic.")
+    accesses: list[ExecPathAccess] = []
+    if operands:
+        accesses.append(ExecPathAccess(path=operands[0], role="read"))
+    if len(operands) == 2:
+        accesses.append(ExecPathAccess(path=operands[1], role="write"))
+    return ExecGrammarClassification(True, "", tuple(accesses))
+
+
+def _parse_bash_pattern_command(
+    name: str,
+    arguments: tuple[str, ...],
+    *,
+    allow_stdin: bool = False,
+) -> ExecGrammarClassification:
+    if name == "grep":
+        grammar = _bash_grammar(
+            switches=tuple(_BASH_GREP_SWITCHES),
+            values=tuple(_BASH_GREP_VALUES),
+            optional_values=tuple(_BASH_GREP_OPTIONAL_VALUES),
+        )
+    else:
+        grammar = _bash_grammar(
+            switches=tuple(_BASH_RG_SWITCHES),
+            values=tuple(_BASH_RG_VALUES),
+        )
+    for argument in arguments:
+        option_name = argument.split("=", maxsplit=1)[0]
+        if option_name in _BASH_FORBIDDEN_PATTERN_OPTIONS:
+            return ExecGrammarClassification(False, "Pattern-file or external preprocessor options require confirmation.")
+        if option_name.startswith("--") and any(
+            marker in option_name.casefold() for marker in ("config", "preprocess", "ignore-file")
+        ):
+            return ExecGrammarClassification(False, "Pattern configuration options require confirmation.")
+    parsed = _parse_bash_options(arguments, grammar)
+    if not parsed[0]:
+        return ExecGrammarClassification(False, parsed[1])
+    _accepted, _reason, options, raw_operands = parsed
+    operands = list(raw_operands)
+    patterns = [
+        value
+        for option, value in options
+        if option in {"-e", "--regexp"} and value is not None
+    ]
+    files_mode = name == "rg" and any(option == "--files" for option, _value in options)
+    if files_mode and patterns:
+        return ExecGrammarClassification(False, "Rg files mode cannot include a search pattern.")
+    if not files_mode and not patterns and operands:
+        patterns.append(operands.pop(0))
+    if not patterns and not files_mode:
+        return ExecGrammarClassification(False, "The pattern command is missing a fixed pattern.")
+    if any(not _is_static_bash_value(pattern) for pattern in patterns):
+        return ExecGrammarClassification(False, "The pattern operand is dynamic.")
+    if not operands and not files_mode and not allow_stdin:
+        return ExecGrammarClassification(False, "The pattern command would consume its path from stdin.")
+    accesses: list[ExecPathAccess] = []
+    for operand in operands:
+        if not _is_static_bash_path(operand):
+            return ExecGrammarClassification(False, "The pattern path operand is dynamic or comes from stdin.")
+        accesses.append(ExecPathAccess(path=operand, role="read"))
+    return ExecGrammarClassification(True, "", tuple(accesses))
+
+
+def _parse_bash_find(arguments: tuple[str, ...]) -> ExecGrammarClassification:
+    if not arguments:
+        return ExecGrammarClassification(False, "Find requires a fixed starting path.")
+    starts: list[str] = []
+    index = 0
+    while index < len(arguments) and not arguments[index].startswith("-"):
+        starts.append(arguments[index])
+        index += 1
+    if not starts or any(not _is_static_bash_path(path) for path in starts):
+        return ExecGrammarClassification(False, "Find has a dynamic starting path.")
+    while index < len(arguments):
+        token = arguments[index]
+        if token in _BASH_FIND_ACTIONS:
+            return ExecGrammarClassification(False, "Find action or delegation requires confirmation.")
+        if token in {"-type"}:
+            if index + 1 >= len(arguments) or arguments[index + 1] not in {"b", "c", "d", "f", "l", "p", "s"}:
+                return ExecGrammarClassification(False, "Find has an unknown type operand.")
+            index += 2
+            continue
+        if token in {"-name", "-path", "-wholename"}:
+            if index + 1 >= len(arguments) or not _is_static_bash_value(arguments[index + 1]):
+                return ExecGrammarClassification(False, "Find has a dynamic pattern operand.")
+            index += 2
+            continue
+        if token in {"-maxdepth", "-mindepth"}:
+            if index + 1 >= len(arguments) or not arguments[index + 1].isdigit():
+                return ExecGrammarClassification(False, "Find has an invalid depth operand.")
+            index += 2
+            continue
+        if token in {"-print", "-print0", "-P", "-a"}:
+            index += 1
+            continue
+        return ExecGrammarClassification(False, "Find contains an unknown switch or expression.")
+    return ExecGrammarClassification(
+        True,
+        "",
+        tuple(ExecPathAccess(path=path, role="read") for path in starts),
+    )
+
+
+def _parse_bash_options(
+    arguments: tuple[str, ...],
+    grammar: _BashGrammar,
+) -> tuple[bool, str, tuple[tuple[str, str | None], ...], tuple[str, ...]]:
+    options: list[tuple[str, str | None]] = []
+    operands: list[str] = []
+    options_done = False
+    index = 0
+    while index < len(arguments):
+        argument = arguments[index]
+        if options_done or not argument.startswith("-") or argument == "-":
+            operands.append(argument)
+            index += 1
+            continue
+        if argument == "--":
+            options_done = True
+            index += 1
+            continue
+        if argument.startswith("--"):
+            name, separator, attached = argument.partition("=")
+            if name in grammar.values:
+                if not separator:
+                    if index + 1 >= len(arguments):
+                        return False, "A Bash option is missing its operand.", (), ()
+                    attached = arguments[index + 1]
+                    index += 1
+                if attached is None or not _is_static_bash_value(attached):
+                    return False, "A Bash option operand is dynamic.", (), ()
+                options.append((name, attached))
+            elif name in grammar.optional_values:
+                if separator and not _is_static_bash_value(attached):
+                    return False, "A Bash option operand is dynamic.", (), ()
+                options.append((name, attached if separator else None))
+            elif name in grammar.switches and not separator:
+                options.append((name, None))
+            else:
+                return False, "The Bash command contains an unknown or abbreviated switch.", (), ()
+            index += 1
+            continue
+        if argument in grammar.values:
+            if index + 1 >= len(arguments):
+                return False, "A Bash option is missing its operand.", (), ()
+            attached = arguments[index + 1]
+            if not _is_static_bash_value(attached):
+                return False, "A Bash option operand is dynamic.", (), ()
+            options.append((argument, attached))
+            index += 2
+            continue
+        if argument in grammar.switches:
+            options.append((argument, None))
+            index += 1
+            continue
+        if len(argument) > 2 and argument.startswith("-"):
+            short_options = tuple(f"-{character}" for character in argument[1:])
+            if all(option in grammar.switches for option in short_options):
+                options.extend((option, None) for option in short_options)
+                index += 1
+                continue
+        return False, "The Bash command contains an unknown or combined switch.", (), ()
+    return True, "", tuple(options), tuple(operands)
+
+
+def _split_bash_pipeline(command: str) -> list[tuple[str, ...]] | None:
+    segments: list[tuple[str, ...]] = []
+    buffer: list[str] = []
+    quote: str | None = None
+    escaped = False
+    for index, character in enumerate(command):
+        if escaped:
+            buffer.append(character)
+            escaped = False
+            continue
+        if character == "\\" and quote != "'":
+            buffer.append(character)
+            escaped = True
+            continue
+        if quote is not None:
+            buffer.append(character)
+            if character == quote:
+                quote = None
+            continue
+        if character in {"'", '"'}:
+            quote = character
+            buffer.append(character)
+            continue
+        if character == "|":
+            if index + 1 < len(command) and command[index + 1] == "|":
+                return None
+            text = "".join(buffer).strip()
+            if not text:
+                return None
+            try:
+                segments.append(tuple(shlex.split(text, comments=False, posix=True)))
+            except ValueError:
+                return None
+            buffer.clear()
+            continue
+        if character in ";&<>\n(){}":
+            return None
+        buffer.append(character)
+    if quote is not None or escaped:
+        return None
+    text = "".join(buffer).strip()
+    if not text:
+        return None
+    try:
+        segments.append(tuple(shlex.split(text, comments=False, posix=True)))
+    except ValueError:
+        return None
+    return segments if all(segments) else None
+
+
+def _is_static_bash_value(value: str) -> bool:
+    # Expansion facts come from the Bash AST before shlex removes quote context.
+    return bool(value)
+
+
+def _is_static_bash_path(value: str) -> bool:
+    return _is_static_bash_value(value) and value != "-"
+
+
+def _is_trusted_bash_identity(
+    identity: ExecCommandIdentity,
+    *,
+    requested: str,
+) -> bool:
+    if identity.requested != requested or identity.resolution_count != 1:
+        return False
+    if identity.kind == "builtin":
+        return (
+            requested in BASH_APPROVED_BUILTINS
+            and identity.canonical == requested
+            and identity.resolved is None
+        )
+    if identity.kind != "native":
+        return False
+    return (
+        "/" not in requested
+        and identity.canonical == requested
+        and identity.resolved is not None
+        and os.path.isabs(identity.resolved)
+    )
+
+
+def _is_trusted_bash_git_identity(
+    identity: ExecCommandIdentity,
+    *,
+    requested: str,
+) -> bool:
+    return (
+        identity.requested == requested
+        and identity.kind == "native"
+        and identity.resolution_count == 1
+        and identity.canonical == requested
+        and identity.resolved is not None
+        and os.path.isabs(identity.resolved)
+        and "/" not in requested
+    )
+
+
+def bash_git_audit_targets(
+    command: str,
+    cwd: str,
+) -> tuple[tuple[int, str], ...] | None:
+    """Return static Git identity indexes and effective POSIX directories."""
+    segments = _split_bash_pipeline(command)
+    if segments is None:
+        return None
+    targets: list[tuple[int, str]] = []
+    for index, tokens in enumerate(segments):
+        if not tokens or tokens[0] not in {"git", "git.exe"}:
+            continue
+        base = Path(cwd)
+        cursor = 1
+        while cursor < len(tokens) and tokens[cursor] == "-C":
+            if cursor + 1 >= len(tokens) or not _is_static_bash_path(tokens[cursor + 1]):
+                return None
+            requested = Path(tokens[cursor + 1])
+            base = requested if requested.is_absolute() else base / requested
+            cursor += 2
+        targets.append((index, str(base.absolute())))
+    return tuple(targets)
+
+
 def _is_trusted_git_identity(
     identity: ExecCommandIdentity,
     *,
@@ -1535,11 +2614,18 @@ def _is_static_powershell_path(value: str) -> bool:
     return True
 
 
-def _classify_git_arguments(arguments: tuple[str, ...]) -> ExecGrammarClassification:
+def _classify_git_arguments(
+    arguments: tuple[str, ...],
+    *,
+    path_validator: Callable[[str], bool] | None = None,
+    value_validator: Callable[[str], bool] | None = None,
+) -> ExecGrammarClassification:
+    is_path = _is_static_powershell_path if path_validator is None else path_validator
+    is_value = _is_static_powershell_value if value_validator is None else value_validator
     values = list(arguments)
     accesses: list[ExecPathAccess] = []
     while values and values[0] == "-C":
-        if len(values) < 2 or not _is_static_powershell_path(values[1]):
+        if len(values) < 2 or not is_path(values[1]):
             return ExecGrammarClassification(False, "Git has an invalid repository path operand.")
         accesses.append(ExecPathAccess(path=values[1], role="read"))
         values = values[2:]
@@ -1557,7 +2643,7 @@ def _classify_git_arguments(arguments: tuple[str, ...]) -> ExecGrammarClassifica
     while index < len(values):
         token = values[index]
         if after_separator:
-            if not _is_static_powershell_path(token):
+            if not is_path(token) or not _is_plain_git_pathspec(token):
                 return ExecGrammarClassification(False, "Git pathspec is dynamic.")
             if form in {"status", "diff", "ls-files"}:
                 accesses.append(ExecPathAccess(path=token, role="read"))
@@ -1575,7 +2661,7 @@ def _classify_git_arguments(arguments: tuple[str, ...]) -> ExecGrammarClassifica
                 return ExecGrammarClassification(False, "Git has an unknown switch.")
             if "=" in token:
                 attached = token.split("=", maxsplit=1)[1]
-                if option_name not in value_options or not _is_static_powershell_value(attached):
+                if option_name not in value_options or not is_value(attached):
                     return ExecGrammarClassification(
                         False,
                         "Git has an invalid attached switch operand.",
@@ -1584,14 +2670,14 @@ def _classify_git_arguments(arguments: tuple[str, ...]) -> ExecGrammarClassifica
                 saw_branch_list = True
             if option_name in value_options and option_name not in _GIT_OPTIONAL_VALUE_OPTIONS:
                 if "=" not in token:
-                    if index + 1 >= len(values) or not _is_static_powershell_value(values[index + 1]):
+                    if index + 1 >= len(values) or not is_value(values[index + 1]):
                         return ExecGrammarClassification(False, "Git switch is missing its operand.")
                     index += 1
             index += 1
             continue
         positional_count += 1
         if form in {"show", "log", "rev-parse"} and positional_count <= 1:
-            if not _is_static_powershell_value(token):
+            if not is_value(token) or not _is_plain_git_revision(token):
                 return ExecGrammarClassification(False, "Git revision operand is dynamic.")
         else:
             return ExecGrammarClassification(False, "Git has an unknown operand.")
@@ -1601,7 +2687,18 @@ def _classify_git_arguments(arguments: tuple[str, ...]) -> ExecGrammarClassifica
     return ExecGrammarClassification(True, "", tuple(accesses))
 
 
+def _is_plain_git_pathspec(value: str) -> bool:
+    return not value.startswith(":") and not any(marker in value for marker in "*?[]")
+
+
+def _is_plain_git_revision(value: str) -> bool:
+    return re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._/-]*", value) is not None
+
+
 __all__ = [
+    "BASH_APPROVED_BUILTINS",
+    "BASH_READ_CANDIDATES",
+    "BASH_WRITE_CANDIDATES",
     "GIT_READ_FORMS",
     "POWERSHELL_READ_CANDIDATES",
     "POWERSHELL_WRITE_CANDIDATES",
@@ -1621,7 +2718,10 @@ __all__ = [
     "ExecSyntaxConfidence",
     "ResolvedExecShell",
     "assess_command",
+    "bash_git_audit_targets",
+    "bash_recursive_forced_delete_targets",
     "catastrophic_matches",
+    "classify_bash_command",
     "classify_powershell_command",
     "powershell_git_audit_targets",
     "requires_legacy_destructive_confirmation",

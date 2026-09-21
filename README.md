@@ -100,6 +100,8 @@ Workspace 的 `.myclaw/schedule.json` 使用严格 canonical Schedule Job schema
 | `/dream` | 将待处理的会话摘要整理为长期记忆 |
 | `/reload_skill` | 重新加载 `~/.myclaw/skills/` 中的 Skill |
 
+POSIX Bash 在 Read-Only 和 Workspace-Write 下也使用严格 Exec 策略：只读候选为 `pwd`、`ls`、`cat`、`head`、`tail`、`wc`、`stat`、`file`、`grep`、`rg`、`find`、`sort`、`uniq`、`cut`、`diff`，写入候选为 `mkdir`、`touch`、`cp`、`mv`、`rm`。每个候选只接受固定参数语法和静态路径角色；固定的简单 pipeline 可以直通。Bash 命令必须是唯一的 PATH native executable，或受信任的 `pwd` builtin；重复 PATH、symlink、别名、函数、脚本、shim、Workspace executable、歧义/未知身份、动态展开、重定向、控制流、glob、follow/watch、外部预处理和 `find` action 都会请求一次确认。Read-Only 只允许 Workspace 读取，Workspace-Write 允许 Workspace 读取和写入；Full-Access 允许可解析的非灾难性动态 Bash Exec 直通，但灾难性操作和检查器不确定仍需确认。Bash Git 与 PowerShell Git 使用相同的固定环境隔离、diff/show 参数加固和 Workspace 内仓库配置审计。
+
 ## 项目架构
 
 CLI 负责组装运行时和管理组件生命周期。前台输入经终端与 Message Bus 进入 Agent Loop，由 Agent Runner 循环调用模型与工具，结果经 Message Bus 返回终端。

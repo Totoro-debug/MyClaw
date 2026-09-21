@@ -4,6 +4,27 @@ status: accepted
 
 # Fix the Built-in Tool Catalog and BaseTool Boundaries
 
+## Strict Bash Exec Boundary
+
+On POSIX Bash, Read-Only and Workspace-Write use the shared typed assessment
+with Bash-native facts. Direct read candidates are `pwd`, `ls`, `cat`, `head`,
+`tail`, `wc`, `stat`, `file`, `grep`, `rg`, `find`, `sort`, `uniq`, `cut`,
+and `diff`; direct write candidates are `mkdir`, `touch`, `cp`, `mv`, and
+`rm`. Each command has a fixed option grammar and explicit path roles.
+`grep`/`rg` patterns must be fixed, `find` cannot use action or delegation
+expressions, and `cp`/`mv` distinguish source reads from destination writes.
+A simple fixed pipeline is allowed when every command identity and operand is
+classified. Bash identities must resolve uniquely through the selected PATH to
+a native executable, or be the approved `pwd` builtin; duplicate PATH entries,
+symlinks, aliases, functions, scripts, shims, ambiguous or unknown identities,
+Workspace executables, dynamic expansions, redirection, command lists, control
+flow, glob/home expansion, follow/watch modes, external preprocessors, and
+unlisted commands require one confirmation. Read-Only permits
+only Workspace reads; Workspace-Write permits Workspace reads and writes.
+Full-Access allows parseable non-catastrophic dynamic Bash commands directly,
+but never bypasses catastrophic confirmation, inspector uncertainty, argument
+validation, capability errors, or Tool execution errors.
+
 The Runtime Generation Tool Catalog contains these ten Built-in Tools in fixed order: Read File, Write File, Edit File, List Dir, Glob, Grep, Exec, Web Search, Web Fetch, and Schedule. Configured MCP Tools follow them as defined by [ADR-0020](0020-expose-configured-mcp-tools-through-tool-gateway.md). Foreground and User Schedule Agent Run Tool Catalogs add the run-local Built-in Tool Search; the User Schedule Catalog also excludes Schedule, as defined by [ADR-0021](0021-defer-tool-schema-exposure-per-agent-run.md). User Configuration cannot enable, disable, register, or replace any Built-in capability.
 
 `ToolGateway.call()` is the sole public invocation boundary. It parses raw Provider arguments, resolves a Tool, calls the final `BaseTool.prepare()` pipeline, obtains any one-shot confirmation, and invokes `execute_prepared()` before normalizing the result. Built-in preparation casts, defaults, filters, and validates with a temporary restricted Schema; MCP preparation preserves the complete argument object without those transformations. Each Tool exposes a `parameters` dictionary, and `to_schema()` returns a detached projection whenever that Tool is exposed in a Model request.

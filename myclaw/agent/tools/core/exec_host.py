@@ -9,6 +9,7 @@ import ntpath
 import os
 import posixpath
 import re
+import shlex
 import shutil
 import subprocess
 from collections.abc import Callable, Mapping
@@ -17,14 +18,19 @@ from pathlib import Path
 from typing import Any, Final, Protocol, cast
 
 from myclaw.agent.tools.core.exec_policy import (
+    BASH_APPROVED_BUILTINS,
     ExecAssessment,
     ExecCommandIdentity,
+    ExecDynamicConstruct,
+    ExecIdentityKind,
     ExecOutcome,
     ExecPlatform,
     ExecShellFamily,
     ExecShellSelector,
     ResolvedExecShell,
     assess_command,
+    bash_git_audit_targets,
+    classify_bash_command,
     classify_powershell_command,
     powershell_git_audit_targets,
 )
@@ -50,6 +56,18 @@ _WINDOWS_ENVIRONMENT: Final[tuple[str, ...]] = (
 )
 _PS_FLAGS: Final[tuple[str, ...]] = ("-NoLogo", "-NoProfile", "-NonInteractive")
 _BASH_FLAGS: Final[tuple[str, ...]] = ("--noprofile", "--norc")
+_NATIVE_EXECUTABLE_MAGICS: Final[frozenset[bytes]] = frozenset(
+    {
+        b"\xbe\xba\xfe\xca",
+        b"\xbf\xba\xfe\xca",
+        b"\xca\xfe\xba\xbe",
+        b"\xca\xfe\xba\xbf",
+        b"\xce\xfa\xed\xfe",
+        b"\xcf\xfa\xed\xfe",
+        b"\xfe\xed\xfa\xce",
+        b"\xfe\xed\xfa\xcf",
+    }
+)
 _BACKGROUND_CLEANUPS: Final[set[asyncio.Task[None]]] = set()
 _PS_VERSION_PREFIX: Final[str] = "MYCLAW_PS_VERSION:"
 _GIT_HARDENED_FORM_PATTERN: Final[re.Pattern[str]] = re.compile(
@@ -513,10 +531,10 @@ class _BaseExecHost:
 
     def environment_for_command(self, command: str) -> dict[str, str]:
         environment = self.resolved_shell.env
-        if self.resolved_shell.family not in {"powershell", "pwsh"}:
+        if self.resolved_shell.family not in {"powershell", "pwsh", "bash"}:
             return environment
         if re.search(r"(?:^|[|;\s])git(?:\.exe)?(?:\s|$)", command, re.IGNORECASE):
-            null_device = "NUL" if self.resolved_shell.platform == "windows" else os.devnull
+            null_device = "NUL" if self.resolved_shell.platform == "windows" else "/dev/null"
             environment.update(
                 {
                     "GIT_CONFIG_NOSYSTEM": "1",
@@ -548,7 +566,7 @@ class _BaseExecHost:
         git_executable: str | None = None,
     ) -> str:
         """Add fixed Git flags that disable configuration-driven diff execution."""
-        if self.resolved_shell.family not in {"powershell", "pwsh"}:
+        if self.resolved_shell.family not in {"powershell", "pwsh", "bash"}:
             return command
         match = _GIT_HARDENED_FORM_PATTERN.fullmatch(command)
         if match is None:
@@ -556,8 +574,11 @@ class _BaseExecHost:
         requested = match.group("requested")
         invocation = requested
         if git_executable is not None:
-            quoted = git_executable.replace("'", "''")
-            invocation = f"& '{quoted}'"
+            if self.resolved_shell.family == "bash":
+                invocation = shlex.quote(git_executable)
+            else:
+                quoted = git_executable.replace("'", "''")
+                invocation = f"& '{quoted}'"
         flags = _GIT_HARDENED_FLAGS if match.group("form").casefold() in {"diff", "show"} else ""
         return (
             f"{match.group('leading')}{invocation}{match.group('global')} "
@@ -622,13 +643,24 @@ class BashExecHost(_BaseExecHost):
     """POSIX Bash Host using a no-profile, no-rc process policy."""
 
     async def inspect(self, command: str, cwd: Path) -> ExecAssessment:
-        del cwd
+        try:
+            source_bytes = command.encode("utf-8")
+        except UnicodeEncodeError:
+            return ExecAssessment.uncertain_result(
+                "Bash AST input encoding was invalid.",
+                status="uncertain",
+            )
+        if len(source_bytes) > _INSPECTION_MAX_COMMAND_LENGTH:
+            return ExecAssessment.uncertain_result(
+                "Bash AST input exceeded the inspection limit.",
+                status="uncertain",
+            )
         try:
             import tree_sitter_bash
             from tree_sitter import Language, Parser
 
             parser = Parser(Language(tree_sitter_bash.language()))
-            tree = parser.parse(command.encode("utf-8"))
+            tree = parser.parse(source_bytes)
         except (ImportError, OSError, TypeError, ValueError):
             return ExecAssessment.uncertain_result(
                 "Bash AST inspection is unavailable.",
@@ -641,31 +673,179 @@ class BashExecHost(_BaseExecHost):
             )
 
         root = tree.root_node
-        if root.has_error:
+        command_names = _tree_command_names(root, command)
+        if not _bash_tree_is_complete(root, len(source_bytes)):
             return assess_command(
                 command,
                 family="bash",
                 syntax_confidence="unknown",
                 syntax_uncertain=True,
+                command_names=command_names,
                 diagnostics=("Bash AST syntax was malformed.",),
                 inspector_status="uncertain",
             )
-        return assess_command(
+        assessment = assess_command(
             command,
             family="bash",
             syntax_confidence="high",
             syntax_uncertain=False,
-            command_names=_tree_command_names(root, command),
+            command_names=command_names,
+            command_identities=_tree_command_identities(
+                command_names,
+                cwd=cwd,
+                environment=self.resolved_shell.env,
+            ),
+            dynamic_constructs=_bash_dynamic_constructs(root),
         )
+        grammar = classify_bash_command(command, assessment)
+        return replace(assessment, file_accesses=grammar.file_accesses)
 
     async def execute(self, command: str, cwd: Path, timeout: int) -> ExecOutcome:
+        return await self.execute_assessed(command, cwd, timeout, assessment=None)
+
+    async def execute_assessed(
+        self,
+        command: str,
+        cwd: Path,
+        timeout: int,
+        *,
+        assessment: ExecAssessment | None,
+    ) -> ExecOutcome:
         spec = self.process_spec(cwd)
+        git_executable = self._assessed_git_executable(assessment)
         return await self._run(
-            (spec.executable, *spec.flags, "-c", self.command_for_execution(command)),
+            (
+                spec.executable,
+                *spec.flags,
+                "-c",
+                self.command_for_execution(command, git_executable=git_executable),
+            ),
             cwd=spec.cwd,
             timeout=timeout,
             environment=self.environment_for_command(command),
         )
+
+    async def audit_git_delegation(
+        self,
+        command: str,
+        cwd: Path,
+        workspace_root: Path,
+        assessment: ExecAssessment,
+    ) -> ExecAssessment:
+        """Complete Git facts only after Workspace boundaries are available."""
+        targets = bash_git_audit_targets(command, str(cwd))
+        if not targets:
+            return assessment
+        provisional = replace(assessment, git_delegation_safe=True)
+        if not classify_bash_command(command, provisional).accepted:
+            return assessment
+        try:
+            root = workspace_root.resolve(strict=True)
+            for identity_index, target in targets:
+                identity = assessment.command_identities[identity_index]
+                if (
+                    identity.kind != "native"
+                    or identity.resolution_count != 1
+                    or identity.resolved is None
+                    or not os.path.isabs(identity.resolved)
+                ):
+                    return assessment
+                executable = Path(identity.resolved)
+                if _is_lexically_within(executable, root):
+                    return assessment
+                canonical_executable = executable.resolve(strict=False)
+                if _is_host_path_within(canonical_executable, root):
+                    return assessment
+                candidate = Path(target)
+                if not _is_lexically_within(candidate, root):
+                    return assessment
+                canonical_target = candidate.resolve(strict=True)
+                if not canonical_target.is_dir() or not _is_host_path_within(
+                    canonical_target,
+                    root,
+                ):
+                    return assessment
+        except (IndexError, OSError, RuntimeError, ValueError):
+            return assessment
+        git_delegation_safe, audit_failed = await self._audit_git_delegation(
+            command,
+            cwd,
+            assessment.command_identities,
+        )
+        if audit_failed:
+            return ExecAssessment.uncertain_result(
+                "Git repository delegation inspection failed.",
+                status="failed",
+                catastrophic=assessment.catastrophic_matches,
+            )
+        return replace(assessment, git_delegation_safe=git_delegation_safe)
+
+    @staticmethod
+    def _assessed_git_executable(assessment: ExecAssessment | None) -> str | None:
+        if assessment is None or not assessment.command_identities:
+            return None
+        identity = assessment.command_identities[0]
+        if (
+            identity.requested not in {"git", "git.exe"}
+            or identity.kind != "native"
+            or identity.resolution_count != 1
+            or identity.resolved is None
+            or not os.path.isabs(identity.resolved)
+        ):
+            return None
+        return identity.resolved
+
+    async def _audit_git_delegation(
+        self,
+        command: str,
+        cwd: Path,
+        identities: tuple[ExecCommandIdentity, ...],
+    ) -> tuple[bool | None, bool]:
+        targets = bash_git_audit_targets(command, str(cwd))
+        if not targets:
+            return None, False
+        audited = False
+        for identity_index, target in targets:
+            if identity_index >= len(identities):
+                return None, True
+            identity = identities[identity_index]
+            if (
+                identity.kind != "native"
+                or identity.resolution_count != 1
+                or identity.resolved is None
+                or not os.path.isabs(identity.resolved)
+            ):
+                continue
+            audited = True
+            try:
+                outcome = await self._run(
+                    (
+                        identity.resolved,
+                        "-C",
+                        target,
+                        "config",
+                        "--no-includes",
+                        "--name-only",
+                        "--get-regexp",
+                        _GIT_DELEGATION_CONFIG_PATTERN,
+                    ),
+                    cwd=cwd,
+                    timeout=_INSPECTION_TIMEOUT,
+                    environment=self.environment_for_command("git"),
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                return None, True
+            if outcome.timed_out or outcome.stderr:
+                return None, True
+            if outcome.exit_code == 0:
+                if outcome.stdout.strip():
+                    return False, False
+                continue
+            if outcome.exit_code != 1:
+                return None, True
+        return (True if audited else None), False
 
 
 class PowerShellExecHost(_BaseExecHost):
@@ -1173,6 +1353,234 @@ def _as_bytes(value: bytes | None) -> bytes:
     return b"" if value is None else value
 
 
+def _bash_tree_is_complete(root: Any, source_length: int) -> bool:
+    if (
+        getattr(root, "type", None) != "program"
+        or getattr(root, "start_byte", None) != 0
+        or getattr(root, "end_byte", None) != source_length
+        or bool(getattr(root, "has_error", True))
+    ):
+        return False
+    stack = [root]
+    while stack:
+        node = stack.pop()
+        if (
+            getattr(node, "type", None) == "ERROR"
+            or bool(getattr(node, "is_error", False))
+            or bool(getattr(node, "is_missing", False))
+        ):
+            return False
+        stack.extend(getattr(node, "children", ()))
+    return True
+
+
+def _tree_command_identities(
+    command_names: tuple[str, ...],
+    *,
+    cwd: Path,
+    environment: Mapping[str, str],
+) -> tuple[ExecCommandIdentity, ...]:
+    return tuple(
+        _resolve_bash_identity(name, cwd=cwd, environment=environment)
+        for name in command_names
+    )
+
+
+def _resolve_bash_identity(
+    requested: str,
+    *,
+    cwd: Path,
+    environment: Mapping[str, str],
+) -> ExecCommandIdentity:
+    if requested in BASH_APPROVED_BUILTINS:
+        return ExecCommandIdentity(
+            requested=requested,
+            canonical=requested,
+            kind="builtin",
+            resolution_count=1,
+        )
+    candidates = _bash_executable_candidates(requested, cwd=cwd, environment=environment)
+    if not candidates:
+        return ExecCommandIdentity(requested=requested, resolution_count=0, kind="unknown")
+    if len(candidates) > 1:
+        return ExecCommandIdentity(requested=requested, resolution_count=len(candidates), kind="ambiguous")
+    resolved, is_symlink = candidates[0]
+    return ExecCommandIdentity(
+        requested=requested,
+        resolved=resolved,
+        canonical=Path(resolved).name,
+        kind="shim" if is_symlink else _bash_executable_kind(resolved, cwd=cwd),
+        resolution_count=1,
+    )
+
+
+def _bash_executable_candidates(
+    requested: str,
+    *,
+    cwd: Path,
+    environment: Mapping[str, str],
+) -> tuple[tuple[str, bool], ...]:
+    if not requested or requested in {".", ".."}:
+        return ()
+    raw_candidates: list[Path] = []
+    if "/" in requested:
+        candidate = Path(requested)
+        raw_candidates.append(candidate if candidate.is_absolute() else cwd / candidate)
+    else:
+        for raw_entry in environment.get("PATH", "").split(os.pathsep):
+            entry = Path(raw_entry) if raw_entry else cwd
+            if not entry.is_absolute():
+                entry = cwd / entry
+            raw_candidates.append(entry / requested)
+    resolved: list[tuple[str, bool]] = []
+    for candidate in raw_candidates:
+        try:
+            if not candidate.is_file() or not os.access(candidate, os.X_OK):
+                continue
+            is_symlink = candidate.is_symlink()
+            value = str(candidate.resolve(strict=True))
+        except (OSError, RuntimeError, ValueError):
+            continue
+        resolved.append((value, is_symlink))
+    return tuple(resolved)
+
+
+def _bash_executable_kind(resolved: str, *, cwd: Path) -> ExecIdentityKind:
+    path = Path(resolved)
+    try:
+        if _is_host_path_within(path, cwd.resolve(strict=True)):
+            return "workspace"
+    except (OSError, RuntimeError, ValueError):
+        return "unknown"
+    if path.suffix.casefold() in {".shim", ".cmd", ".bat", ".com"}:
+        return "shim"
+    if path.suffix.casefold() in {".sh", ".bash", ".zsh", ".fish", ".py", ".pl", ".rb"}:
+        return "script"
+    try:
+        with path.open("rb") as stream:
+            header = stream.read(4)
+    except OSError:
+        return "unknown"
+    if header.startswith(b"#!"):
+        return "script"
+    if header.startswith(b"\x7fELF") or header in _NATIVE_EXECUTABLE_MAGICS:
+        return "native"
+    return "script"
+
+
+def _bash_dynamic_constructs(root: Any) -> tuple[ExecDynamicConstruct, ...]:
+    constructs: list[ExecDynamicConstruct] = []
+    seen: set[tuple[str, str]] = set()
+    node_kinds = {
+        "variable_assignment": ("assignment", "variable assignment"),
+        "command_substitution": ("substitution", "command substitution"),
+        "process_substitution": ("substitution", "process substitution"),
+        "simple_expansion": ("variable", "variable expansion"),
+        "parameter_expansion": ("variable", "variable expansion"),
+        "arithmetic_expansion": ("variable", "arithmetic expansion"),
+        "ansi_c_string": ("syntax", "ANSI-C quoted string"),
+        "$": ("variable", "locale-translated or variable string"),
+        "file_redirect": ("redirection", "stream redirection"),
+        "heredoc_redirect": ("redirection", "here-document redirection"),
+        "heredoc_body": ("redirection", "here-document body"),
+        "herestring_redirect": ("redirection", "here-string redirection"),
+        "function_definition": ("control-flow", "function definition"),
+        "if_statement": ("control-flow", "conditional statement"),
+        "for_statement": ("control-flow", "for loop"),
+        "c_style_for_statement": ("control-flow", "C-style for loop"),
+        "while_statement": ("control-flow", "while loop"),
+        "until_statement": ("control-flow", "until loop"),
+        "case_statement": ("control-flow", "case statement"),
+        "subshell": ("control-flow", "subshell"),
+        "compound_statement": ("control-flow", "compound statement"),
+        "comment": ("syntax", "shell comment"),
+        ";": ("command-list", "command list"),
+        "&&": ("command-list", "conditional command list"),
+        "||": ("command-list", "conditional command list"),
+        "&": ("command-list", "background command list"),
+    }
+    indirect_names = {
+        ".",
+        "bash",
+        "builtin",
+        "command",
+        "dash",
+        "doas",
+        "env",
+        "eval",
+        "exec",
+        "make",
+        "nice",
+        "node",
+        "nohup",
+        "npm",
+        "npx",
+        "perl",
+        "python",
+        "python3",
+        "ruby",
+        "sh",
+        "source",
+        "sudo",
+        "time",
+        "xargs",
+        "zsh",
+    }
+
+    def add(kind: str, expression: str) -> None:
+        key = (kind, expression)
+        if key not in seen:
+            seen.add(key)
+            constructs.append(ExecDynamicConstruct(kind, expression))
+
+    stack = [root]
+    while stack:
+        node = stack.pop()
+        node_type = getattr(node, "type", "")
+        expression = _tree_node_text(node)
+        classification = node_kinds.get(node_type)
+        if classification is not None:
+            add(classification[0], classification[1])
+        if node_type == "word" and _bash_word_has_dynamic_expansion(expression):
+            add("glob", "unquoted glob or home expansion")
+        if node_type == "command":
+            command_name = next(
+                (
+                    _tree_node_text(child)
+                    for child in getattr(node, "children", ())
+                    if getattr(child, "type", None) == "command_name"
+                ),
+                "",
+            )
+            if command_name.casefold() in indirect_names:
+                add("indirect-invocation", "indirect or delegated command invocation")
+        stack.extend(reversed(tuple(getattr(node, "children", ()))))
+    return tuple(constructs)
+
+
+def _bash_word_has_dynamic_expansion(value: str) -> bool:
+    if value.startswith("~"):
+        return True
+    escaped = False
+    for character in value:
+        if escaped:
+            escaped = False
+            continue
+        if character == "\\":
+            escaped = True
+            continue
+        if character in "*?[]":
+            return True
+    return False
+
+
+def _tree_node_text(node: Any) -> str:
+    value = getattr(node, "text", b"")
+    if isinstance(value, bytes):
+        return value.decode("utf-8", errors="replace")
+    return str(value)
+
+
 def _tree_command_names(root: Any, source: str) -> tuple[str, ...]:
     names: list[str] = []
     stack = [root]
@@ -1183,7 +1591,7 @@ def _tree_command_names(root: Any, source: str) -> tuple[str, ...]:
             for child in getattr(node, "children", ()):
                 if getattr(child, "type", None) == "command_name":
                     name = encoded[child.start_byte : child.end_byte].decode("utf-8", errors="replace")
-                    if name and name not in names:
+                    if name:
                         names.append(name)
                     break
         stack.extend(reversed(tuple(getattr(node, "children", ()))))

@@ -976,6 +976,10 @@ async def test_every_cross_host_git_read_form_has_a_direct_powershell_fixture(
         "git log --format=$format",
         "git status --untracked-files=$mode",
         "git -C $repo status",
+        "git show :/needle",
+        "git rev-parse 'HEAD^{tree}'",
+        "git status -- ':!inside.txt'",
+        "git --config-env=core.pager=PAGER status",
         "Get-Location | git status",
     ),
 )
@@ -1080,7 +1084,7 @@ def test_git_environment_is_fixed_only_for_git_processes() -> None:
     assert host.command_for_execution("git status") == "git status"
 
 
-def test_bash_command_and_environment_are_not_rewritten_for_git() -> None:
+def test_bash_command_and_environment_are_hardened_for_git() -> None:
     resolved = resolve_exec_shell(
         "auto",
         platform="posix",
@@ -1089,8 +1093,17 @@ def test_bash_command_and_environment_are_not_rewritten_for_git() -> None:
     )
     host = create_exec_host(resolved)
 
-    assert host.environment_for_command("git diff --stat") == resolved.env  # type: ignore[attr-defined]
-    assert host.command_for_execution("git diff --stat") == "git diff --stat"  # type: ignore[attr-defined]
+    environment = host.environment_for_command("git diff --stat")  # type: ignore[attr-defined]
+    assert environment["GIT_CONFIG_NOSYSTEM"] == "1"
+    assert environment["GIT_CONFIG_GLOBAL"] == "/dev/null"
+    assert environment["GIT_PAGER"] == "cat"
+    assert environment["GIT_EXTERNAL_DIFF"] == ""
+    assert environment["GIT_OPTIONAL_LOCKS"] == "0"
+    assert environment["GIT_CONFIG_VALUE_1"] == "false"
+    assert environment["GIT_CONFIG_VALUE_3"] == "/dev/null"
+    assert host.command_for_execution("git diff --stat") == (  # type: ignore[attr-defined]
+        "git diff --no-ext-diff --no-textconv --stat"
+    )
 
 
 @pytest.mark.parametrize(
