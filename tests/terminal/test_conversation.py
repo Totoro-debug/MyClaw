@@ -35,6 +35,7 @@ from myclaw.agent.loop import AgentLoop, ConfirmationRequestView, ForegroundConv
 from myclaw.agent.memory.dream import DreamResult
 from myclaw.agent.message_bus import InboundMessage, MessageBus, OutboundMessage
 from myclaw.agent.session.session import Session
+from myclaw.agent.tools.permission import MCPToolIdentity
 from myclaw.agent.tools.tool_gateway import (
     ConfirmationDecision,
     ConfirmationRequest,
@@ -198,9 +199,10 @@ class ConfirmationRunSource(_ScriptedSource):
         self,
         *,
         tool_name: str = "read_file",
-        details: dict[str, str | int] | None = None,
+        details: dict[str, Any] | None = None,
         reason: str = "The requested path is outside the current Workspace.",
         warnings: tuple[str, ...] = (),
+        mcp_identity: MCPToolIdentity | None = None,
     ) -> None:
         self.submissions: list[str] = []
         self.responses: list[tuple[UUID, ConfirmationDecision]] = []
@@ -215,6 +217,7 @@ class ConfirmationRunSource(_ScriptedSource):
             details=({"path": "outside.txt"} if details is None else cast(JsonObject, details)),
             warnings=warnings,
             reason=reason,
+            mcp_identity=mcp_identity,
         )
 
     async def run(self, text: str) -> AsyncIterator[OutboundMessage | ConfirmationRequest]:
@@ -3455,6 +3458,47 @@ async def test_write_confirmation_hides_content_and_unknown_details() -> None:
         assert "raw-result" not in visible_text
         assert all("sk-sensitive-value" not in detail for detail in details)
         assert all("raw-result" not in detail for detail in details)
+
+        await pilot.press("escape")
+        await asyncio.wait_for(submission, timeout=1)
+        await _wait_for_turn(app)
+
+
+@pytest.mark.asyncio
+async def test_mcp_confirmation_shows_stable_identity_and_complete_arguments() -> None:
+    arguments = {
+        "nested": {"unicode": "\u5b8c\u6574\u53c2\u6570", "nullable": None},
+        "items": [1, True, {"value": "x" * 512}],
+    }
+    identity = MCPToolIdentity(
+        server_name="calendar-server",
+        remote_name="create_event",
+        model_name="mcp_calendar-server_create_event",
+    )
+    conversation = ConfirmationRunSource(
+        tool_name=identity.model_name,
+        details=arguments,
+        reason="MCP Tool invocation requires confirmation.",
+        mcp_identity=identity,
+    )
+    runtime = _terminal_backend(conversation)
+    app = _terminal_app(cast(Any, runtime))
+
+    async with app.run_test(size=(100, 30)) as pilot:
+        submission = asyncio.create_task(pilot.press(*list("create event"), "enter"))
+        await asyncio.wait_for(conversation.confirmation_requested.wait(), timeout=1)
+        await _wait_for_confirmation(app, pilot)
+
+        details = [
+            str(cast(Static, item).content) for item in app.screen.query(".confirmation-details")
+        ]
+        assert details == [
+            "MCP Server: calendar-server",
+            "Remote Tool: create_event",
+            "Model Tool: mcp_calendar-server_create_event",
+            "Arguments: "
+            + json.dumps(arguments, ensure_ascii=False, separators=(",", ":")),
+        ]
 
         await pilot.press("escape")
         await asyncio.wait_for(submission, timeout=1)

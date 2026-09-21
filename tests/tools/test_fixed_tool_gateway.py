@@ -14,6 +14,7 @@ from myclaw.agent.tools.base import BaseTool
 from myclaw.agent.tools.deferred import RUN_BASELINE_TOOL_NAMES, build_agent_run_gateway
 from myclaw.agent.tools.mcp import MCPTool, MCPToolSpec
 from myclaw.agent.tools.mcp_runtime import MCPRuntimeManager, allocate_mcp_tool_name
+from myclaw.agent.tools.permission import PermissionContext
 from myclaw.agent.tools.tool_gateway import (
     ConfirmationDecision,
     ConfirmationRequest,
@@ -211,6 +212,65 @@ def test_agent_run_gateway_starts_with_search_baseline_and_activates_deferred_to
         "mcp_alpha_calendar_events",
         "tool_search",
     )
+
+
+@pytest.mark.parametrize("level", ["read-only", "workspace-write", "full-access"])
+def test_mcp_catalog_exposure_activation_and_search_ignore_permission_level(
+    workspace: Path,
+    agent_home: Path,
+    level: str,
+) -> None:
+    remote_tool = MCPTool(
+        MCPToolSpec(
+            server_name="alpha",
+            remote_name="calendar_events",
+            model_name="mcp_alpha_calendar_events",
+            description="Read calendar events.",
+            parameters={"type": "object", "properties": {}},
+        ),
+        _MCPCallSession(),
+    )
+    run_gateway = build_agent_run_gateway(
+        _gateway(workspace, agent_home, additional_tools=(remote_tool,)),
+        mcp_keywords={"mcp_alpha_calendar_events": ("calendar", "events")},
+        permission_context=PermissionContext(
+            level=level,  # type: ignore[arg-type]
+            origin="foreground",
+        ),
+    )
+    catalog_names = tuple(tool.name for tool in run_gateway.catalog)
+    baseline_schema = next(
+        schema
+        for schema in run_gateway.schemas
+        if schema["function"]["name"] == "read_file"
+    )
+    expected_mcp_schema = remote_tool.to_schema()
+
+    assert "mcp_alpha_calendar_events" in catalog_names
+    assert "mcp_alpha_calendar_events" not in run_gateway.exposed_names
+    result = asyncio.run(
+        run_gateway.call(
+            ModelToolCall(
+                id=f"search-calendar-{level}",
+                name="tool_search",
+                arguments=json.dumps({"query": "calendar"}),
+            )
+        )
+    )
+
+    assert result.status == "success"
+    assert json.loads(result.content) == ["mcp_alpha_calendar_events"]
+    assert "mcp_alpha_calendar_events" in run_gateway.exposed_names
+    assert next(
+        schema
+        for schema in run_gateway.schemas
+        if schema["function"]["name"] == "mcp_alpha_calendar_events"
+    ) == expected_mcp_schema
+    assert next(
+        schema
+        for schema in run_gateway.schemas
+        if schema["function"]["name"] == "read_file"
+    ) == baseline_schema
 
 
 @pytest.mark.asyncio

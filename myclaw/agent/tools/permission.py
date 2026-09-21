@@ -115,6 +115,31 @@ class FileAccess:
             raise TypeError("File access roots must be Paths")
 
 
+@dataclass(frozen=True, slots=True)
+class MCPToolIdentity:
+    """Stable identity for one discovered MCP Tool invocation."""
+
+    server_name: str
+    remote_name: str
+    model_name: str
+
+    def __post_init__(self) -> None:
+        for value, field_name in (
+            (self.server_name, "server_name"),
+            (self.remote_name, "remote_name"),
+            (self.model_name, "model_name"),
+        ):
+            if not isinstance(value, str) or not value:
+                raise ValueError(f"MCP Tool identity {field_name} must be a non-empty string")
+
+    def to_dict(self) -> dict[str, str]:
+        return {
+            "server_name": self.server_name,
+            "remote_name": self.remote_name,
+            "model_name": self.model_name,
+        }
+
+
 def canonicalize_file_access(
     *,
     workspace: Path,
@@ -220,6 +245,7 @@ class ToolInvocationFacts:
     exec_assessment: ExecAssessment | None
     schedule_action: ScheduleAction | None
     network_targets: tuple[NetworkAssessment, ...]
+    mcp_identity: MCPToolIdentity | None
 
     def __init__(
         self,
@@ -231,6 +257,7 @@ class ToolInvocationFacts:
         exec_assessment: ExecAssessment | None = None,
         schedule_action: ScheduleAction | None = None,
         network_targets: tuple[NetworkAssessment, ...] = (),
+        mcp_identity: MCPToolIdentity | None = None,
     ) -> None:
         if not isinstance(tool_name, str) or not tool_name:
             raise TypeError("Tool invocation tool_name must be a non-empty string")
@@ -240,6 +267,8 @@ class ToolInvocationFacts:
             raise TypeError("Tool invocation argument names must be strings")
         if legacy_safety_reason is not None and not isinstance(legacy_safety_reason, str):
             raise TypeError("Tool invocation legacy_safety_reason must be a string or None")
+        if mcp_identity is not None and not isinstance(mcp_identity, MCPToolIdentity):
+            raise TypeError("Tool invocation MCP identity must be MCPToolIdentity or None")
         object.__setattr__(self, "tool_name", tool_name)
         object.__setattr__(self, "_normalized_arguments", deepcopy(dict(normalized_arguments)))
         object.__setattr__(self, "legacy_safety_reason", legacy_safety_reason)
@@ -247,6 +276,7 @@ class ToolInvocationFacts:
         object.__setattr__(self, "exec_assessment", deepcopy(exec_assessment))
         object.__setattr__(self, "schedule_action", deepcopy(schedule_action))
         object.__setattr__(self, "network_targets", tuple(deepcopy(network_targets)))
+        object.__setattr__(self, "mcp_identity", deepcopy(mcp_identity))
 
     @property
     def normalized_arguments(self) -> dict[str, Any]:
@@ -302,6 +332,17 @@ class ToolPermissionPolicy:
         context: PermissionContext,
     ) -> ToolAuthorizationSession:
         """Classify one detached invocation without retaining mutable run state."""
+        if facts.mcp_identity is not None:
+            if context.origin != "foreground":
+                return _DecisionAuthorizationSession("direct")
+            if context.level is None:
+                return _LegacyAuthorizationSession(facts.legacy_safety_reason)
+            if context.level == "full-access":
+                return _DecisionAuthorizationSession("direct")
+            return _DecisionAuthorizationSession(
+                "confirm",
+                _mcp_confirmation_reason(facts.mcp_identity),
+            )
         if facts.network_targets and context.origin != "memory":
             return _NetworkAuthorizationSession(facts.network_targets, context.level)
         if (
@@ -425,6 +466,14 @@ class _DecisionAuthorizationSession:
         resolved_addresses: tuple[IPAddress, ...],
     ) -> None:
         del target, resolved_addresses
+
+
+def _mcp_confirmation_reason(identity: MCPToolIdentity) -> str:
+    return (
+        "MCP Tool "
+        f"server={identity.server_name} remote_tool={identity.remote_name} "
+        f"model_tool={identity.model_name} requires confirmation for this call."
+    )
 
 
 def _classify_exec_invocation(
@@ -731,6 +780,7 @@ __all__ = [
     "FileAccess",
     "FileAccessRole",
     "IPAddress",
+    "MCPToolIdentity",
     "NetworkAssessment",
     "NetworkConfirmationDecision",
     "NetworkConfirmationRequester",

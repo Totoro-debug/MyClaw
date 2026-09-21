@@ -29,7 +29,14 @@ from myclaw.agent.tools.mcp import (
     mcp_tool_spec_from_remote,
     normalize_nullable,
 )
-from myclaw.agent.tools.tool_gateway import ModelToolCall, ToolGateway
+from myclaw.agent.tools.permission import MCPToolIdentity, PermissionContext
+from myclaw.agent.tools.tool_gateway import (
+    ConfirmationDecision,
+    ConfirmationRequest,
+    ConfirmationRequester,
+    ModelToolCall,
+    ToolGateway,
+)
 from myclaw.config.config import MCPServerConfiguration
 from tests.fixtures.gateway import SingleToolGateway
 from tests.fixtures.mcp_wire import (
@@ -513,6 +520,349 @@ def _tool_for_session(
     )
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("level", "expects_confirmation"),
+    [
+        ("read-only", True),
+        ("workspace-write", True),
+        ("full-access", False),
+    ],
+)
+async def test_foreground_mcp_permission_level_controls_each_call(
+    level: str,
+    expects_confirmation: bool,
+) -> None:
+    session = _Session()
+    tool = _tool_for_session(session)
+    requests: list[ConfirmationRequest] = []
+
+    async def approve(request: ConfirmationRequest) -> ConfirmationDecision:
+        requests.append(request)
+        return "approved"
+
+    gateway = ToolGateway._for_memory(
+        (tool,),
+        permission_context=PermissionContext(level=level, origin="foreground"),  # type: ignore[arg-type]
+    )
+    arguments = {"nested": {"value": "normalized"}, "extra": [None]}
+
+    result = await gateway.call(
+        ModelToolCall(id="mcp-level", name=tool.name, arguments=json.dumps(arguments)),
+        confirmation=approve,
+    )
+
+    assert result.status == "success"
+    assert session.calls == [(tool.remote_name, arguments)]
+    assert len(requests) == int(expects_confirmation)
+    if expects_confirmation:
+        assert requests[0].details == arguments
+        assert requests[0].mcp_identity == MCPToolIdentity(
+            server_name="remote",
+            remote_name="remote_echo",
+            model_name="mcp_remote_echo",
+        )
+        assert result.confirmation is not None
+        assert result.confirmation.decision == "approved"
+    else:
+        assert result.confirmation is None
+
+
+@pytest.mark.asyncio
+async def test_low_permission_mcp_decline_never_reaches_transport() -> None:
+    session = _Session()
+    tool = _tool_for_session(session)
+    requests: list[ConfirmationRequest] = []
+
+    async def decline(request: ConfirmationRequest) -> ConfirmationDecision:
+        requests.append(request)
+        return "declined"
+
+    gateway = ToolGateway._for_memory(
+        (tool,),
+        permission_context=PermissionContext(level="read-only", origin="foreground"),
+    )
+    result = await gateway.call(
+        ModelToolCall(id="mcp-decline", name=tool.name, arguments='{"value":"blocked"}'),
+        confirmation=decline,
+    )
+
+    assert result.status == "refused"
+    assert len(requests) == 1
+    assert session.calls == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("confirmation_mode", ["missing", "failure", "invalid"])
+async def test_low_permission_mcp_confirmation_failure_never_reaches_transport(
+    confirmation_mode: str,
+) -> None:
+    session = _Session()
+    tool = _tool_for_session(session)
+
+    async def fail_confirmation(request: ConfirmationRequest) -> ConfirmationDecision:
+        del request
+        raise RuntimeError("presenter failed")
+
+    async def invalid_confirmation(request: ConfirmationRequest) -> ConfirmationDecision:
+        del request
+        return cast(ConfirmationDecision, "unexpected")
+
+    confirmation: ConfirmationRequester | None
+    if confirmation_mode == "missing":
+        confirmation = None
+    elif confirmation_mode == "failure":
+        confirmation = fail_confirmation
+    else:
+        confirmation = invalid_confirmation
+
+    gateway = ToolGateway._for_memory(
+        (tool,),
+        permission_context=PermissionContext(level="read-only", origin="foreground"),
+    )
+    result = await gateway.call(
+        ModelToolCall(id=f"mcp-{confirmation_mode}", name=tool.name, arguments="{}"),
+        confirmation=confirmation,
+    )
+
+    assert result.status == "refused"
+    assert result.confirmation is not None
+    assert result.confirmation.decision is None
+    assert session.calls == []
+
+
+@pytest.mark.asyncio
+async def test_low_permission_mcp_repeated_calls_request_independent_approvals() -> None:
+    session = _Session()
+    tool = _tool_for_session(session)
+    requests: list[ConfirmationRequest] = []
+
+    async def approve(request: ConfirmationRequest) -> ConfirmationDecision:
+        requests.append(request)
+        return "approved"
+
+    gateway = ToolGateway._for_memory(
+        (tool,),
+        permission_context=PermissionContext(level="workspace-write", origin="foreground"),
+    )
+    first_arguments = {"value": "same"}
+    second_arguments = {"value": "same"}
+    first = await gateway.call(
+        ModelToolCall(id="mcp-repeat-1", name=tool.name, arguments=json.dumps(first_arguments)),
+        confirmation=approve,
+    )
+    second = await gateway.call(
+        ModelToolCall(id="mcp-repeat-2", name=tool.name, arguments=json.dumps(second_arguments)),
+        confirmation=approve,
+    )
+
+    assert first.status == second.status == "success"
+    assert len(requests) == 2
+    assert requests[0].confirmation_id != requests[1].confirmation_id
+    assert [request.details for request in requests] == [first_arguments, second_arguments]
+    assert session.calls == [
+        (tool.remote_name, first_arguments),
+        (tool.remote_name, second_arguments),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_replacement_mcp_identity_does_not_inherit_an_earlier_approval() -> None:
+    first_session = _Session()
+    replacement_session = _Session()
+    first_tool = MCPTool(
+        MCPToolSpec(
+            server_name="alpha",
+            remote_name="echo",
+            model_name="mcp_echo",
+            description="First generation echo.",
+            parameters={"type": "object"},
+        ),
+        first_session,
+    )
+    replacement_tool = MCPTool(
+        MCPToolSpec(
+            server_name="beta",
+            remote_name="echo",
+            model_name="mcp_echo",
+            description="Replacement generation echo.",
+            parameters={"type": "object"},
+        ),
+        replacement_session,
+    )
+    requests: list[ConfirmationRequest] = []
+
+    async def approve(request: ConfirmationRequest) -> ConfirmationDecision:
+        requests.append(request)
+        return "approved"
+
+    for tool in (first_tool, replacement_tool):
+        gateway = ToolGateway._for_memory(
+            (tool,),
+            permission_context=PermissionContext(level="read-only", origin="foreground"),
+        )
+        result = await gateway.call(
+            ModelToolCall(id=f"call-{tool.server_name}", name=tool.name, arguments="{}"),
+            confirmation=approve,
+        )
+        assert result.status == "success"
+
+    assert [request.mcp_identity for request in requests] == [
+        MCPToolIdentity(server_name="alpha", remote_name="echo", model_name="mcp_echo"),
+        MCPToolIdentity(server_name="beta", remote_name="echo", model_name="mcp_echo"),
+    ]
+    assert first_session.calls == [("echo", {})]
+    assert replacement_session.calls == [("echo", {})]
+
+
+@pytest.mark.asyncio
+async def test_concurrent_foreground_mcp_calls_keep_confirmation_state_isolated() -> None:
+    session = _Session()
+    tool = _tool_for_session(session)
+    requests: list[ConfirmationRequest] = []
+
+    async def approve(request: ConfirmationRequest) -> ConfirmationDecision:
+        requests.append(request)
+        await asyncio.sleep(0)
+        return "approved"
+
+    gateway = ToolGateway._for_memory(
+        (tool,),
+        permission_context=PermissionContext(level="read-only", origin="foreground"),
+    )
+    results = await asyncio.gather(
+        gateway.call(
+            ModelToolCall(
+                id="mcp-concurrent-1",
+                name=tool.name,
+                arguments='{"value":"one"}',
+            ),
+            confirmation=approve,
+        ),
+        gateway.call(
+            ModelToolCall(
+                id="mcp-concurrent-2",
+                name=tool.name,
+                arguments='{"value":"two"}',
+            ),
+            confirmation=approve,
+        ),
+    )
+
+    assert [result.status for result in results] == ["success", "success"]
+    assert len(requests) == 2
+    assert {request.tool_call_id for request in requests} == {
+        "mcp-concurrent-1",
+        "mcp-concurrent-2",
+    }
+    assert {tuple(sorted(request.details.items())) for request in requests} == {
+        (("value", "one"),),
+        (("value", "two"),),
+    }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("level", ["read-only", "workspace-write", "full-access"])
+async def test_mcp_parse_and_lookup_errors_precede_permission_at_every_level(level: str) -> None:
+    session = _Session()
+    tool = _tool_for_session(session)
+    requests: list[ConfirmationRequest] = []
+
+    async def unexpected_confirmation(request: ConfirmationRequest) -> ConfirmationDecision:
+        requests.append(request)
+        raise AssertionError("hard MCP errors must not request confirmation")
+
+    gateway = ToolGateway._for_memory(
+        (tool,),
+        permission_context=PermissionContext(level=level, origin="foreground"),  # type: ignore[arg-type]
+    )
+    invalid_json = await gateway.call(
+        ModelToolCall(id="mcp-invalid-json", name=tool.name, arguments="not-json"),
+        confirmation=unexpected_confirmation,
+    )
+    unknown_tool = await gateway.call(
+        ModelToolCall(id="mcp-unknown", name="mcp_remote_missing", arguments="{}"),
+        confirmation=unexpected_confirmation,
+    )
+
+    assert invalid_json.status == unknown_tool.status == "error"
+    assert requests == []
+    assert session.calls == []
+
+
+@pytest.mark.asyncio
+async def test_mcp_schedule_context_calls_directly_without_confirmation() -> None:
+    session = _Session()
+    tool = _tool_for_session(session)
+
+    async def unexpected_confirmation(request: ConfirmationRequest) -> ConfirmationDecision:
+        raise AssertionError(f"Schedule MCP calls must execute without confirmation: {request}")
+
+    gateway = ToolGateway._for_memory(
+        (tool,),
+        permission_context=PermissionContext(level="read-only", origin="schedule"),
+    )
+    result = await gateway.call(
+        ModelToolCall(id="mcp-schedule", name=tool.name, arguments='{"value":"direct"}'),
+        confirmation=unexpected_confirmation,
+    )
+
+    assert result.status == "success"
+    assert session.calls == [(tool.remote_name, {"value": "direct"})]
+
+
+@pytest.mark.asyncio
+async def test_approved_mcp_transport_failure_preserves_gateway_error() -> None:
+    class FailingSession:
+        async def call_tool(self, name: str, arguments: dict[str, Any]) -> object:
+            del name, arguments
+            raise RuntimeError("private transport failure")
+
+    tool = _tool_for_session(FailingSession())
+    requests: list[ConfirmationRequest] = []
+
+    async def approve(request: ConfirmationRequest) -> ConfirmationDecision:
+        requests.append(request)
+        return "approved"
+
+    gateway = ToolGateway._for_memory(
+        (tool,),
+        permission_context=PermissionContext(level="read-only", origin="foreground"),
+    )
+    result = await gateway.call(
+        ModelToolCall(id="mcp-transport-error", name=tool.name, arguments="{}"),
+        confirmation=approve,
+    )
+
+    assert result.status == "error"
+    assert result.content == "mcp_remote_echo could not complete the request."
+    assert len(requests) == 1
+
+
+@pytest.mark.asyncio
+async def test_approved_mcp_cancellation_propagates_unchanged() -> None:
+    class CancelledSession:
+        async def call_tool(self, name: str, arguments: dict[str, Any]) -> object:
+            del name, arguments
+            raise asyncio.CancelledError
+
+    tool = _tool_for_session(CancelledSession())
+
+    async def approve(request: ConfirmationRequest) -> ConfirmationDecision:
+        del request
+        return "approved"
+
+    gateway = ToolGateway._for_memory(
+        (tool,),
+        permission_context=PermissionContext(level="workspace-write", origin="foreground"),
+    )
+    with pytest.raises(asyncio.CancelledError):
+        await gateway.call(
+            ModelToolCall(id="mcp-cancelled", name=tool.name, arguments="{}"),
+            confirmation=approve,
+        )
+
+
 class _ResultSession:
     def __init__(self, result: object) -> None:
         self.result = result
@@ -618,13 +968,25 @@ async def test_mcp_call_timeout_is_a_tool_error_without_marking_connection_unava
             raise TimeoutError("transport timeout")
 
     tool = _tool_for_session(_ImmediateTimeoutSession(), call_timeout=0.01)
-    result = await ToolGateway._for_memory((tool,)).call(
-        ModelToolCall(id="call-timeout", name=tool.name, arguments="{}")
+    requests: list[ConfirmationRequest] = []
+
+    async def approve(request: ConfirmationRequest) -> ConfirmationDecision:
+        requests.append(request)
+        return "approved"
+
+    gateway = ToolGateway._for_memory(
+        (tool,),
+        permission_context=PermissionContext(level="read-only", origin="foreground"),
+    )
+    result = await gateway.call(
+        ModelToolCall(id="call-timeout", name=tool.name, arguments="{}"),
+        confirmation=approve,
     )
 
     assert result.status == "error"
     assert "timed out" in result.content
     assert tool.unavailable is False
+    assert len(requests) == 1
 
 
 @pytest.mark.asyncio
@@ -638,13 +1000,49 @@ async def test_hanging_mcp_call_is_bounded_by_tool_timeout() -> None:
             return CallToolResult(content=[])
 
     tool = _tool_for_session(_HangingSession(), call_timeout=0.01)
-    result = await ToolGateway._for_memory((tool,)).call(
-        ModelToolCall(id="call-hanging-timeout", name=tool.name, arguments="{}")
+
+    async def approve(request: ConfirmationRequest) -> ConfirmationDecision:
+        del request
+        return "approved"
+
+    gateway = ToolGateway._for_memory(
+        (tool,),
+        permission_context=PermissionContext(level="workspace-write", origin="foreground"),
+    )
+    result = await gateway.call(
+        ModelToolCall(id="call-hanging-timeout", name=tool.name, arguments="{}"),
+        confirmation=approve,
     )
 
     assert result.status == "error"
     assert result.content == "MCP Tool call timed out after 0.01 seconds."
     assert tool.unavailable is False
+
+
+@pytest.mark.asyncio
+async def test_approved_mcp_server_error_result_remains_a_tool_error() -> None:
+    tool = _tool_for_session(
+        _ResultSession(
+            CallToolResult(content=[TextContent(text="server failure")], is_error=True)
+        )
+    )
+    requests: list[ConfirmationRequest] = []
+
+    async def approve(request: ConfirmationRequest) -> ConfirmationDecision:
+        requests.append(request)
+        return "approved"
+
+    gateway = ToolGateway._for_memory(
+        (tool,),
+        permission_context=PermissionContext(level="read-only", origin="foreground"),
+    )
+    result = await gateway.call(
+        ModelToolCall(id="call-server-error", name=tool.name, arguments="{}"),
+        confirmation=approve,
+    )
+
+    assert (result.status, result.content) == ("error", "server failure")
+    assert len(requests) == 1
 
 
 @pytest.mark.asyncio
@@ -666,6 +1064,50 @@ async def test_closed_mcp_session_returns_safe_error_and_marks_connection() -> N
     )
     assert tool.unavailable is True
     assert marked == [True]
+
+
+@pytest.mark.asyncio
+async def test_unavailable_mcp_tool_is_a_hard_error_before_later_confirmation() -> None:
+    class _ClosedSession:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def call_tool(self, name: str, arguments: dict[str, Any]) -> object:
+            del name, arguments
+            self.calls += 1
+            raise MCPError(types.CONNECTION_CLOSED, "private transport detail")
+
+    session = _ClosedSession()
+    tool = _tool_for_session(session)
+    requests: list[ConfirmationRequest] = []
+
+    async def approve(request: ConfirmationRequest) -> ConfirmationDecision:
+        requests.append(request)
+        return "approved"
+
+    gateway = ToolGateway._for_memory(
+        (tool,),
+        permission_context=PermissionContext(level="read-only", origin="foreground"),
+    )
+    first = await gateway.call(
+        ModelToolCall(id="call-disconnect", name=tool.name, arguments="{}"),
+        confirmation=approve,
+    )
+    second = await gateway.call(
+        ModelToolCall(id="call-unavailable", name=tool.name, arguments="{}"),
+        confirmation=lambda request: pytest.fail(f"unexpected confirmation: {request}"),
+    )
+
+    assert (first.status, first.content) == (
+        "error",
+        "MCP Server connection is unavailable.",
+    )
+    assert (second.status, second.content) == (
+        "error",
+        "MCP Server connection is unavailable.",
+    )
+    assert len(requests) == 1
+    assert session.calls == 1
 
 
 @pytest.mark.asyncio

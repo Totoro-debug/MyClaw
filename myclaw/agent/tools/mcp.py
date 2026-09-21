@@ -29,6 +29,7 @@ from mcp_types.methods import validate_server_result
 from pydantic import ValidationError
 
 from myclaw.agent.tools.base import BaseTool, ToolError
+from myclaw.agent.tools.permission import MCPToolIdentity, ToolInvocationFacts
 from myclaw.config.config import MCPServerConfiguration
 from myclaw.utils.async_tasks import await_task_preserving_cancellation
 
@@ -118,10 +119,32 @@ class MCPTool(BaseTool):
 
     async def prepare_arguments(self, arguments: dict[str, Any]) -> dict[str, Any]:
         """Forward the complete argument object without local schema processing."""
+        if self._unavailable:
+            raise ToolError(_CONNECTION_UNAVAILABLE)
         return deepcopy(arguments)
+
+    def build_invocation_facts(
+        self,
+        prepared_arguments: dict[str, Any],
+        *,
+        safety_reason: str | None,
+    ) -> ToolInvocationFacts:
+        """Attach the complete remote identity to the normalized call facts."""
+        return ToolInvocationFacts(
+            tool_name=self.name,
+            normalized_arguments=prepared_arguments,
+            legacy_safety_reason=safety_reason,
+            mcp_identity=MCPToolIdentity(
+                server_name=self.server_name,
+                remote_name=self.remote_name,
+                model_name=self.name,
+            ),
+        )
 
     async def execute_prepared(self, arguments: dict[str, Any]) -> str:
         """Call the remote Tool and project its result to text."""
+        if self._unavailable:
+            raise ToolError(_CONNECTION_UNAVAILABLE)
         try:
             async with asyncio.timeout(self._call_timeout):
                 result = await self._session.call_tool(self.remote_name, deepcopy(arguments))
@@ -146,6 +169,9 @@ class MCPTool(BaseTool):
         self._unavailable = True
         if self._on_closed is not None:
             self._on_closed()
+
+    def _observe_connection_closed(self) -> None:
+        self._unavailable = True
 
 
 def normalize_nullable(value: Any) -> Any:
@@ -405,6 +431,8 @@ class MCPServerConnection:
         def on_closed() -> None:
             if self._close_requested is close_requested:
                 self._unavailable = True
+                for tool in self._tools:
+                    tool._observe_connection_closed()
 
         try:
             async with asyncio.timeout(float(self.configuration.connect_timeout)):

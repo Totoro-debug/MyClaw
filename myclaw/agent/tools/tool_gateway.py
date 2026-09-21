@@ -31,6 +31,7 @@ from myclaw.agent.tools.core.web_search import WebSearchTool
 from myclaw.agent.tools.core.write_file import WriteFileTool
 from myclaw.agent.tools.mcp import MCPTool
 from myclaw.agent.tools.permission import (
+    MCPToolIdentity,
     NetworkConfirmationDecision,
     PermissionContext,
     PermissionSnapshot,
@@ -75,6 +76,7 @@ class ConfirmationRequest:
     summary: str
     _details: dict[str, Any] = field(repr=False)
     warnings: tuple[str, ...] = ()
+    mcp_identity: MCPToolIdentity | None = None
 
     def __init__(
         self,
@@ -86,6 +88,7 @@ class ConfirmationRequest:
         warnings: tuple[str, ...] = (),
         *,
         reason: str = "",
+        mcp_identity: MCPToolIdentity | None = None,
     ) -> None:
         require_uuid4(confirmation_id, field="confirmation_id")
         if not isinstance(tool_call_id, str) or not tool_call_id:
@@ -98,6 +101,8 @@ class ConfirmationRequest:
             raise TypeError("confirmation reason must be a string")
         if not isinstance(details, dict):
             raise TypeError("confirmation details must be a JSON object")
+        if mcp_identity is not None and not isinstance(mcp_identity, MCPToolIdentity):
+            raise TypeError("confirmation MCP identity must be MCPToolIdentity or None")
         if not isinstance(warnings, (tuple, list)) or any(
             not isinstance(item, str) for item in warnings
         ):
@@ -109,6 +114,7 @@ class ConfirmationRequest:
         object.__setattr__(self, "summary", summary)
         object.__setattr__(self, "_details", deepcopy(details))
         object.__setattr__(self, "warnings", tuple(warnings))
+        object.__setattr__(self, "mcp_identity", deepcopy(mcp_identity))
 
     @property
     def details(self) -> dict[str, Any]:
@@ -116,7 +122,7 @@ class ConfirmationRequest:
         return deepcopy(self._details)
 
     def to_dict(self) -> dict[str, object]:
-        return {
+        result: dict[str, object] = {
             "confirmation_id": str(self.confirmation_id),
             "tool_call_id": self.tool_call_id,
             "tool_name": self.tool_name,
@@ -125,6 +131,9 @@ class ConfirmationRequest:
             "details": deepcopy(self._details),
             "warnings": list(self.warnings),
         }
+        if self.mcp_identity is not None:
+            result["mcp_identity"] = self.mcp_identity.to_dict()
+        return result
 
 
 @dataclass(frozen=True, slots=True)
@@ -455,6 +464,7 @@ class ToolGateway:
                 reason=reason,
                 summary=f"Confirm {tool.name}"[:240],
                 details=deepcopy(prepared_arguments),
+                mcp_identity=facts.mcp_identity,
             )
             if confirmation is None:
                 confirmation_state[0] = ToolConfirmationMetadata(request=request, decision=None)

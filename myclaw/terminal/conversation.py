@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import re
 import sys
 from asyncio import CancelledError, Event, Task, create_task, sleep
@@ -3864,6 +3865,15 @@ def _safe_confirmation_url(value: object) -> object:
 
 def _confirmation_detail_lines(request: ConfirmationRequestView) -> tuple[str, ...]:
     details = request.details
+    if request.mcp_identity is not None:
+        identity = request.mcp_identity
+        return (
+            f"MCP Server: {identity.server_name}",
+            f"Remote Tool: {identity.remote_name}",
+            f"Model Tool: {identity.model_name}",
+            "Arguments: "
+            + json.dumps(details, ensure_ascii=False, separators=(",", ":")),
+        )
     tool_name = request.tool_name.casefold()
     if tool_name == "exec" and "command" in details:
         lines = [f"Command: {_friendly_parameter_value(details['command'])}"]

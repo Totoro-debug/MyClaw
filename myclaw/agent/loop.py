@@ -45,7 +45,7 @@ from myclaw.agent.session.session import Session, SessionStoragePartition
 from myclaw.agent.tools.base import BaseTool
 from myclaw.agent.tools.core.exec_host import ExecHost
 from myclaw.agent.tools.deferred import build_agent_run_gateway
-from myclaw.agent.tools.permission import PermissionContext
+from myclaw.agent.tools.permission import MCPToolIdentity, PermissionContext
 from myclaw.agent.tools.tool_gateway import (
     ConfirmationDecision,
     ConfirmationRequest,
@@ -103,6 +103,9 @@ class ConfirmationRequestView(Protocol):
 
     @property
     def warnings(self) -> tuple[str, ...]: ...
+
+    @property
+    def mcp_identity(self) -> MCPToolIdentity | None: ...
 
 
 @dataclass(frozen=True, slots=True)

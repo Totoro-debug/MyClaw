@@ -98,12 +98,16 @@ does not change it, and a new process starts from the configured value.
 The selector reports the current level and leaves it unchanged when the same
 level is submitted. An upgrade to `full-access` opens a warning with Cancel
 focused by default on every attempt. Full-Access removes ordinary permission
-confirmation for foreground File Tools and parseable non-catastrophic
-PowerShell or Bash Exec calls; it is not an operating-system sandbox and does not
-bypass validation, capability checks, business refusals, catastrophic or
-uncertain Exec confirmation, or Tool errors. Web Search is direct at every
-level. Web Fetch uses the per-hop network authorization below. MCP and
-Schedule retain their existing behavior. A
+confirmation for foreground File Tools, parseable non-catastrophic
+PowerShell or Bash Exec calls, and MCP Tool invocations; it is not an
+operating-system sandbox and does not bypass validation, capability checks,
+business refusals, catastrophic or uncertain Exec confirmation, or Tool
+errors. Web Search is direct at every level. Web Fetch uses the per-hop
+network authorization below. Foreground Read-Only and Workspace-Write MCP
+calls each request one confirmation bound to the normalized server/tool
+identity and complete arguments; approval is never cached. User Schedule
+Agent Runs call MCP Tools directly through their run-local Gateway without
+requesting foreground or background Tool Confirmation. A
 process startup notice is shown at most once when the configured level is
 Full-Access. `/config` reports the configured level, and `/status` reports both
 configured and current foreground levels.
@@ -121,9 +125,10 @@ used.
 Foreground model File Tools do not inherit the Skill Root exemption used by
 internal Skill loading. A foreground model-issued File access beneath
 `~/.myclaw/skills` is an ordinary external access unless it is also beneath
-the Workspace. User Schedule Agent Runs retain their pre-change authorization
-behavior until the later Schedule permission phase. Dream's private memory
-Tool and Runtime persistence writes remain outside this model File policy.
+the Workspace. User Schedule Agent Runs are composed without a foreground Tool
+Permission Level, so their File Tool calls use each Tool's ordinary safety reason
+directly. Dream's private memory Tool and Runtime persistence writes remain
+outside this model File policy.
 
 Permission classification happens after preparation and business refusal, so
 invalid arguments, hard errors, capability errors, and execution errors do
@@ -169,13 +174,16 @@ semantics. Web Fetch sends no cross-origin sensitive headers.
 ## Scope Boundaries
 
 This decision does not alter the fixed Tool Catalog, Tool Exposure, Tool
-Activation, Tool Search, MCP Tool behavior, or Schedule permission behavior.
+Activation, Tool Search, MCP discovery, transport, schema projection, or
+Schedule permission behavior. Foreground MCP invocation authorization requires
+lower levels to confirm every call while Full-Access calls directly; neither
+path changes ordinary MCP hard-error behavior.
 It does not provide an operating-system sandbox. Full-Access removes ordinary
 foreground File and parseable non-catastrophic PowerShell or Bash Exec
 permission confirmation; validation, capability checks, business refusals, catastrophic
 or uncertain Exec confirmation, and Tool errors remain enforced. Web Search
-remains direct; Web Fetch applies the per-hop rules above. MCP and Schedule
-permission behavior is unchanged by this decision.
+remains direct; Web Fetch applies the per-hop rules above. User Schedule MCP
+calls execute directly without entering the foreground confirmation path.
 
 The existing Skill Loader remains responsible for its own internal reads, and
 ADR-0016 no longer defines a confirmation-free boundary for model-issued

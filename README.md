@@ -66,7 +66,7 @@ MCP Server 可在 `[mcp.servers.<name>.tool_keywords]` 下按远端 Tool 原名�
 
 Web Search 在所有权限级别始终 direct。Web Fetch 会在初始 URL 和每个 redirect hop 建立连接前进行一次受控 DNS 审计与网络授权：只有所有解析地址均 globally routable 的非空集合才是 public；private、loopback、link-local、reserved、unspecified、multicast、mixed、空结果和 DNS failure 在 Read-Only/Workspace-Write 下请求确认，Full-Access 只跳过权限提示。一次规范化调用最多一次确认，批准不产生 hostname、IP 或 network grant；普通 DNS、连接、TLS、HTTP、body/decode 和 timeout 错误在三种级别都仍返回 Tool Error。redirect 不由 HTTP client 自动跟随，connector 只使用当前 hop 刚审计的地址集合，禁用环境 proxy，且保留请求 Host、TLS SNI 和证书 hostname 校验。MyClaw 没有 OS 级 network sandbox。
 
-`/permission` 只修改当前 Runtime Lifetime 后续前台 Agent Run 的权限级别，不写入 User Configuration、Conversation Session 或 Schedule。成功的 `/resume` replacement 会保留当前选择；失败的 replacement 不会改变它；新进程从配置值开始。选择 `full-access` 前必须通过默认聚焦 Cancel 的警告；当前该级别取消前台 File Tool、普通 Exec 和 Web Fetch 非公网目标的权限确认，但不是操作系统沙箱，也不绕过参数校验、能力错误、业务拒绝、灾难性 Exec 确认或 Tool 执行错误。Web Search、MCP 和 Schedule 保持各自既有行为。进程启动时最多显示一次 Full-Access 安全提示；`/config` 显示 configured level，`/status` 同时显示 configured/current foreground level。
+`/permission` 只修改当前 Runtime Lifetime 后续前台 Agent Run 的权限级别，不写入 User Configuration、Conversation Session 或 Schedule。成功的 `/resume` replacement 会保留当前选择；失败的 replacement 不会改变它；新进程从配置值开始。选择 `full-access` 前必须通过默认聚焦 Cancel 的警告；当前该级别取消前台 File Tool、普通 Exec 和 Web Fetch 非公网目标的权限确认，但不是操作系统沙箱，也不绕过参数校验、能力错误、业务拒绝、灾难性 Exec 确认或 Tool 执行错误。前台 MCP Tool 在 Read-Only 和 Workspace-Write 下每次调用都对完整规范化的 server/tool identity 与 arguments 请求一次独立确认，批准不会缓存为 Server、Tool、参数或 Host grant；Full-Access 直接调用但仍保留 MCP 的 schema、参数、transport、timeout、server error 和 cancellation 错误。User Schedule Agent Run 中的 MCP Tool 使用该 Run 的无前台确认路径直接调用，不请求前台或后台 Tool Confirmation。Web Search 始终 direct。进程启动时最多显示一次 Full-Access 安全提示；`/config` 显示 configured level，`/status` 同时显示 configured/current foreground level。
 
 安全默认值字段包括 Runtime 的 Tool 结果大小、迭代上限、Always-load Skill 开关、`compact_ratio`、权限级别和 Exec Shell，Memory 的 batch size 与 schedule，以及每个 Model Route 的 `reasoning_effort`。缺失字段静默使用默认值；显式非法值使用有效默认值并产生且只产生一条不包含原始值的安全诊断。`compact_ratio` 的默认值为 `0.9`，只接受有限且非布尔的数值 `0.5` 至 `0.95`（含边界）。原始配置不会被自动改写；`myclaw config` 与 `/config` 显示相同的有效值和诊断，以及脱敏后的原始 TOML。已移除的 `compaction_message_threshold` 等未知字段会被忽略。
 
@@ -114,14 +114,14 @@ CLI 负责组装运行时和管理组件生命周期。前台输入经终端与 
 | Agent Loop | 绑定一个会话，串行处理前台输入，管理上下文、任务目标和会话持久化 |
 | Agent Runner | 执行有迭代上限的模型与工具循环，供前台和用户定时任务复用 |
 | Model Router | 按用途选择模型，适配 OpenAI 兼容协议与 Anthropic，处理重试和回退 |
-| Tool Gateway / MCP | 统一内置与 MCP 工具的调用入口；MCP 连接由 CLI 管理，每个 Agent Loop 使用固定工具快照，单次 Agent Run 通过 `tool_search` 按需暴露延迟 Tool schema |
+| Tool Gateway / MCP | 统一内置与 MCP 工具的调用入口；MCP 连接由 CLI 管理，每个 Agent Loop 使用固定工具快照，单次 Agent Run 通过 `tool_search` 按需暴露延迟 Tool schema；前台低权限 MCP 调用逐次确认且不缓存批准 |
 | Memory / Dream | 管理短期记忆、会话摘要和长期记忆；Dream 通过一次受限的 `memory` 请求整理长期记忆 |
 | Schedule Service | 持久化并调度任务；用户任务调用当前 Agent Loop，记忆整理任务直接调用 Dream |
 | Skill Loader / Context Builder | 加载 Skill 快照，按需提供指令，统一构建 Agent Loop 的模型请求上下文 |
 
 全局配置与 Skill 位于 `~/.myclaw/`；会话、记忆、定时任务、工具产物和日志归各 Workspace 的 `.myclaw/` 所有。
 
-内置工具通过权限检查决定是否请求一次性确认；Exec 通过 Host 以当前用户权限执行，不提供操作系统沙箱。MCP 支持 stdio 和 Streamable HTTP，已启用的 Server 视为可信能力，其工具调用不再逐次确认。
+内置工具通过权限检查决定是否请求一次性确认；Exec 通过 Host 以当前用户权限执行，不提供操作系统沙箱。MCP 支持 stdio 和 Streamable HTTP，已启用的 Server 是用户配置的外部能力：前台 Read-Only/Workspace-Write 对每个 MCP Tool invocation 单独确认，Full-Access 直接调用；确认不缓存，且任何权限级别都保留既有 hard errors。
 
 架构决策见[现行 ADR](docs/adr/)，领域术语见[CONTEXT.md](CONTEXT.md)。
 
