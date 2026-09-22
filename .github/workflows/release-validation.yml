@@ -1,0 +1,30 @@
+name: Windows release validation
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  windows-release:
+    name: Windows release gate
+    runs-on: windows-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install test dependencies
+        run: python -m pip install -e ".[dev]"
+      - name: Run the Windows release gate
+        run: >-
+          python scripts/release_validation.py
+          --phase all
+          --report "$env:RUNNER_TEMP\windows-release.json"

@@ -1027,7 +1027,7 @@ async def test_bash_catastrophic_wrappers_and_options_confirm_in_full_access(
 
 
 @pytest.mark.asyncio
-async def test_bash_identity_rejects_plain_script_duplicate_path_and_symlink(
+async def test_bash_identity_rejects_plain_script_and_duplicate_path(
     tmp_path: Path,
 ) -> None:
     workspace, host = _synthetic_bash_host(tmp_path, {"cat", "plain"})
@@ -1054,6 +1054,10 @@ async def test_bash_identity_rejects_plain_script_duplicate_path_and_symlink(
     assert duplicate.command_identities[0].kind == "ambiguous"
     assert duplicate.command_identities[0].resolution_count == 2
 
+
+@pytest.mark.asyncio
+async def test_bash_identity_rejects_symlink(tmp_path: Path) -> None:
+    workspace, _host = _synthetic_bash_host(tmp_path, {"linked"})
     target_dir = tmp_path / "target-bin"
     target_dir.mkdir()
     target = target_dir / "linked"

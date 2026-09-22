@@ -1169,50 +1169,56 @@ def test_disabled_powershell_switch_does_not_create_catastrophic_false_positive(
     assert catastrophic_matches("Remove-Item -Recurse:$false -Force C:\\") == ()
 
 
+_CATASTROPHIC_CONFIRM_COMMANDS = (
+    "Remove-Item -Recurse -Force C:\\",
+    "Remove-Item -Re -Fo C:\\",
+    "Remove-Item -Recurse -Force C:\\,D:\\",
+    "Remove-Item -Recurse -Force @('C:\\','D:\\')",
+    "Clear-Content -LiteralPath C:\\",
+    "Clear-Content *",
+    "Clear-Content @('C:\\*','D:\\*')",
+    "Clear-Content \\\\server\\share\\*",
+    "Clear-Content .\\.\\*",
+    "Clear-Content C:\\dir\\..\\*",
+    "Clear-Content \\\\server\\share\\.\\*",
+    "Clear-Content C:\\**",
+    "Clear-Content ([array]('C:\\*'))",
+    "Clear-Content $('C:\\*')",
+    "Clear-Content FileSystem::C:\\*",
+    "Clear-Content Microsoft.PowerShell.Core\\FileSystem::C:\\*",
+    "Clear-Content ${env:USERPROFILE}\\*",
+    "Set-Content C:\\* erased",
+    "Set-Content -Path \\\\.\\PhysicalDrive0 value",
+    "Format-Volume -DriveLetter C",
+    "Clear-Disk -Number 0 -RemoveData",
+    "Remove-Partition -DiskNumber 0 -PartitionNumber 1",
+    "git clean -fdx",
+    "git reset --hard",
+    "git checkout -f main",
+    "git checkout -f -- :/",
+    "git checkout -f HEAD -- :!does-not-exist",
+    "git restore .",
+    "git restore :/",
+    "git restore :/**",
+    "git restore :(top)",
+    "git restore :(glob)**",
+    "git restore :(top,glob,icase)**",
+    "git restore :(exclude)does-not-exist",
+    "git restore :!does-not-exist",
+    "git restore --source HEAD :(exclude)does-not-exist",
+    "Restart-Computer -Force",
+    "shutdown /r /t 0",
+)
+
+
 @pytest.mark.asyncio
+@pytest.mark.parametrize("level", ("read-only", "workspace-write", "full-access"))
+@pytest.mark.parametrize("command", _CATASTROPHIC_CONFIRM_COMMANDS)
 async def test_catastrophic_powershell_calls_confirm_once_at_every_permission_level(
     tmp_path: Path,
+    level: Literal["read-only", "workspace-write", "full-access"],
+    command: str,
 ) -> None:
-    commands = (
-        "Remove-Item -Recurse -Force C:\\",
-        "Remove-Item -Re -Fo C:\\",
-        "Remove-Item -Recurse -Force C:\\,D:\\",
-        "Remove-Item -Recurse -Force @('C:\\','D:\\')",
-        "Clear-Content -LiteralPath C:\\",
-        "Clear-Content *",
-        "Clear-Content @('C:\\*','D:\\*')",
-        "Clear-Content \\\\server\\share\\*",
-        "Clear-Content .\\.\\*",
-        "Clear-Content C:\\dir\\..\\*",
-        "Clear-Content \\\\server\\share\\.\\*",
-        "Clear-Content C:\\**",
-        "Clear-Content ([array]('C:\\*'))",
-        "Clear-Content $('C:\\*')",
-        "Clear-Content FileSystem::C:\\*",
-        "Clear-Content Microsoft.PowerShell.Core\\FileSystem::C:\\*",
-        "Clear-Content ${env:USERPROFILE}\\*",
-        "Set-Content C:\\* erased",
-        "Set-Content -Path \\\\.\\PhysicalDrive0 value",
-        "Format-Volume -DriveLetter C",
-        "Clear-Disk -Number 0 -RemoveData",
-        "Remove-Partition -DiskNumber 0 -PartitionNumber 1",
-        "git clean -fdx",
-        "git reset --hard",
-        "git checkout -f main",
-        "git checkout -f -- :/",
-        "git checkout -f HEAD -- :!does-not-exist",
-        "git restore .",
-        "git restore :/",
-        "git restore :/**",
-        "git restore :(top)",
-        "git restore :(glob)**",
-        "git restore :(top,glob,icase)**",
-        "git restore :(exclude)does-not-exist",
-        "git restore :!does-not-exist",
-        "git restore --source HEAD :(exclude)does-not-exist",
-        "Restart-Computer -Force",
-        "shutdown /r /t 0",
-    )
     executable = r"C:\PowerShell\pwsh.exe"
     shell = resolve_exec_shell(
         "pwsh",
@@ -1224,69 +1230,64 @@ async def test_catastrophic_powershell_calls_confirm_once_at_every_permission_le
     requests: list[ConfirmationRequest] = []
     executions: list[str] = []
 
-    for level in ("read-only", "workspace-write", "full-access"):
-        for command in commands:
-            matches = catastrophic_matches(command)
-            assert matches
-            assessment = ExecAssessment(
-                syntax_confidence="high",
-                syntax_uncertain=False,
-                catastrophic_matches=matches,
-            )
+    matches = catastrophic_matches(command)
+    assert matches
+    assessment = ExecAssessment(
+        syntax_confidence="high",
+        syntax_uncertain=False,
+        catastrophic_matches=matches,
+    )
 
-            class Host:
-                resolved_shell = shell
+    class Host:
+        resolved_shell = shell
 
-                async def inspect(
-                    self,
-                    inspected_command: str,
-                    cwd: Path,
-                    *,
-                    expected_command: str = command,
-                    expected_assessment: ExecAssessment = assessment,
-                ) -> ExecAssessment:
-                    del cwd
-                    assert inspected_command == expected_command
-                    return expected_assessment
+        async def inspect(
+            self,
+            inspected_command: str,
+            cwd: Path,
+        ) -> ExecAssessment:
+            del cwd
+            assert inspected_command == command
+            return assessment
 
-                async def execute(
-                    self,
-                    executed_command: str,
-                    cwd: Path,
-                    timeout: int,
-                ) -> ExecOutcome:
-                    del cwd, timeout
-                    executions.append(executed_command)
-                    return ExecOutcome(exit_code=0, stdout=b"unexpected", stderr=b"")
+        async def execute(
+            self,
+            executed_command: str,
+            cwd: Path,
+            timeout: int,
+        ) -> ExecOutcome:
+            del cwd, timeout
+            executions.append(executed_command)
+            return ExecOutcome(exit_code=0, stdout=b"unexpected", stderr=b"")
 
-                def process_spec(self, cwd: Path) -> ExecProcessSpec:
-                    del cwd
-                    raise AssertionError("catastrophic commands must confirm before spawn")
+        def process_spec(self, cwd: Path) -> ExecProcessSpec:
+            del cwd
+            raise AssertionError("catastrophic commands must confirm before spawn")
 
-            snapshot = PermissionSnapshot(level=level, exec_shell=shell)
-            gateway = ToolGateway._for_memory(
-                (ExecTool(workspace=tmp_path, host=Host()),),
-                permission_context=PermissionContext.from_snapshot(
-                    snapshot,
-                    workspace_root=tmp_path,
-                ),
-            )
+    snapshot = PermissionSnapshot(level=level, exec_shell=shell)
+    gateway = ToolGateway._for_memory(
+        (ExecTool(workspace=tmp_path, host=Host()),),
+        permission_context=PermissionContext.from_snapshot(
+            snapshot,
+            workspace_root=tmp_path,
+        ),
+    )
 
-            async def decline(request: ConfirmationRequest) -> Literal["declined"]:
-                requests.append(request)
-                return "declined"
+    async def decline(request: ConfirmationRequest) -> Literal["declined"]:
+        requests.append(request)
+        return "declined"
 
-            result = await gateway.call(
-                ModelToolCall(
-                    id=f"catastrophic-{level}-{abs(hash(command))}",
-                    name="exec",
-                    arguments=json.dumps({"command": command}),
-                ),
-                confirmation=decline,
-            )
-            assert result.status == "refused"
+    result = await gateway.call(
+        ModelToolCall(
+            id=f"catastrophic-{level}-{abs(hash(command))}",
+            name="exec",
+            arguments=json.dumps({"command": command}),
+        ),
+        confirmation=decline,
+    )
 
-    assert len(requests) == len(commands) * 3
+    assert result.status == "refused"
+    assert len(requests) == 1
     assert executions == []
 
 
@@ -1302,10 +1303,12 @@ async def test_catastrophic_powershell_calls_confirm_once_at_every_permission_le
         ("inconsistent-output", "uncertain"),
     ),
 )
+@pytest.mark.parametrize("level", ("read-only", "workspace-write", "full-access"))
 async def test_shell_present_inspector_uncertainty_confirms_at_every_level(
     tmp_path: Path,
     failure_case: str,
     status: str,
+    level: Literal["read-only", "workspace-write", "full-access"],
 ) -> None:
     executable = r"C:\PowerShell\pwsh.exe"
     shell = resolve_exec_shell(
@@ -1318,50 +1321,49 @@ async def test_shell_present_inspector_uncertainty_confirms_at_every_level(
     requests: list[ConfirmationRequest] = []
     executions: list[str] = []
 
-    for level in ("read-only", "workspace-write", "full-access"):
-        class Host:
-            resolved_shell = shell
+    class Host:
+        resolved_shell = shell
 
-            async def inspect(self, command: str, cwd: Path) -> ExecAssessment:
-                del command, cwd
-                return ExecAssessment.uncertain_result(
-                    "fixture inspector failure",
-                    status=status,  # type: ignore[arg-type]
-                )
+        async def inspect(self, command: str, cwd: Path) -> ExecAssessment:
+            del command, cwd
+            return ExecAssessment.uncertain_result(
+                "fixture inspector failure",
+                status=status,  # type: ignore[arg-type]
+            )
 
-            async def execute(self, command: str, cwd: Path, timeout: int) -> ExecOutcome:
-                del cwd, timeout
-                executions.append(command)
-                return ExecOutcome(exit_code=0, stdout=b"unexpected", stderr=b"")
+        async def execute(self, command: str, cwd: Path, timeout: int) -> ExecOutcome:
+            del cwd, timeout
+            executions.append(command)
+            return ExecOutcome(exit_code=0, stdout=b"unexpected", stderr=b"")
 
-            def process_spec(self, cwd: Path) -> ExecProcessSpec:
-                del cwd
-                raise AssertionError("uncertain inspection must confirm before spawn")
+        def process_spec(self, cwd: Path) -> ExecProcessSpec:
+            del cwd
+            raise AssertionError("uncertain inspection must confirm before spawn")
 
-        snapshot = PermissionSnapshot(level=level, exec_shell=shell)
-        gateway = ToolGateway._for_memory(
-            (ExecTool(workspace=tmp_path, host=Host()),),
-            permission_context=PermissionContext.from_snapshot(
-                snapshot,
-                workspace_root=tmp_path,
-            ),
-        )
+    snapshot = PermissionSnapshot(level=level, exec_shell=shell)
+    gateway = ToolGateway._for_memory(
+        (ExecTool(workspace=tmp_path, host=Host()),),
+        permission_context=PermissionContext.from_snapshot(
+            snapshot,
+            workspace_root=tmp_path,
+        ),
+    )
 
-        async def decline(request: ConfirmationRequest) -> Literal["declined"]:
-            requests.append(request)
-            return "declined"
+    async def decline(request: ConfirmationRequest) -> Literal["declined"]:
+        requests.append(request)
+        return "declined"
 
-        result = await gateway.call(
-            ModelToolCall(
-                id=f"inspector-{failure_case}-{level}",
-                name="exec",
-                arguments=json.dumps({"command": "Get-Location"}),
-            ),
-            confirmation=decline,
-        )
-        assert result.status == "refused"
+    result = await gateway.call(
+        ModelToolCall(
+            id=f"inspector-{failure_case}-{level}",
+            name="exec",
+            arguments=json.dumps({"command": "Get-Location"}),
+        ),
+        confirmation=decline,
+    )
 
-    assert len(requests) == 3
+    assert result.status == "refused"
+    assert len(requests) == 1
     assert executions == []
 
 

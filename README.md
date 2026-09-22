@@ -31,6 +31,18 @@ source .venv/bin/activate
 python -m pip install .
 ```
 
+## Windows-only release scope
+
+当前 release gate 只覆盖 Windows x64：必须真实执行 Windows PowerShell 5.1 和 PowerShell 7 的 Host Exec 检查、执行、Full-Access 动态命令，以及在隔离环境中安装 wheel 后从源码树外执行 entry point 与配置 smoke。PowerShell 选择器配置位于 `[runtime].exec_shell`；`auto` 优先选择 PowerShell 7，随后选择 Windows PowerShell 5.1，显式选择不会交叉回退。
+
+POSIX Bash 的实现、解析器、策略和测试继续保留，但由于当前发布环境没有可用的 POSIX 主机，`POSIX Bash is not formally validated for this release`。这不是对 POSIX 行为的通过声明。Windows 发布校验入口为：
+
+```powershell
+python scripts/release_validation.py --phase all
+```
+
+`Full-Access` 只移除普通权限提示，不提供 OS sandbox；参数校验、能力错误、业务拒绝、执行错误、灾难性 Exec 和不确定检查仍然有效。发布门禁会输出 skip 分类、Windows junction/reparse 证据、量化覆盖计数和未验证范围。
+
 ## 项目最小配置
 
 执行 `myclaw config` 生成默认配置，再将 `~/.myclaw/config.toml` 的内容替换为以下配置。已有配置不会被该命令覆盖。`~` 表示当前用户主目录，Windows 下通常为 `C:\Users\<用户名>`。
