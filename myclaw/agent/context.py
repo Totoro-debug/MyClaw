@@ -181,6 +181,7 @@ class ContextBuilder:
         *,
         session_id: str,
         summary: str = "",
+        permission_snapshot: PermissionSnapshot | None = None,
     ) -> list[dict[str, Any]]:
         """Build the canonical initial Model Request Context for a Schedule Job."""
         snapshot = _SCHEDULE_PROJECTION_SNAPSHOT.get()
@@ -196,6 +197,7 @@ class ContextBuilder:
             session_id=session_id,
             current_time=current_time,
             summary=summary,
+            permission_snapshot=permission_snapshot,
         )
 
     @contextmanager

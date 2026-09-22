@@ -16,8 +16,11 @@ from tzlocal import get_localzone_name
 
 from myclaw.agent.blackboard import Blackboard
 from myclaw.agent.confirmation import (
+    BackgroundConfirmationOwner,
     CallbackConfirmationRequester,
+    ConfirmationAborted,
     ConfirmationEnvelope,
+    ConfirmationUnavailable,
     ForegroundConfirmationOwner,
 )
 from myclaw.agent.context import ContextBuilder
@@ -72,7 +75,11 @@ from myclaw.provider.errors import ModelCallError
 from myclaw.provider.model_router import ModelRouteStatus
 from myclaw.provider.models import ModelCompleted, ModelRoute, ReasoningDelta, TextDelta
 from myclaw.schedule.model import ScheduleJob
-from myclaw.schedule.service import ScheduleJobExecutionError, ScheduleService
+from myclaw.schedule.service import (
+    ScheduleJobExecutionError,
+    ScheduleOccurrence,
+    ScheduleService,
+)
 from myclaw.skills.catalog import LoadedSkill, ManualSkillInvocation, SkillLoader, SkillMetadata
 from myclaw.utils.async_tasks import await_task_preserving_cancellation
 
@@ -668,7 +675,11 @@ class AgentLoop:
         active.cancel()
         await asyncio.gather(active, return_exceptions=True)
 
-    async def run_schedule_job(self, job: ScheduleJob) -> None:
+    async def run_schedule_job(
+        self,
+        job: ScheduleJob,
+        occurrence: ScheduleOccurrence | None = None,
+    ) -> None:
         """Execute one Schedule Job without using foreground state or output."""
         if self._aborted or self._closing or self._closed:
             raise RuntimeError("Agent Loop is no longer active")
@@ -679,16 +690,32 @@ class AgentLoop:
                     "Only User Schedule Jobs may run through Agent Loop.",
                 )
             )
+        if occurrence is not None and occurrence.job != job:
+            raise ValueError("Schedule occurrence Job does not match its callback Job")
+        background_owner: BackgroundConfirmationOwner | None = None
+        if occurrence is not None and occurrence.permission_snapshot is not None:
+            background_owner = BackgroundConfirmationOwner(
+                generation_id=self._generation_id,
+                job_id=job.job_id,
+                occurrence_id=occurrence.occurrence_id,
+            )
+            self._schedule_service.bind_occurrence_owner(occurrence, background_owner)
         current_task = asyncio.current_task()
         if current_task is not None:
             self._schedule_tasks.add(current_task)
         try:
-            await self._execute_schedule_job(job)
+            await self._execute_schedule_job(job, occurrence)
         finally:
+            if occurrence is not None and background_owner is not None:
+                self._schedule_service.unbind_occurrence_owner(occurrence, background_owner)
             if current_task is not None:
                 self._schedule_tasks.discard(current_task)
 
-    async def _execute_schedule_job(self, job: ScheduleJob) -> None:
+    async def _execute_schedule_job(
+        self,
+        job: ScheduleJob,
+        occurrence: ScheduleOccurrence | None = None,
+    ) -> None:
         schedule_session: Session | None = None
         workspace_state = self._session.workspace_state
         with session_log(workspace_state, job.session_id):
@@ -708,7 +735,10 @@ class AgentLoop:
                         title=cast(str, job.title),
                     )
                 try:
-                    await self._run_schedule_agent(schedule_session, job)
+                    if occurrence is None:
+                        await self._run_schedule_agent(schedule_session, job)
+                    else:
+                        await self._run_schedule_agent(schedule_session, job, occurrence)
                 except ScheduleJobExecutionError as failure:
                     logger.warning(
                         "Schedule Job failed job_id={} kind={} code={}",
@@ -735,26 +765,46 @@ class AgentLoop:
                             type(error).__name__,
                         )
 
-    async def _run_schedule_agent(self, session: Session, job: ScheduleJob) -> None:
+    async def _run_schedule_agent(
+        self,
+        session: Session,
+        job: ScheduleJob,
+        occurrence: ScheduleOccurrence | None = None,
+    ) -> None:
         with self._context_builder.schedule_projection_scope():
-            await self._run_schedule_agent_scoped(session, job)
+            await self._run_schedule_agent_scoped(session, job, occurrence)
 
-    async def _run_schedule_agent_scoped(self, session: Session, job: ScheduleJob) -> None:
+    async def _run_schedule_agent_scoped(
+        self,
+        session: Session,
+        job: ScheduleJob,
+        occurrence: ScheduleOccurrence | None = None,
+    ) -> None:
         current_user = {"role": "user", "content": job.message}
-        run_gateway = self._new_run_gateway(
-            excluded_names=("schedule",),
-            permission_context=PermissionContext(
+        permission_snapshot = None if occurrence is None else occurrence.permission_snapshot
+        permission_context = (
+            PermissionContext.from_snapshot(
+                permission_snapshot,
+                workspace_root=self._workspace_state.workspace_path,
+                origin="schedule",
+                configured_schedule_level=self._permission_control.configured(),
+            )
+            if permission_snapshot is not None
+            else PermissionContext(
                 origin="schedule",
                 workspace_root=self._workspace_state.workspace_path,
-            ),
+            )
+        )
+        run_gateway = self._new_run_gateway(
+            excluded_names=("schedule",),
+            permission_context=permission_context,
         )
 
         def project_messages(messages: Sequence[dict[str, Any]]) -> list[dict[str, Any]]:
-            return self._context_builder.build_schedule_messages(
-                messages,
-                session_id=session.session_id,
-                summary="",
-            )
+            kwargs: dict[str, Any] = {"session_id": session.session_id, "summary": ""}
+            if permission_snapshot is not None:
+                kwargs["permission_snapshot"] = permission_snapshot
+            return self._context_builder.build_schedule_messages(messages, **kwargs)
 
         run_context = self._new_agent_run_context(
             session,
@@ -762,6 +812,40 @@ class AgentLoop:
             route="schedule",
             project_messages=project_messages,
         )
+        schedule_confirmation: Callable[
+            [ConfirmationRequest], Awaitable[ConfirmationDecision]
+        ] | None = None
+        if occurrence is not None and permission_snapshot is not None:
+            background_owner = self._schedule_service.occurrence_owner(occurrence)
+
+            async def request_schedule_confirmation(
+                request: ConfirmationRequest,
+            ) -> ConfirmationDecision:
+                lifecycle_aborted = False
+                try:
+                    self._schedule_service.confirmation_waiting(occurrence)
+                    requester = self._confirmation_requester
+                    if requester is None:
+                        raise ConfirmationUnavailable("confirmation requester is not bound")
+                    return await requester(
+                        ConfirmationEnvelope(
+                            request=request,
+                            origin="background",
+                            owner=background_owner,
+                            job_id=job.job_id,
+                            title=cast(str, job.title),
+                        )
+                    )
+                except ConfirmationAborted:
+                    lifecycle_aborted = True
+                    self._schedule_service.confirmation_aborted(occurrence)
+                    raise
+                finally:
+                    if not lifecycle_aborted:
+                        self._schedule_service.confirmation_finished(occurrence)
+
+            schedule_confirmation = request_schedule_confirmation
+
         try:
             initial_messages = await self._prepare_agent_run(
                 run_context,
@@ -803,11 +887,25 @@ class AgentLoop:
                 model="schedule",
                 tool_gateway=run_gateway,
                 on_output=None,
-                confirmation=None,
+                confirmation=schedule_confirmation,
                 externalize_result=self._result_externalizer_for(session),
                 cancel_requested=self._schedule_service.cancellation_requested,
                 max_iterations=self._max_iterations,
             )
+        except ConfirmationAborted:
+            if self._aborted:
+                raise asyncio.CancelledError() from None
+            self._record_schedule_failure(
+                session,
+                run_context,
+                current_user,
+                ErrorInfo(
+                    "tool_failed",
+                    "Schedule Tool confirmation was aborted.",
+                ),
+                job,
+            )
+            raise
         except ModelCallError as failure:
             raise ScheduleJobExecutionError(failure.error) from failure
         if self._aborted:
@@ -933,6 +1031,19 @@ class AgentLoop:
         error: ErrorInfo,
         job: ScheduleJob,
     ) -> NoReturn:
+        self._record_schedule_failure(session, context, current_user, error, job)
+        if error.code == "turn_cancelled":
+            raise asyncio.CancelledError()
+        raise ScheduleJobExecutionError(error)
+
+    def _record_schedule_failure(
+        self,
+        session: Session,
+        context: _AgentRunContext,
+        current_user: dict[str, Any],
+        error: ErrorInfo,
+        job: ScheduleJob,
+    ) -> None:
         self._commit_schedule_run(
             session,
             context,
@@ -947,9 +1058,6 @@ class AgentLoop:
             ],
             job=job,
         )
-        if error.code == "turn_cancelled":
-            raise asyncio.CancelledError()
-        raise ScheduleJobExecutionError(error)
 
     def respond_to_confirmation(
         self,

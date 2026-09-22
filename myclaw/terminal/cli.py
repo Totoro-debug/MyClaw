@@ -15,7 +15,7 @@ from myclaw.agent.loop import AgentLoop, ModelContextOverflowError
 from myclaw.agent.memory.dream import Dream
 from myclaw.agent.memory.manager import MemoryManager
 from myclaw.agent.message_bus import MessageBus
-from myclaw.agent.permission import RuntimePermissionControl
+from myclaw.agent.permission import PermissionSnapshot, RuntimePermissionControl
 from myclaw.agent.tools.core.exec_host import (
     EXEC_CAPABILITY_ERROR,
     create_exec_host,
@@ -47,7 +47,7 @@ from myclaw.management.service import (
 from myclaw.provider.factory import create_provider
 from myclaw.provider.model_router import ModelRouter
 from myclaw.schedule.model import JobSchedule, ScheduleJob
-from myclaw.schedule.service import ScheduleService
+from myclaw.schedule.service import ScheduleOccurrence, ScheduleService
 from myclaw.terminal.conversation import (
     TerminalConversationApp,
     is_interactive_terminal,
@@ -118,8 +118,8 @@ def _print_exec_notice(message: str) -> None:
 def _print_permission_startup_notice() -> None:
     console.print(
         "Full-Access is enabled for this process. It cancels ordinary permission confirmation "
-        "for valid foreground File Tool calls; it is not an OS sandbox. Validation and Tool "
-        "errors still apply. Exec, Web, MCP, and Schedule keep their existing behavior.",
+        "for valid File, Exec, Web Fetch, MCP, and User Schedule calls; it is not an OS sandbox. "
+        "Validation and Tool errors still apply; hard and uncertain Exec checks remain enforced.",
         markup=False,
         highlight=False,
         soft_wrap=True,
@@ -177,6 +177,21 @@ def _fatal_target_preparation_error(error: Exception) -> FatalManagementError:
             )
         )
     return FatalManagementError(_TARGET_SESSION_PREPARATION_ERROR)
+
+
+async def _drain_schedule_confirmation_aborts(
+    schedule_service: ScheduleService,
+    *,
+    generation_id: object | None = None,
+) -> None:
+    """Drain the optional lifecycle seam while keeping old test fakes usable."""
+    drain = getattr(schedule_service, "drain_confirmation_aborts", None)
+    if not callable(drain):
+        return
+    if generation_id is None:
+        await drain()
+    else:
+        await drain(generation_id=generation_id)
 
 
 async def _run_cli_conversation(
@@ -259,10 +274,23 @@ async def _run_cli_conversation(
             memory_route_status=router.route_status("memory"),
         )
 
+        async def execute_user_occurrence(occurrence: ScheduleOccurrence) -> None:
+            if current_loop is None:
+                raise RuntimeError("Schedule Service user executor is not bound")
+            await current_loop.run_schedule_job(occurrence.job, occurrence)
+
         async def execute_user_job(job: ScheduleJob) -> None:
             if current_loop is None:
                 raise RuntimeError("Schedule Service user executor is not bound")
             await current_loop.run_schedule_job(job)
+
+        configured_schedule_level = permission_control.configured()
+
+        def capture_schedule_permission_snapshot() -> PermissionSnapshot:
+            return PermissionSnapshot(
+                level=configured_schedule_level,
+                exec_shell=exec_host.resolved_shell,
+            )
 
         async def wait_for_session_persist(loop: AgentLoop, session_id: str) -> None:
             old_session = loop.session
@@ -292,6 +320,13 @@ async def _run_cli_conversation(
             workspace_state=workspace_state,
             clock=AsyncioSchedulerClock(now=local_now),
             execute_user_job=execute_user_job,
+            execute_user_occurrence=execute_user_occurrence,
+            permission_snapshot_factory=capture_schedule_permission_snapshot,
+            cancel_confirmation_owner=getattr(
+                confirmation_coordinator,
+                "cancel_owner",
+                None,
+            ),
             execute_dream=dream.run,
             timezone_name=get_localzone_name(),
         )
@@ -472,7 +507,18 @@ async def _run_cli_conversation(
                 try:
                     generation_id = getattr(old_loop, "generation_id", None)
                     if generation_id is not None:
+                        cancel_generation = getattr(
+                            schedule_service,
+                            "cancel_confirmation_generation",
+                            None,
+                        )
+                        if callable(cancel_generation):
+                            cancel_generation(generation_id)
                         await confirmation_coordinator.cancel_generation(generation_id)
+                        await _drain_schedule_confirmation_aborts(
+                            schedule_service,
+                            generation_id=generation_id,
+                        )
                     await terminal_app.quiesce_for_rebind()
                     await schedule_service.pause_and_drain()
                     current_loop = None
@@ -562,6 +608,12 @@ async def _run_cli_conversation(
             await confirmation_coordinator.close()
         except BaseException as error:
             cleanup_errors.append(error)
+
+        if schedule_service is not None:
+            try:
+                await _drain_schedule_confirmation_aborts(schedule_service)
+            except BaseException as error:
+                cleanup_errors.append(error)
 
         if management is not None:
             try:

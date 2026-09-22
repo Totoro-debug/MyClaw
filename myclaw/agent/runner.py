@@ -10,6 +10,7 @@ from typing import Any, ClassVar, Literal, Protocol, cast
 
 from loguru import logger
 
+from myclaw.agent.confirmation import ConfirmationAborted
 from myclaw.agent.run_errors import CommittableAgentRunError
 from myclaw.agent.tools.tool_gateway import (
     ConfirmationRequester,
@@ -508,6 +509,8 @@ class AgentRunner:
                             raise RuntimeError("Tool Gateway ended without a result")
                     except asyncio.CancelledError:
                         raise
+                    except ConfirmationAborted:
+                        raise
                     except Exception:
                         result = ToolResult(
                             tool_call_id=tool_call.id,
@@ -613,6 +616,8 @@ class AgentRunner:
                 )
             except BaseException:
                 pass
+            raise
+        except ConfirmationAborted:
             raise
         except Exception:
             if propagate_unexpected_errors:

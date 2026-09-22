@@ -6,12 +6,15 @@ import asyncio
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
-from typing import Literal, Protocol
+from typing import Literal, Protocol, cast
+from uuid import UUID, uuid4
 from zoneinfo import ZoneInfo
 
 from croniter import croniter  # type: ignore[import-untyped]
 from loguru import logger
 
+from myclaw.agent.confirmation import BackgroundConfirmationOwner, ConfirmationAborted
+from myclaw.agent.permission import PermissionSnapshot
 from myclaw.agent.workspace_state import WorkspaceState
 from myclaw.errors import ErrorInfo
 from myclaw.logging.session import session_log
@@ -38,8 +41,16 @@ class ScheduleClock(Protocol):
 
 
 type ScheduleJobExecutor = Callable[[ScheduleJob], Awaitable[None]]
+type ScheduleOccurrenceExecutor = Callable[[ScheduleOccurrence], Awaitable[None]]
+type PermissionSnapshotFactory = Callable[[], PermissionSnapshot]
+type ConfirmationOwnerCanceller = Callable[[BackgroundConfirmationOwner], Awaitable[None]]
 type DreamExecutor = Callable[[], Awaitable[object]]
 type _ExecutionLane = Literal["user", "dream"]
+
+
+async def _unavailable_user_job(job: ScheduleJob) -> None:
+    del job
+    raise RuntimeError("Schedule Service User Job executor is not bound")
 
 
 class ScheduleJobExecutionError(Exception):
@@ -50,6 +61,26 @@ class ScheduleJobExecutionError(Exception):
             raise TypeError("Schedule Job execution errors require ErrorInfo")
         self.error = error
         super().__init__(error.message)
+
+
+@dataclass(frozen=True, slots=True)
+class ScheduleOccurrence:
+    """Runtime identity and admission facts for one scheduled execution."""
+
+    job: ScheduleJob
+    occurrence_id: UUID
+    permission_snapshot: PermissionSnapshot | None = None
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.job, ScheduleJob):
+            raise TypeError("Schedule occurrences require a Schedule Job")
+        if not isinstance(self.occurrence_id, UUID):
+            raise TypeError("Schedule occurrence ids must be UUIDs")
+        if self.permission_snapshot is not None and not isinstance(
+            self.permission_snapshot,
+            PermissionSnapshot,
+        ):
+            raise TypeError("Schedule occurrence permissions require a snapshot")
 
 
 @dataclass(frozen=True, slots=True)
@@ -66,6 +97,15 @@ class ScheduleServiceStatus:
         }
 
 
+@dataclass(slots=True)
+class _ActiveScheduleRun:
+    occurrence: ScheduleOccurrence
+    task: asyncio.Task[None]
+    owner: BackgroundConfirmationOwner | None = None
+    confirmation_waiting: bool = False
+    confirmation_abort_pending: bool = False
+
+
 class ScheduleService:
     """Own Schedule persistence and dispatch Jobs through one execution callback."""
 
@@ -74,13 +114,36 @@ class ScheduleService:
         *,
         workspace_state: WorkspaceState,
         clock: ScheduleClock,
-        execute_user_job: ScheduleJobExecutor,
+        execute_user_job: ScheduleJobExecutor | None = None,
         execute_dream: DreamExecutor,
         timezone_name: str | None = None,
+        **runtime_options: object,
     ) -> None:
+        execute_user_occurrence = cast(
+            ScheduleOccurrenceExecutor | None,
+            runtime_options.pop("execute_user_occurrence", None),
+        )
+        permission_snapshot_factory = cast(
+            PermissionSnapshotFactory | None,
+            runtime_options.pop("permission_snapshot_factory", None),
+        )
+        cancel_confirmation_owner = cast(
+            ConfirmationOwnerCanceller | None,
+            runtime_options.pop("cancel_confirmation_owner", None),
+        )
+        if runtime_options:
+            unexpected = next(iter(runtime_options))
+            raise TypeError(f"Unexpected Schedule Service runtime option: {unexpected}")
+        if execute_user_job is None and execute_user_occurrence is None:
+            raise TypeError("Schedule Service requires a User Job executor")
         self._store = WorkspaceScheduleStore(workspace_state)
         self._clock = clock
-        self._execute_user_job = execute_user_job
+        self._execute_user_job: ScheduleJobExecutor = (
+            execute_user_job if execute_user_job is not None else _unavailable_user_job
+        )
+        self._execute_user_occurrence = execute_user_occurrence
+        self._permission_snapshot_factory = permission_snapshot_factory
+        self._cancel_confirmation_owner = cancel_confirmation_owner
         self._execute_dream = execute_dream
         self._timezone_name = timezone_name
         self._loop_task: asyncio.Task[None] | None = None
@@ -88,6 +151,8 @@ class ScheduleService:
         self._terminal_commit_tasks: set[asyncio.Task[ScheduleJob | None]] = set()
         self._reservation_gate = asyncio.Lock()
         self._active_job_ids: set[str] = set()
+        self._active_runs: dict[str, _ActiveScheduleRun] = {}
+        self._cancelled_confirmation_generations: set[UUID] = set()
         self._consumed_at_jobs: set[str] = set()
         self._retry_at_jobs_after_resume: set[str] = set()
         self._every_deadlines: dict[str, _EveryDeadline] = {}
@@ -243,7 +308,162 @@ class ScheduleService:
         """Remove one user-owned Job with the Store's optimistic expectation."""
         if self._aborted:
             raise RuntimeError("Schedule Service is no longer active")
-        return await self._store.remove_user_job(job_id, expected=expected)
+        removed = await self._store.remove_user_job(job_id, expected=expected)
+        if not removed:
+            return False
+        active = self._active_runs.get(job_id)
+        if active is None:
+            return True
+        if not active.task.done():
+            active.task.cancel()
+        cancellation_error: BaseException | None = None
+        if active.owner is not None and self._cancel_confirmation_owner is not None:
+            try:
+                await self._cancel_confirmation_owner(active.owner)
+            except BaseException as error:
+                cancellation_error = error
+        await self._drain_confirmation_runs((active,), require_terminal=False)
+        if cancellation_error is not None:
+            raise cancellation_error
+        return True
+
+    def bind_occurrence_owner(
+        self,
+        occurrence: ScheduleOccurrence,
+        owner: BackgroundConfirmationOwner,
+    ) -> None:
+        """Bind the Runtime confirmation owner to one admitted occurrence."""
+        if not isinstance(occurrence, ScheduleOccurrence):
+            raise TypeError("Schedule occurrence is invalid")
+        if not isinstance(owner, BackgroundConfirmationOwner):
+            raise TypeError("Schedule occurrence owner is invalid")
+        if owner.job_id != occurrence.job.job_id:
+            raise ValueError("Schedule occurrence owner Job ID does not match")
+        active = self._active_runs.get(occurrence.job.job_id)
+        if active is None or active.occurrence != occurrence:
+            raise RuntimeError("Schedule occurrence is not active")
+        if active.owner is not None and active.owner != owner:
+            raise RuntimeError("Schedule occurrence already has a confirmation owner")
+        active.owner = owner
+
+    def unbind_occurrence_owner(
+        self,
+        occurrence: ScheduleOccurrence,
+        owner: BackgroundConfirmationOwner,
+    ) -> None:
+        active = self._active_runs.get(occurrence.job.job_id)
+        if active is not None and active.occurrence == occurrence and active.owner == owner:
+            active.owner = None
+
+    def occurrence_owner(self, occurrence: ScheduleOccurrence) -> BackgroundConfirmationOwner:
+        active = self._active_runs.get(occurrence.job.job_id)
+        if active is None or active.occurrence != occurrence or active.owner is None:
+            raise RuntimeError("Schedule occurrence confirmation owner is not bound")
+        return active.owner
+
+    def confirmation_waiting(self, occurrence: ScheduleOccurrence) -> None:
+        """Mark the exact occurrence as blocked on a global confirmation slot."""
+        active = self._active_runs.get(occurrence.job.job_id)
+        if active is None or active.occurrence != occurrence:
+            raise RuntimeError("Schedule occurrence is not active")
+        owner = active.owner
+        if owner is None:
+            raise RuntimeError("Schedule occurrence confirmation owner is not bound")
+        if owner.generation_id in self._cancelled_confirmation_generations:
+            active.confirmation_abort_pending = True
+            raise ConfirmationAborted("confirmation lifecycle cancelled")
+        active.confirmation_waiting = True
+
+    def confirmation_aborted(self, occurrence: ScheduleOccurrence) -> None:
+        """Retain an aborted occurrence until its terminal Store write is drained."""
+        active = self._active_runs.get(occurrence.job.job_id)
+        if active is None or active.occurrence != occurrence:
+            raise RuntimeError("Schedule occurrence is not active")
+        active.confirmation_waiting = False
+        active.confirmation_abort_pending = True
+
+    def confirmation_finished(self, occurrence: ScheduleOccurrence) -> None:
+        active = self._active_runs.get(occurrence.job.job_id)
+        if active is not None and active.occurrence == occurrence:
+            active.confirmation_waiting = False
+
+    def cancel_confirmation_generation(self, generation_id: UUID) -> None:
+        """Close the admission window for background confirmations in a generation."""
+        if not isinstance(generation_id, UUID):
+            raise TypeError("confirmation generation id must be a UUID")
+        self._cancelled_confirmation_generations.add(generation_id)
+        for active in self._active_runs.values():
+            if (
+                active.confirmation_waiting
+                and active.owner is not None
+                and active.owner.generation_id == generation_id
+            ):
+                active.confirmation_abort_pending = True
+
+    async def drain_confirmation_aborts(self, generation_id: UUID | None = None) -> None:
+        """Abort and await pending background confirmations before broad cancellation."""
+        if generation_id is not None:
+            self.cancel_confirmation_generation(generation_id)
+        else:
+            self._cancelled_confirmation_generations.update(
+                active.owner.generation_id
+                for active in self._active_runs.values()
+                if active.owner is not None
+            )
+            for active in self._active_runs.values():
+                if active.confirmation_waiting and active.owner is not None:
+                    active.confirmation_abort_pending = True
+        while True:
+            pending = tuple(
+                active
+                for active in self._active_runs.values()
+                if active.confirmation_abort_pending
+                and active.owner is not None
+                and (
+                    generation_id is None
+                    or active.owner.generation_id == generation_id
+                )
+            )
+            if not pending:
+                return
+            if self._cancel_confirmation_owner is not None:
+                await asyncio.gather(
+                    *(
+                        self._cancel_confirmation_owner(active.owner)
+                        for active in pending
+                        if active.confirmation_waiting and active.owner is not None
+                    ),
+                    return_exceptions=True,
+                )
+            await self._drain_confirmation_runs(pending, require_terminal=True)
+
+    async def _drain_confirmation_runs(
+        self,
+        active_runs: tuple[_ActiveScheduleRun, ...],
+        *,
+        require_terminal: bool,
+    ) -> None:
+        tasks = tuple(
+            active.task
+            for active in active_runs
+        )
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        for active in active_runs:
+            job_id = active.occurrence.job.job_id
+            if self._active_runs.get(job_id) is active:
+                self._active_runs.pop(job_id, None)
+                self._active_job_ids.discard(job_id)
+        if not require_terminal:
+            return
+        failures = tuple(result for result in results if isinstance(result, BaseException))
+        if not failures:
+            return
+        if len(failures) == 1 and not isinstance(failures[0], asyncio.CancelledError):
+            raise failures[0]
+        raise BaseExceptionGroup(
+            "Schedule confirmation abort did not reach a terminal Store outcome",
+            failures,
+        )
 
     async def register_dream_job(self, *, schedule: JobSchedule) -> ScheduleJob:
         if self._aborted:
@@ -261,11 +481,32 @@ class ScheduleService:
             await asyncio.gather(loop_task, return_exceptions=True)
         self._loop_task = None
         retry_at_jobs = self._consumed_at_jobs.intersection(self._active_job_ids)
+        confirmation_aborts = tuple(
+            active
+            for active in self._active_runs.values()
+            if active.confirmation_abort_pending
+        )
+        confirmation_abort_tasks = {active.task for active in confirmation_aborts}
+        ordinary_tasks = tuple(
+            task
+            for task in self._run_tasks
+            if task not in confirmation_abort_tasks
+        )
+        for task in ordinary_tasks:
+            if not task.done():
+                task.cancel()
+        if confirmation_aborts:
+            await self._drain_confirmation_runs(
+                confirmation_aborts,
+                require_terminal=True,
+            )
         await self._cancel_and_drain_job_tasks(cancel_terminal=True)
         retry_at_jobs.update(self._retry_at_jobs_after_resume)
         self._consumed_at_jobs.difference_update(retry_at_jobs)
         self._retry_at_jobs_after_resume.clear()
         self._active_job_ids.clear()
+        self._active_runs.clear()
+        self._cancelled_confirmation_generations.clear()
 
     async def _drain_cancelled_tasks(self) -> None:
         loop_task = self._loop_task
@@ -274,6 +515,8 @@ class ScheduleService:
         await self._cancel_and_drain_job_tasks(cancel_terminal=True)
         self._loop_task = None
         self._active_job_ids.clear()
+        self._active_runs.clear()
+        self._cancelled_confirmation_generations.clear()
         self._every_deadlines.clear()
         self._cron_cursors.clear()
 
@@ -320,6 +563,8 @@ class ScheduleService:
             )
         await self._cancel_and_drain_job_tasks(cancel_terminal=False)
         self._active_job_ids.clear()
+        self._active_runs.clear()
+        self._cancelled_confirmation_generations.clear()
         self._every_deadlines.clear()
         self._cron_cursors.clear()
         for result in results:
@@ -419,11 +664,24 @@ class ScheduleService:
             return
         if job.job_id in self._consumed_at_jobs:
             return
+        occurrence = ScheduleOccurrence(
+            job=job,
+            occurrence_id=uuid4(),
+            permission_snapshot=(
+                self._permission_snapshot_factory()
+                if lane == "user" and self._permission_snapshot_factory is not None
+                else None
+            ),
+        )
         self._consume_recurring_occurrence(job, current_monotonic=current_monotonic)
         if job.schedule.kind == "at":
             self._consumed_at_jobs.add(job.job_id)
-        task = asyncio.create_task(self._run_job(job, lane=lane))
+        task = asyncio.create_task(self._run_job(occurrence, lane=lane))
         self._active_job_ids.add(job.job_id)
+        self._active_runs[job.job_id] = _ActiveScheduleRun(
+            occurrence=occurrence,
+            task=task,
+        )
         self._run_tasks.add(task)
         task.add_done_callback(self._run_finished)
 
@@ -584,11 +842,18 @@ class ScheduleService:
                     task.cancel()
             await asyncio.gather(*tasks, return_exceptions=True)
 
-    async def _run_job(self, job: ScheduleJob, *, lane: _ExecutionLane) -> None:
+    async def _run_job(
+        self,
+        occurrence: ScheduleOccurrence,
+        *,
+        lane: _ExecutionLane,
+    ) -> None:
+        job = occurrence.job
         terminal: Literal["ok", "error"] | None = None
         terminal_error: str | None = None
         terminal_ready = False
         terminal_persisted = False
+        confirmation_aborted = False
         try:
             if lane == "dream":
                 result = await self._execute_dream()
@@ -602,11 +867,19 @@ class ScheduleService:
                     terminal = "ok"
                 terminal_ready = True
             else:
-                await self._execute_user_job(job)
+                if self._execute_user_occurrence is not None:
+                    await self._execute_user_occurrence(occurrence)
+                else:
+                    await self._execute_user_job(job)
                 terminal = "ok"
                 terminal_ready = True
         except asyncio.CancelledError:
             raise
+        except ConfirmationAborted:
+            confirmation_aborted = True
+            terminal = "error"
+            terminal_error = "Schedule Tool confirmation was aborted."
+            terminal_ready = True
         except ScheduleJobExecutionError as failure:
             terminal = "error"
             terminal_error = failure.error.message
@@ -623,18 +896,34 @@ class ScheduleService:
         finally:
             try:
                 if terminal is not None and terminal_ready:
-                    await self._commit_terminal(job, terminal, terminal_error)
+                    await self._commit_terminal(
+                        job,
+                        terminal,
+                        terminal_error,
+                        propagate_failure=confirmation_aborted,
+                    )
                     terminal_persisted = True
             finally:
                 if job.schedule.kind == "at" and not terminal_persisted:
                     self._retry_at_jobs_after_resume.add(job.job_id)
-                self._active_job_ids.discard(job.job_id)
+                active = self._active_runs.get(job.job_id)
+                retain_for_abort_drain = (
+                    active is not None
+                    and active.occurrence == occurrence
+                    and active.confirmation_abort_pending
+                )
+                if not retain_for_abort_drain:
+                    self._active_job_ids.discard(job.job_id)
+                if active is not None and active.occurrence == occurrence and not retain_for_abort_drain:
+                    self._active_runs.pop(job.job_id, None)
 
     async def _commit_terminal(
         self,
         job: ScheduleJob,
         terminal: Literal["ok", "error"],
         error: str | None,
+        *,
+        propagate_failure: bool = False,
     ) -> None:
         finished_at_ms = _epoch_milliseconds(self._clock.now())
         every_deadline: _EveryDeadline | None = None
@@ -708,6 +997,10 @@ class ScheduleService:
                         terminal,
                         type(failure).__name__,
                     )
+            if propagate_failure:
+                raise ScheduleStoreFaultedError(
+                    "Schedule confirmation terminal update failed"
+                ) from failure
         if cancellation is not None:
             raise cancellation
 
@@ -716,6 +1009,11 @@ class ScheduleService:
 
     def _run_finished(self, task: asyncio.Task[None]) -> None:
         self._run_tasks.discard(task)
+        for job_id, active in tuple(self._active_runs.items()):
+            if active.task is task:
+                if not active.confirmation_abort_pending:
+                    self._active_runs.pop(job_id, None)
+                break
         if task.cancelled():
             return
         try:
@@ -895,6 +1193,8 @@ __all__ = [
     "ScheduleClock",
     "ScheduleJobExecutionError",
     "ScheduleJobExecutor",
+    "ScheduleOccurrence",
+    "ScheduleOccurrenceExecutor",
     "ScheduleService",
     "ScheduleServiceStatus",
     "ScheduleStaleRemovalError",

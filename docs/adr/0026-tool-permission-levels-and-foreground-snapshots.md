@@ -106,8 +106,9 @@ errors. Web Search is direct at every level. Web Fetch uses the per-hop
 network authorization below. Foreground Read-Only and Workspace-Write MCP
 calls each request one confirmation bound to the normalized server/tool
 identity and complete arguments; approval is never cached. User Schedule
-Agent Runs call MCP Tools directly through their run-local Gateway without
-requesting foreground or background Tool Confirmation. A
+Agent Runs use the admission snapshot through their run-local Gateway and
+enter the background confirmation coordinator at the lower levels. Full-Access
+calls directly. A
 process startup notice is shown at most once when the configured level is
 Full-Access. `/config` reports the configured level, and `/status` reports both
 configured and current foreground levels.
@@ -139,9 +140,18 @@ Jobs, Store/Service failures, and other hard Tool errors remain errors at every
 level; Full-Access does not bypass them. Schedule Job persistence and public
 JSON contain no permission level or snapshot.
 
-The existing User Schedule Agent Run continues to use its direct non-foreground
-path, and Dream Schedule Job and other System Schedule Job mutations remain
-internal direct operations.
+At User Schedule occurrence admission, Schedule Service captures the immutable
+startup configured level and process-lifetime resolved Exec Shell in a runtime
+`PermissionSnapshot`. The exact snapshot is projected into the Schedule Runtime
+Context and the run-local Gateway. Read-Only and Workspace-Write apply the same
+structured File, Exec, Web Fetch, and per-call MCP rules as the corresponding
+foreground level; Full-Access removes ordinary permission prompts but retains
+hard errors and catastrophic/uncertain Exec confirmation. Each low-level MCP
+call therefore enters the shared background confirmation coordinator, with no
+confirmation cache. Dream and other System Schedule Jobs remain outside this
+model and keep their internal direct behavior. The snapshot, owner, and
+presentation envelope remain runtime-only and never enter `ScheduleJob`,
+Session, Tool Result, or public JSON.
 
 ## File Facts and Host Paths
 
@@ -156,10 +166,9 @@ used.
 Foreground model File Tools do not inherit the Skill Root exemption used by
 internal Skill loading. A foreground model-issued File access beneath
 `~/.myclaw/skills` is an ordinary external access unless it is also beneath
-the Workspace. User Schedule Agent Runs are composed without a foreground Tool
-Permission Level, so their File Tool calls use each Tool's ordinary safety reason
-directly. Dream's private memory Tool and Runtime persistence writes remain
-outside this model File policy.
+the Workspace. User Schedule Agent Runs use their admission snapshot for the
+same canonical File policy. Dream's private memory Tool and Runtime persistence
+writes remain outside this model File policy.
 
 Permission classification happens after preparation and business refusal, so
 invalid arguments, hard errors, capability errors, and execution errors do
@@ -215,7 +224,8 @@ foreground File and parseable non-catastrophic PowerShell or Bash Exec
 permission confirmation; validation, capability checks, business refusals, catastrophic
 or uncertain Exec confirmation, and Tool errors remain enforced. Web Search
 remains direct; Web Fetch applies the per-hop rules above. User Schedule MCP
-calls execute directly without entering the foreground confirmation path.
+calls use the same per-call policy through the background confirmation path;
+Full-Access calls directly.
 
 The existing Skill Loader remains responsible for its own internal reads, and
 ADR-0016 no longer defines a confirmation-free boundary for model-issued

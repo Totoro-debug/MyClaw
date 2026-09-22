@@ -173,6 +173,10 @@ async def test_cli_async_root_owns_lifetime_components_and_async_shutdown(
         async def pause_and_drain(self) -> None:
             events.append("schedule_pause")
 
+        async def drain_confirmation_aborts(self, *, generation_id: object | None = None) -> None:
+            assert generation_id is None
+            events.append("schedule_confirmation_drain")
+
         async def close(self) -> None:
             events.append("schedule_close")
 
@@ -302,6 +306,7 @@ async def test_cli_async_root_owns_lifetime_components_and_async_shutdown(
         "app_run",
         "terminal_restore",
         "confirmation_close",
+        "schedule_confirmation_drain",
         "management_deactivate",
         "schedule_pause",
         "schedule_close",
@@ -990,10 +995,12 @@ async def test_cli_resume_publishes_current_only_after_target_activation(
 
         async def cancel_generation(self, generation_id: UUID) -> None:
             cancelled_generations.append(generation_id)
+            events.append("coordinator_cancel_generation")
 
         async def close(self) -> None:
             nonlocal coordinator_close_calls
             coordinator_close_calls += 1
+            events.append("coordinator_close")
 
     def current_value() -> object:
         assert current_callback is not None
@@ -1080,6 +1087,19 @@ async def test_cli_resume_publishes_current_only_after_target_activation(
 
         def start(self) -> None:
             events.append("schedule_start")
+
+        def cancel_confirmation_generation(self, generation_id: UUID) -> None:
+            events.append(f"schedule_cancel_generation:{generation_id.int}")
+
+        async def drain_confirmation_aborts(
+            self,
+            *,
+            generation_id: object | None = None,
+        ) -> None:
+            if isinstance(generation_id, UUID):
+                events.append(f"schedule_confirmation_drain:{generation_id.int}")
+            else:
+                events.append("schedule_confirmation_drain:all")
 
         async def pause_and_drain(self) -> None:
             nonlocal pause_count
@@ -1230,7 +1250,7 @@ async def test_cli_resume_publishes_current_only_after_target_activation(
         configuration=configuration,
     )
 
-    assert events[:27] == [
+    assert events[:33] == [
         "old_init",
         "old_preflight",
         "old_start",
@@ -1239,6 +1259,9 @@ async def test_cli_resume_publishes_current_only_after_target_activation(
         "before_current",
         "target_init",
         "target_preflight",
+        "schedule_cancel_generation:1",
+        "coordinator_cancel_generation",
+        "schedule_confirmation_drain:1",
         "quiesce",
         "schedule_pause",
         "old_abort",
@@ -1250,6 +1273,9 @@ async def test_cli_resume_publishes_current_only_after_target_activation(
         "target_schedule_job",
         "target_init",
         "target_preflight",
+        "schedule_cancel_generation:2",
+        "coordinator_cancel_generation",
+        "schedule_confirmation_drain:2",
         "quiesce",
         "schedule_pause",
         "target_abort",
@@ -1259,7 +1285,9 @@ async def test_cli_resume_publishes_current_only_after_target_activation(
         "schedule_resume",
         "target_schedule_job",
     ]
-    assert events[27:] == [
+    assert events[33:] == [
+        "coordinator_close",
+        "schedule_confirmation_drain:all",
         "schedule_pause",
         "schedule_close",
         "target_close",

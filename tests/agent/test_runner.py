@@ -10,6 +10,7 @@ from uuid import uuid4
 
 import pytest
 
+from myclaw.agent.confirmation import ConfirmationAborted
 from myclaw.agent.run_errors import CommittableAgentRunError
 from myclaw.agent.runner import (
     AgentRunner,
@@ -1152,6 +1153,48 @@ async def test_runner_passes_confirmation_requester_directly_before_tool_call() 
     assert result.final_content == "Done"
     assert order == ["callback", "gateway"]
     assert gateway.confirmations == [requester]
+
+
+@pytest.mark.asyncio
+async def test_runner_propagates_confirmation_aborted_without_turn_repair() -> None:
+    call = ModelToolCall(id="call", name="work", arguments="{}")
+    provider = ScriptedFakeProvider(
+        streams=(
+            StreamScript(
+                events=(
+                    ModelCompleted(
+                        response=ModelResponse(
+                            message=AssistantModelMessage(content="Working", tool_calls=(call,)),
+                            usage=ModelUsage(input_tokens=1, output_tokens=1, total_tokens=2),
+                            finish_reason="tool_calls",
+                        )
+                    ),
+                )
+            ),
+        )
+    )
+
+    class AbortingGateway(_DirectGateway):
+        async def call(
+            self,
+            tool_call: ModelToolCall,
+            *,
+            confirmation: object = None,
+        ) -> ToolResult:
+            del tool_call, confirmation
+            raise ConfirmationAborted("confirmation lifecycle cancelled")
+
+    with pytest.raises(ConfirmationAborted):
+        await _runner(ScriptedFakeRouter(provider)).run(
+            [{"role": "user", "content": "Run work."}],
+            model="chat",
+            tool_gateway=AbortingGateway([]),
+            on_output=None,
+            confirmation=None,
+            externalize_result=None,
+            cancel_requested=None,
+            max_iterations=50,
+        )
 
 
 @pytest.mark.asyncio

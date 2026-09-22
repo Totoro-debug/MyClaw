@@ -16,4 +16,20 @@ Synchronous and asynchronous presenter invocation failures complete the active p
 
 The Textual adapter projects foreground and background envelopes into the same modal. Foreground uses `Tool Confirmation`; background uses `Background Tool Confirmation` and shows `Source: job_id + title`. The modal defaults focus to Decline, has no timeout, and treats lifecycle dismissal as no decision. The adapter captures the mounted conversation display and input widgets once and reuses those references for streamed output and modal restoration, avoiding stale widget queries across replacement.
 
-Schedule permission and background producer integration are intentionally deferred to the later Schedule phase. This ADR defines the shared lifetime, ordering, cancellation, and presentation contract without changing the existing User Schedule execution path.
+User Schedule occurrences use this same coordinator when their admission
+snapshot requires confirmation. Schedule Service binds a
+`BackgroundConfirmationOwner(generation_id, job_id, occurrence_id)` to the
+active occurrence; the Agent Loop wraps each exact normalized call in a
+background envelope carrying only the canonical `job_id` and title for the
+modal source. Replacement and shutdown cancel old-generation owners and drain
+their typed `ConfirmationAborted` failures while the Schedule Store is still
+writable. The typed outcome passes through the Gateway, Runner, and Agent Loop
+to Schedule Service; a failed terminal Store write fails that drain. The old
+generation cannot admit a later confirmation between drain and Schedule pause;
+the pause barrier retains any late gate-aborted occurrence until terminal
+persistence finishes before it broadly cancels ordinary Schedule work.
+A recurring Job retains an error terminal state, while a one-shot Job follows
+its existing terminal removal path. A successful Job deletion first persists
+absence, then cancels and drains its exact active occurrence and confirmation
+owner. No owner or envelope is persisted, and Dream/System Schedule work
+remains outside this confirmation path.

@@ -346,7 +346,9 @@ class ToolPermissionPolicy:
         if facts.schedule_action is not None:
             return _classify_schedule_invocation(facts, context)
         if facts.mcp_identity is not None:
-            if context.origin != "foreground":
+            if context.origin == "memory":
+                return _DecisionAuthorizationSession("direct")
+            if context.origin == "schedule" and context.snapshot is None:
                 return _DecisionAuthorizationSession("direct")
             if context.level is None:
                 return _LegacyAuthorizationSession(facts.legacy_safety_reason)
@@ -361,7 +363,14 @@ class ToolPermissionPolicy:
         if (
             facts.tool_name == "exec"
             and facts.exec_assessment is not None
-            and context.origin == "foreground"
+            and (
+                context.origin == "foreground"
+                or (
+                    context.origin == "schedule"
+                    and context.snapshot is not None
+                    and context.configured_schedule_level is not None
+                )
+            )
         ):
             return _classify_exec_invocation(facts, context)
         if facts.file_accesses and context.origin != "memory":

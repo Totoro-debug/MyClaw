@@ -48,6 +48,26 @@ def test_foreground_runtime_context_projects_the_permission_snapshot(
     assert "- Tool Confirmation: Permission checks may require one confirmation" in content
 
 
+def test_schedule_runtime_context_projects_the_permission_snapshot(
+    monkeypatch: pytest.MonkeyPatch,
+    workspace: Path,
+) -> None:
+    builder = _builder(monkeypatch, workspace, "UTC")
+    snapshot = PermissionSnapshot("workspace-write", resolve_exec_shell("auto"))
+
+    messages = builder.build_schedule_messages(
+        [{"role": "user", "content": "Scheduled question."}],
+        session_id="schedule-session",
+        permission_snapshot=snapshot,
+    )
+
+    content = messages[-1]["content"]
+    assert isinstance(content, str)
+    assert "- Tool Permission Level: workspace-write" in content
+    assert f"- Exec Shell: {snapshot.exec_shell.family}" in content
+    assert "- Tool Confirmation: Permission checks may require one confirmation" in content
+
+
 class _FrozenDateTime(datetime):
     @classmethod
     def now(cls, tz: object = None) -> _FrozenDateTime:
