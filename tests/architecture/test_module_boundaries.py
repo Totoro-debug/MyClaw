@@ -811,6 +811,61 @@ def test_agent_modules_do_not_depend_on_terminal_presentation() -> None:
     assert violations == []
 
 
+def test_cli_exclusively_owns_the_runtime_confirmation_coordinator() -> None:
+    constructor_sites: list[Path] = []
+    for path in _python_files(PACKAGE_ROOT):
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        if any(
+            isinstance(node, ast.Call)
+            and (
+                (isinstance(node.func, ast.Name) and node.func.id == "ToolConfirmationCoordinator")
+                or (
+                    isinstance(node.func, ast.Attribute)
+                    and node.func.attr == "ToolConfirmationCoordinator"
+                )
+            )
+            for node in ast.walk(tree)
+        ):
+            constructor_sites.append(path.relative_to(PROJECT_ROOT))
+
+    assert constructor_sites == [_CLI_PATH]
+
+    loop_path = PACKAGE_ROOT / "agent" / "loop.py"
+    terminal_path = PACKAGE_ROOT / "terminal" / "conversation.py"
+    assert "ToolConfirmationCoordinator" not in loop_path.read_text(encoding="utf-8")
+    assert "ToolConfirmationCoordinator" not in terminal_path.read_text(encoding="utf-8")
+
+    terminal_tree = ast.parse(terminal_path.read_text(encoding="utf-8"), filename=str(terminal_path))
+    terminal_app = next(
+        node
+        for node in terminal_tree.body
+        if isinstance(node, ast.ClassDef) and node.name == "TerminalConversationApp"
+    )
+    bind = next(
+        node
+        for node in terminal_app.body
+        if isinstance(node, ast.FunctionDef) and node.name == "bind_confirmation_coordinator"
+    )
+    coordinator_parameter = bind.args.args[1]
+    assert isinstance(coordinator_parameter.annotation, ast.Name)
+    assert coordinator_parameter.annotation.id == "ConfirmationPresentationCoordinator"
+
+    forbidden_queue_names = {
+        "_pending_confirmation",
+        "_confirmation_queue",
+        "_foreground_confirmations",
+        "_background_confirmations",
+    }
+    for path in (loop_path, terminal_path):
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        retained = {
+            node.attr
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Attribute) and node.attr in forbidden_queue_names
+        }
+        assert retained == set()
+
+
 def test_terminal_conversation_lifecycle_has_no_business_lifecycle_calls() -> None:
     path = PACKAGE_ROOT / "terminal" / "conversation.py"
     tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))

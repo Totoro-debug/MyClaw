@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from copy import deepcopy
 from dataclasses import dataclass, replace
 from datetime import datetime
@@ -15,6 +15,11 @@ from loguru import logger
 from tzlocal import get_localzone_name
 
 from myclaw.agent.blackboard import Blackboard
+from myclaw.agent.confirmation import (
+    CallbackConfirmationRequester,
+    ConfirmationEnvelope,
+    ForegroundConfirmationOwner,
+)
 from myclaw.agent.context import ContextBuilder
 from myclaw.agent.context_budget import ContextBudget, ContextUsageSnapshot, estimate_request_tokens
 from myclaw.agent.memory.conversation_compactor import (
@@ -136,12 +141,9 @@ class TerminalAgentLoopControl(Protocol):
 
 
 type ConfirmationCallback = Callable[[ConfirmationRequestView], None]
-
-
-@dataclass(slots=True)
-class _PendingConfirmation:
-    request: ConfirmationRequest
-    future: asyncio.Future[ConfirmationDecision]
+type RuntimeConfirmationRequester = Callable[
+    [ConfirmationEnvelope], Awaitable[ConfirmationDecision]
+]
 
 
 @dataclass(slots=True)
@@ -257,6 +259,7 @@ class AgentLoop:
             )
         )
 
+        self._generation_id = new_uuid()
         self._workspace_state = workspace_state
         self._configuration = configuration
         self._session = active_session
@@ -265,6 +268,7 @@ class AgentLoop:
         self._context_builder = context_builder
         self._memory_manager = memory_manager
         self._now = now
+        self._new_uuid = new_uuid
         self._monotonic_now = monotonic_now
         self._schedule_now = schedule_service.current_time
         self._tool_gateway = tool_gateway
@@ -286,8 +290,10 @@ class AgentLoop:
         self._close_task: asyncio.Task[None] | None = None
         self._execution_ready: asyncio.Event | None = None
         self._title_work: dict[str, _TitleWork] = {}
-        self._pending_confirmation: _PendingConfirmation | None = None
         self._confirmation_callback: ConfirmationCallback | None = None
+        self._legacy_confirmation_requester: CallbackConfirmationRequester | None = None
+        self._confirmation_requester: RuntimeConfirmationRequester | None = None
+        self._active_foreground_owner: ForegroundConfirmationOwner | None = None
         self._cancel_requested = False
         self._closing = False
         self._closed = False
@@ -305,6 +311,11 @@ class AgentLoop:
     @property
     def session(self) -> Session:
         return self._session
+
+    @property
+    def generation_id(self) -> UUID:
+        """Return the immutable identity of this Runtime Generation."""
+        return self._generation_id
 
     @property
     def skill_metadata(self) -> tuple[SkillMetadata, ...]:
@@ -361,11 +372,26 @@ class AgentLoop:
         if not callable(callback):
             raise TypeError("confirmation callback must be callable")
         self._confirmation_callback = callback
+        self._legacy_confirmation_requester = CallbackConfirmationRequester(callback)
+
+    def bind_confirmation_requester(self, requester: RuntimeConfirmationRequester) -> None:
+        """Bind the Runtime Lifetime requester without taking ownership of its queue."""
+        if self._confirmation_requester is not None:
+            raise RuntimeError("Agent Loop confirmation requester is already bound")
+        if self._closed or self._aborted:
+            raise RuntimeError("Agent Loop is closed")
+        if not callable(requester):
+            raise TypeError("confirmation requester must be callable")
+        self._confirmation_requester = requester
 
     def unbind_confirmation_callback(self, callback: ConfirmationCallback) -> None:
         """Clear a callback only when it is still bound to this control surface."""
         if self._confirmation_callback is callback:
+            legacy = self._legacy_confirmation_requester
+            if legacy is not None:
+                legacy.unbind(callback)
             self._confirmation_callback = None
+            self._legacy_confirmation_requester = None
 
     async def start(self) -> None:
         if self._closed or self._aborted or self._closing or self._close_task is not None:
@@ -514,6 +540,9 @@ class AgentLoop:
         self._closing = True
         self._cancel_pending_confirmation()
         self._confirmation_callback = None
+        self._legacy_confirmation_requester = None
+        self._confirmation_requester = None
+        self._active_foreground_owner = None
         if not self._started:
             self._abandon_session()
             self._closed = True
@@ -927,16 +956,10 @@ class AgentLoop:
         confirmation_id: UUID,
         decision: ConfirmationDecision,
     ) -> None:
-        if self._aborted:
+        legacy = self._legacy_confirmation_requester
+        if self._aborted or legacy is None:
             raise ValueError("Confirmation response is late or unknown")
-        if decision not in {"approved", "declined"}:
-            raise ValueError("confirmation decision must be approved or declined")
-        pending = self._pending_confirmation
-        if pending is None or pending.request.confirmation_id != confirmation_id:
-            raise ValueError("Confirmation response is late or unknown")
-        if pending.future.done():
-            raise ValueError("Confirmation response is late or unknown")
-        pending.future.set_result(decision)
+        legacy.respond(confirmation_id, decision)
 
     async def _consume_foreground(self) -> None:
         try:
@@ -1163,6 +1186,11 @@ class AgentLoop:
 
         if title_work is not None and not title_work.coordination.prepared.done():
             title_work.coordination.prepared.set_result(True)
+        foreground_owner = ForegroundConfirmationOwner(
+            generation_id=self._generation_id,
+            run_id=self._new_uuid(),
+        )
+        self._active_foreground_owner = foreground_owner
         try:
             result = await run_context.runner.run(
                 initial_messages,
@@ -1189,6 +1217,9 @@ class AgentLoop:
                 metadata_updates=metadata_patch()[0],
                 metadata_removals=metadata_patch()[1],
             )
+        finally:
+            if self._active_foreground_owner is foreground_owner:
+                self._active_foreground_owner = None
 
         if self._aborted:
             return False
@@ -1472,25 +1503,27 @@ class AgentLoop:
     ) -> ConfirmationDecision:
         if self._aborted or self._closing:
             raise asyncio.CancelledError()
-        if self._pending_confirmation is not None:
-            raise RuntimeError("A foreground confirmation request is already pending")
-        callback = self._confirmation_callback
-        if callback is None:
-            raise RuntimeError("Agent Loop confirmation callback is not bound")
-        future: asyncio.Future[ConfirmationDecision] = asyncio.get_running_loop().create_future()
-        pending = _PendingConfirmation(request=request, future=future)
-        self._pending_confirmation = pending
-        try:
-            callback(request)
-            return await future
-        finally:
-            if self._pending_confirmation is pending:
-                self._pending_confirmation = None
+        requester = self._confirmation_requester
+        if requester is not None:
+            owner = self._active_foreground_owner
+            if owner is None:
+                raise RuntimeError("foreground confirmation owner is not bound")
+            return await requester(
+                ConfirmationEnvelope(
+                    request=request,
+                    origin="foreground",
+                    owner=owner,
+                )
+            )
+        legacy = self._legacy_confirmation_requester
+        if legacy is None:
+            raise RuntimeError("Agent Loop confirmation requester is not bound")
+        return await legacy.request(request)
 
     def _cancel_pending_confirmation(self) -> None:
-        pending = self._pending_confirmation
-        if pending is not None and not pending.future.done():
-            pending.future.cancel()
+        legacy = self._legacy_confirmation_requester
+        if legacy is not None:
+            legacy.cancel()
 
     def _start_title_if_needed(
         self,

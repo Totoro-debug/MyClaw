@@ -10,6 +10,7 @@ import typer
 from rich.console import Console
 from tzlocal import get_localzone_name
 
+from myclaw.agent.confirmation import ToolConfirmationCoordinator
 from myclaw.agent.loop import AgentLoop, ModelContextOverflowError
 from myclaw.agent.memory.dream import Dream
 from myclaw.agent.memory.manager import MemoryManager
@@ -208,6 +209,7 @@ async def _run_cli_conversation(
     permission_control = RuntimePermissionControl(
         getattr(configuration.runtime, "permission_level", "workspace-write")
     )
+    confirmation_coordinator = ToolConfirmationCoordinator()
     if permission_control.configured() == "full-access":
         _print_permission_startup_notice()
 
@@ -302,7 +304,7 @@ async def _run_cli_conversation(
         ) -> AgentLoop:
             selected_mcp_snapshot = active_mcp_snapshot if mcp_snapshot is None else mcp_snapshot
             selected_mcp_keywords = active_mcp_keywords if mcp_keywords is None else mcp_keywords
-            return AgentLoop(
+            loop = AgentLoop(
                 workspace_path=workspace_path,
                 workspace_state=workspace_state,
                 agent_home=agent_home,
@@ -320,6 +322,10 @@ async def _run_cli_conversation(
                 exec_host=exec_host,
                 permission_control=permission_control,
             )
+            bind_confirmation_requester = getattr(loop, "bind_confirmation_requester", None)
+            if callable(bind_confirmation_requester):
+                bind_confirmation_requester(confirmation_coordinator.request)
+            return loop
 
         def current_agent_loop() -> AgentLoop:
             if current_loop is None:
@@ -464,6 +470,9 @@ async def _run_cli_conversation(
 
                 destructive_started = True
                 try:
+                    generation_id = getattr(old_loop, "generation_id", None)
+                    if generation_id is not None:
+                        await confirmation_coordinator.cancel_generation(generation_id)
                     await terminal_app.quiesce_for_rebind()
                     await schedule_service.pause_and_drain()
                     current_loop = None
@@ -531,6 +540,13 @@ async def _run_cli_conversation(
             management_dispatcher=dispatcher,
             skill_metadata=initial_loop.skill_metadata,
         )
+        bind_confirmation_coordinator = getattr(
+            terminal_app,
+            "bind_confirmation_coordinator",
+            None,
+        )
+        if callable(bind_confirmation_coordinator):
+            bind_confirmation_coordinator(confirmation_coordinator)
 
         await initial_loop.start()
         schedule_service.start()
@@ -542,6 +558,11 @@ async def _run_cli_conversation(
     except BaseException as error:
         primary_error = error
     finally:
+        try:
+            await confirmation_coordinator.close()
+        except BaseException as error:
+            cleanup_errors.append(error)
+
         if management is not None:
             try:
                 management.deactivate()

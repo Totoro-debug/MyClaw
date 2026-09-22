@@ -82,6 +82,17 @@ async def test_cli_async_root_owns_lifetime_components_and_async_shutdown(
     close_error = RuntimeError("loop close failed")
     primary_error = RuntimeError("terminal failed")
 
+    class FakeConfirmationCoordinator:
+        def __init__(self) -> None:
+            events.append("confirmation_init")
+
+        async def request(self, request: object) -> Literal["approved", "declined"]:
+            del request
+            raise AssertionError("No confirmation is expected in this lifecycle test")
+
+        async def close(self) -> None:
+            events.append("confirmation_close")
+
     class FakeWorkspaceState:
         def __init__(self, workspace_path: Path) -> None:
             self.workspace_path = workspace_path
@@ -172,6 +183,10 @@ async def test_cli_async_root_owns_lifetime_components_and_async_shutdown(
             self.control = object()
             self.skill_metadata = ()
 
+        def bind_confirmation_requester(self, requester: Callable[..., Awaitable[object]]) -> None:
+            assert callable(requester)
+            events.append("loop_bind_confirmation")
+
         def preflight(self) -> None:
             events.append("loop_preflight")
 
@@ -207,6 +222,10 @@ async def test_cli_async_root_owns_lifetime_components_and_async_shutdown(
             del kwargs
             events.append("app_init")
 
+        def bind_confirmation_coordinator(self, coordinator: object) -> None:
+            assert isinstance(coordinator, FakeConfirmationCoordinator)
+            events.append("app_bind_confirmation")
+
         async def run_async(self) -> None:
             events.append("app_run")
             try:
@@ -226,6 +245,7 @@ async def test_cli_async_root_owns_lifetime_components_and_async_shutdown(
     monkeypatch.setattr(cli, "ManagementViewService", FakeManagementService)
     monkeypatch.setattr(cli, "ManagementCommandDispatcher", FakeDispatcher)
     monkeypatch.setattr(cli, "TerminalConversationApp", FakeApp)
+    monkeypatch.setattr(cli, "ToolConfirmationCoordinator", FakeConfirmationCoordinator)
 
     home = AgentHome(tmp_path / "agent-home")
     configuration: Any = SimpleNamespace(
@@ -258,6 +278,7 @@ async def test_cli_async_root_owns_lifetime_components_and_async_shutdown(
         )
 
     assert events == [
+        "confirmation_init",
         "workspace_init",
         "workspace_initialize",
         "mcp_init",
@@ -268,16 +289,19 @@ async def test_cli_async_root_owns_lifetime_components_and_async_shutdown(
         "dream_init",
         "schedule_init",
         "loop_init",
+        "loop_bind_confirmation",
         "loop_preflight",
         "schedule_preflight",
         "dream_register",
         "management_init",
         "dispatcher_init",
         "app_init",
+        "app_bind_confirmation",
         "loop_start",
         "schedule_start",
         "app_run",
         "terminal_restore",
+        "confirmation_close",
         "management_deactivate",
         "schedule_pause",
         "schedule_close",
@@ -956,6 +980,20 @@ async def test_cli_resume_publishes_current_only_after_target_activation(
     management_instances: list[object] = []
     dispatcher_instances: list[object] = []
     app_instances: list[object] = []
+    cancelled_generations: list[UUID] = []
+    coordinator_close_calls = 0
+
+    class FakeConfirmationCoordinator:
+        async def request(self, request: object) -> Literal["approved", "declined"]:
+            del request
+            raise AssertionError("No confirmation is expected in this replacement test")
+
+        async def cancel_generation(self, generation_id: UUID) -> None:
+            cancelled_generations.append(generation_id)
+
+        async def close(self) -> None:
+            nonlocal coordinator_close_calls
+            coordinator_close_calls += 1
 
     def current_value() -> object:
         assert current_callback is not None
@@ -1070,12 +1108,16 @@ async def test_cli_resume_publishes_current_only_after_target_activation(
             self.session = FakeSession("initial" if session_id is None else str(session_id))
             self.control = FakeControl()
             self.skill_metadata = ()
+            self.generation_id = UUID(int=len(loop_instances))
             if session_id is None:
                 initial_loop = self
                 events.append("old_init")
             else:
                 target_loop = self
                 events.append("target_init")
+
+        def bind_confirmation_requester(self, requester: Callable[..., Awaitable[object]]) -> None:
+            assert callable(requester)
 
         def preflight(self) -> None:
             events.append("target_preflight" if self is target_loop else "old_preflight")
@@ -1173,6 +1215,7 @@ async def test_cli_resume_publishes_current_only_after_target_activation(
     monkeypatch.setattr(cli, "ManagementViewService", FakeManagementService)
     monkeypatch.setattr(cli, "ManagementCommandDispatcher", FakeDispatcher)
     monkeypatch.setattr(cli, "TerminalConversationApp", FakeApp)
+    monkeypatch.setattr(cli, "ToolConfirmationCoordinator", FakeConfirmationCoordinator)
 
     home = AgentHome(tmp_path / "agent-home")
     configuration: Any = SimpleNamespace(
@@ -1234,6 +1277,11 @@ async def test_cli_resume_publishes_current_only_after_target_activation(
     assert len(management_instances) == 1
     assert len(dispatcher_instances) == 1
     assert len(app_instances) == 1
+    assert cancelled_generations == [
+        cast(Any, loop_instances[0]).generation_id,
+        cast(Any, loop_instances[1]).generation_id,
+    ]
+    assert coordinator_close_calls == 1
 
 
 @pytest.mark.asyncio

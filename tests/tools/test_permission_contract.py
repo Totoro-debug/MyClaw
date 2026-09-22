@@ -5,6 +5,7 @@ from typing import Any
 
 import pytest
 
+from myclaw.agent.confirmation import ConfirmationAborted
 from myclaw.agent.tools.base import BaseTool, ToolError
 from myclaw.agent.tools.permission import (
     PermissionContext,
@@ -163,6 +164,22 @@ class _ExecutionErrorTool(BaseTool):
         raise ToolError("execution failed")
 
 
+class _AbortedExecutionTool(BaseTool):
+    name = "aborted_execution"
+    description = "A Tool whose execution-time confirmation is lifecycle-aborted."
+
+    async def execute(self) -> str:
+        raise AssertionError("the authorized execution seam must be used")
+
+    async def execute_authorized(
+        self,
+        arguments: dict[str, Any],
+        authorization: ToolAuthorizationSession,
+    ) -> str:
+        del arguments, authorization
+        raise ConfirmationAborted("confirmation lifecycle cancelled")
+
+
 @pytest.mark.asyncio
 async def test_gateway_opens_a_fresh_session_with_structured_call_facts() -> None:
     policy = _RecordingPolicy()
@@ -264,6 +281,20 @@ async def test_approved_confirm_session_reaches_the_execution_boundary() -> None
     assert result.confirmation.decision == "approved"
     assert observed_sessions == [policy.sessions[0]]
     assert tool.calls == ["payload"]
+
+
+@pytest.mark.asyncio
+async def test_execution_time_confirmation_abort_remains_typed() -> None:
+    tool = _AbortedExecutionTool()
+    gateway = ToolGateway._for_memory(
+        (tool,),
+        permission_policy=_FixedDecisionPolicy("direct"),
+    )
+
+    with pytest.raises(ConfirmationAborted, match="lifecycle cancelled"):
+        await gateway.call(
+            ModelToolCall(id="call-aborted", name=tool.name, arguments="{}")
+        )
 
 
 @pytest.mark.asyncio

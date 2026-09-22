@@ -8,6 +8,7 @@ from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
 from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from functools import partial
 from pathlib import Path
 from typing import Any, ClassVar, Literal, Never, cast
 from uuid import UUID, uuid4
@@ -26,11 +27,18 @@ from textual.events import (
     MouseUp,
     Paste,
 )
+from textual.message import Message
 from textual.pilot import Pilot
 from textual.widget import Widget
 from textual.widgets import Button, Markdown, OptionList, Static, TextArea
 
 import myclaw.terminal.cli as cli
+from myclaw.agent.confirmation import (
+    BackgroundConfirmationOwner,
+    ConfirmationAborted,
+    ConfirmationEnvelope,
+    ToolConfirmationCoordinator,
+)
 from myclaw.agent.loop import AgentLoop, ConfirmationRequestView, ForegroundConversationProjection
 from myclaw.agent.memory.dream import DreamResult
 from myclaw.agent.message_bus import InboundMessage, MessageBus, OutboundMessage
@@ -937,6 +945,7 @@ def _terminal_app(
     skill_metadata: tuple[SkillMetadata, ...] = (),
     management_dispatcher: ManagementCommandDispatcher | None = None,
     cleanup: Callable[[], Awaitable[None]] | None = None,
+    confirmation_coordinator: ToolConfirmationCoordinator | None = None,
 ) -> TerminalConversationApp:
     dispatcher = (
         getattr(runtime, "management_dispatcher", _management_dispatcher())
@@ -952,6 +961,10 @@ def _terminal_app(
     if monotonic is not None:
         kwargs["monotonic"] = monotonic
     app = app_type(**kwargs)  # type: ignore[arg-type]
+    if confirmation_coordinator is not None:
+        bind_confirmation_coordinator = getattr(app, "bind_confirmation_coordinator", None)
+        assert callable(bind_confirmation_coordinator)
+        bind_confirmation_coordinator(confirmation_coordinator)
     test_cleanup = cleanup or getattr(runtime, "_terminal_test_cleanup", None)
     return cast(TerminalConversationApp, _TerminalTestDriver(app, runtime, test_cleanup))
 
@@ -1066,6 +1079,13 @@ def _tool_row_texts(app: TerminalConversationApp) -> list[str]:
     return [str(cast(Static, row).content) for row in rows]
 
 
+def _tool_row_tail_matches(
+    app: TerminalConversationApp,
+    expected: Sequence[str],
+) -> bool:
+    return _tool_row_texts(app)[-1:] == list(expected)
+
+
 def _visible_screen_text(app: TerminalConversationApp) -> str:
     text = "".join(element.text or "" for element in _screenshot_text_elements(app))
     return text.replace("\xa0", " ")
@@ -1120,6 +1140,17 @@ async def _wait_for_turn(app: TerminalConversationApp) -> None:
         refreshed = asyncio.Event()
         app.call_after_refresh(refreshed.set)
         await refreshed.wait()
+
+
+async def _wait_for_refresh_condition(
+    app: TerminalConversationApp,
+    predicate: Callable[[], bool],
+) -> None:
+    async with asyncio.timeout(3):
+        while not predicate():
+            refreshed = asyncio.Event()
+            app.call_after_refresh(refreshed.set)
+            await refreshed.wait()
 
 
 def test_terminal_constructor_does_not_expose_runtime_lifecycle_parameters() -> None:
@@ -3433,6 +3464,194 @@ async def test_tool_confirmation_defaults_to_decline_and_shows_effective_operati
 
 
 @pytest.mark.asyncio
+async def test_coordinator_background_confirmation_uses_stable_modal_projection() -> None:
+    coordinator = ToolConfirmationCoordinator()
+    runtime = _terminal_backend(ConfirmationRunSource())
+    app = _terminal_app(
+        runtime,
+        confirmation_coordinator=coordinator,
+    )
+    request = ConfirmationRequest(
+        confirmation_id=uuid4(),
+        tool_call_id="background-call",
+        tool_name="write_file",
+        summary="Confirm background write",
+        reason="A background Job requires confirmation.",
+        details={"path": "nightly.txt"},
+    )
+    envelope = ConfirmationEnvelope(
+        request=request,
+        origin="background",
+        owner=BackgroundConfirmationOwner(uuid4(), "job-1", uuid4()),
+        job_id="job-1",
+        title="Nightly backup",
+    )
+
+    async with app.run_test(size=(80, 24)) as pilot:
+        pending = asyncio.create_task(coordinator.request(envelope))
+        await _wait_for_confirmation(app, pilot)
+
+        assert str(app.screen.query_one("#confirmation-heading", Static).content) == (
+            "Background Tool Confirmation"
+        )
+        assert "Source: job-1 + Nightly backup" in _visible_screen_text(app)
+        assert app.screen.focused is app.screen.query_one("#confirmation-decline", Button)
+        input_area = app._conversation_input
+        display = app._conversation_display
+        assert input_area is not None
+        assert display is not None
+        assert input_area.read_only
+        projection = _AgentRunProjection(app, uuid4(), display=display)
+        app._active_run_projection = projection
+        projection.start()
+        await projection.consume(
+            OutboundMessage(
+                "model_response",
+                "Streaming under modal",
+                {"_stream_delta": True},
+            )
+        )
+        await projection.consume(
+            OutboundMessage(
+                "tool_call",
+                "write_file",
+                {"tool_call_id": "foreground-call", "arguments": '{"path":"note.txt"}'},
+            )
+        )
+        await projection.consume(
+            OutboundMessage(
+                "tool_call",
+                "write_file",
+                {"tool_call_id": "foreground-call", "status": "success"},
+            )
+        )
+        await projection.consume(
+            OutboundMessage(
+                "system_control",
+                "Foreground failed under modal",
+                {
+                    "finish_reason": "failed",
+                    "error_code": "model_failed",
+                    "_streamed": True,
+                },
+            )
+        )
+
+        assert any(markdown.source == "Streaming under modal" for markdown in display.query(Markdown))
+        tool_rows = [row for row in display.query(".tool-row") if isinstance(row, Static)]
+        assert len(tool_rows) == 1
+        assert str(tool_rows[0].content) == "Completed: write_file"
+        assert any(
+            str(widget.content) == "Foreground failed under modal"
+            for widget in display.query(".turn-status")
+            if isinstance(widget, Static)
+        )
+        assert projection.terminal_seen
+
+        await pilot.press("right", "enter")
+        assert await asyncio.wait_for(pending, timeout=1) == "approved"
+        await pilot.pause()
+        assert not input_area.read_only
+
+    await coordinator.close()
+
+
+@pytest.mark.asyncio
+async def test_coordinator_cancellation_before_message_delivery_cannot_open_a_stale_modal() -> None:
+    instances: list[Any] = []
+
+    class DelayedConfirmationApp(TerminalConversationApp):
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            super().__init__(*args, **kwargs)
+            self.confirmation_posted = asyncio.Event()
+            self.deferred_confirmation: Message | None = None
+            instances.append(self)
+
+        def post_message(self, message: Message) -> bool:
+            if isinstance(message, self.CoordinatorConfirmationRequested):
+                self.deferred_confirmation = message
+                self.confirmation_posted.set()
+                return True
+            return super().post_message(message)
+
+        def release_confirmation(self) -> None:
+            message = self.deferred_confirmation
+            assert message is not None
+            self.deferred_confirmation = None
+            assert super().post_message(message)
+
+    coordinator = ToolConfirmationCoordinator()
+    runtime = _terminal_backend(ConfirmationRunSource())
+    app = _terminal_app(
+        runtime,
+        app_type=DelayedConfirmationApp,
+        confirmation_coordinator=coordinator,
+    )
+    envelope = ConfirmationEnvelope(
+        request=ConfirmationRequest(
+            confirmation_id=uuid4(),
+            tool_call_id="cancelled-call",
+            tool_name="write_file",
+            summary="Confirm cancelled write",
+            reason="This request will be cancelled before delivery.",
+            details={"path": "cancelled.txt"},
+        ),
+        origin="background",
+        owner=BackgroundConfirmationOwner(uuid4(), "job-1", uuid4()),
+        job_id="job-1",
+        title="Cancelled job",
+    )
+
+    async with app.run_test(size=(80, 24)) as pilot:
+        delayed = instances[0]
+        pending = asyncio.create_task(coordinator.request(envelope))
+        await delayed.confirmation_posted.wait()
+        await coordinator.cancel_owner(envelope.owner)
+        with pytest.raises(ConfirmationAborted):
+            await pending
+
+        delayed.release_confirmation()
+        await pilot.pause()
+        assert not app.query("#confirmation-heading")
+        assert app._active_confirmation_token is None
+        assert not app._dismissed_confirmation_tokens
+
+    await coordinator.close()
+
+
+@pytest.mark.asyncio
+async def test_coordinator_open_modal_is_aborted_and_drained_on_unmount() -> None:
+    coordinator = ToolConfirmationCoordinator()
+    runtime = _terminal_backend(ConfirmationRunSource())
+    app = _terminal_app(runtime, confirmation_coordinator=coordinator)
+    envelope = ConfirmationEnvelope(
+        request=ConfirmationRequest(
+            confirmation_id=uuid4(),
+            tool_call_id="unmount-call",
+            tool_name="write_file",
+            summary="Confirm unmount write",
+            reason="This request remains open until unmount.",
+            details={"path": "unmount.txt"},
+        ),
+        origin="background",
+        owner=BackgroundConfirmationOwner(uuid4(), "job-1", uuid4()),
+        job_id="job-1",
+        title="Unmount job",
+    )
+    pending: asyncio.Task[ConfirmationDecision]
+
+    async with app.run_test(size=(80, 24)) as pilot:
+        pending = asyncio.create_task(coordinator.request(envelope))
+        await _wait_for_confirmation(app, pilot)
+
+    with pytest.raises(ConfirmationAborted):
+        await pending
+    assert coordinator.active_envelope is None
+    assert coordinator.queued_counts == (0, 0)
+    await coordinator.close()
+
+
+@pytest.mark.asyncio
 async def test_write_confirmation_hides_content_and_unknown_details() -> None:
     secret = "Authorization: Bearer sk-sensitive-value"
     conversation = ConfirmationRunSource(
@@ -3962,19 +4181,22 @@ async def test_activity_layout_changes_preserve_follow_or_historical_anchor_at_e
             refreshed = asyncio.Event()
             app.call_after_refresh(refreshed.set)
             await refreshed.wait()
-            async with asyncio.timeout(1):
-                while "candidate" not in _visible_screen_text(app):
-                    await pilot.pause()
-            async with asyncio.timeout(1):
-                while not display.is_vertical_scroll_end:
-                    await pilot.pause()
+            await _wait_for_refresh_condition(
+                app,
+                lambda: "candidate" in _visible_screen_text(app),
+            )
+            await _wait_for_refresh_condition(
+                app,
+                lambda: display.is_vertical_scroll_end,
+            )
             assert display.is_vertical_scroll_end
             historical_position = display.scroll_y
             if reading_history:
                 await pilot.press("pageup")
-                async with asyncio.timeout(1):
-                    while display.is_vertical_scroll_end:
-                        await pilot.pause()
+                await _wait_for_refresh_condition(
+                    app,
+                    lambda: not display.is_vertical_scroll_end,
+                )
                 historical_position = display.scroll_y
                 assert not display.is_vertical_scroll_end
 
@@ -3993,23 +4215,26 @@ async def test_activity_layout_changes_preserve_follow_or_historical_anchor_at_e
                 await refreshed.wait()
                 expected_tool_row = expected_tool_rows[next_event][-1:]
                 if expected_tool_row:
-                    async with asyncio.timeout(1):
-                        while _tool_row_texts(app)[-1:] != expected_tool_row:
-                            await pilot.pause()
+                    await _wait_for_refresh_condition(
+                        app,
+                        partial(_tool_row_tail_matches, app, expected_tool_row),
+                    )
                 assert _tool_row_texts(app)[-1:] == expected_tool_row
                 if reading_history and expected_tool_row:
-                    async with asyncio.timeout(1):
-                        while not app.query_one("#new-content").display:
-                            await pilot.pause()
+                    await _wait_for_refresh_condition(
+                        app,
+                        lambda: app.query_one("#new-content").display,
+                    )
                     assert not display.is_vertical_scroll_end
                     assert display.scroll_y == historical_position
                     assert app.query_one("#new-content").display
                 elif reading_history:
                     assert not display.is_vertical_scroll_end
                 else:
-                    async with asyncio.timeout(1):
-                        while not display.is_vertical_scroll_end:
-                            await pilot.pause()
+                    await _wait_for_refresh_condition(
+                        app,
+                        lambda: display.is_vertical_scroll_end,
+                    )
                     assert not app.query_one("#new-content").display
 
             conversation.continue_after(1, 4)
@@ -5623,9 +5848,19 @@ async def test_management_completion_keeps_the_composer_visible(
     async with app.run_test(size=size) as pilot:
         await pilot.press("/")
 
-        visible_nodes = _screenshot_text_nodes(app)
         completion = app.query_one("#command-completion", OptionList)
         input_area = app.query_one("#conversation-input", TextArea)
+        async with asyncio.timeout(1):
+            while (
+                completion.option_count != len(MANAGEMENT_COMMANDS)
+                or completion.region.bottom > input_area.region.y
+                or completion.region.overlaps(input_area.region)
+            ):
+                await pilot.pause()
+        refreshed = asyncio.Event()
+        app.call_after_refresh(refreshed.set)
+        await refreshed.wait()
+        visible_nodes = _screenshot_text_nodes(app)
         assert completion.option_count == len(MANAGEMENT_COMMANDS)
         assert completion.virtual_size.height == completion.option_count
         assert all("\n" not in str(option.prompt) for option in completion.options)

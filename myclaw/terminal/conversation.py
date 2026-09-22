@@ -41,6 +41,14 @@ from textual.widgets import Button, Markdown, OptionList, Static, TextArea
 from textual.widgets.option_list import Option
 from textual.worker import Worker, WorkerError
 
+from myclaw.agent.confirmation import (
+    ConfirmationDecision as CoordinatorConfirmationDecision,
+)
+from myclaw.agent.confirmation import (
+    ConfirmationEnvelope,
+    ConfirmationPresentationCoordinator,
+    ConfirmationUnavailable,
+)
 from myclaw.agent.loop import (
     ConfirmationRequestView,
     ForegroundConversationProjection,
@@ -1523,9 +1531,19 @@ class _ToolConfirmationScreen(ModalScreen[ConfirmationDecision]):
         self._request = request
 
     def compose(self) -> ComposeResult:
+        is_background = getattr(self._request, "origin", "foreground") == "background"
+        heading = "Background Tool Confirmation" if is_background else "Tool Confirmation"
         with Center():
             with Vertical(id="confirmation-panel"):
-                yield Static("Tool Confirmation", id="confirmation-heading", markup=False)
+                yield Static(heading, id="confirmation-heading", markup=False)
+                if is_background:
+                    job_id = getattr(self._request, "job_id", "")
+                    title = getattr(self._request, "title", "")
+                    yield Static(
+                        f"Source: {job_id} + {title}",
+                        id="confirmation-source",
+                        markup=False,
+                    )
                 yield Static(
                     f"Tool: {_friendly_name(self._request.tool_name, fallback='Tool')}",
                     id="confirmation-tool",
@@ -1576,8 +1594,19 @@ class _ToolConfirmationScreen(ModalScreen[ConfirmationDecision]):
 class _MessageBusRunProjection:
     """Project one consumed MessageBus foreground run into the Terminal UI."""
 
-    def __init__(self, app: TerminalConversationApp, turn_id: UUID) -> None:
+    def __init__(
+        self,
+        app: TerminalConversationApp,
+        turn_id: UUID,
+        *,
+        display: _ConversationDisplay | None = None,
+    ) -> None:
         self._app = app
+        if display is None:
+            display = app._conversation_display
+        if display is None:
+            display = app.query_one("#conversation-display", _ConversationDisplay)
+        self._display = display
         self.turn_id = turn_id
         self._assistant: Markdown | None = None
         self._response_stream: _CoalescedMarkdownStream | None = None
@@ -1653,7 +1682,7 @@ class _MessageBusRunProjection:
                     tool_row.widget.update(
                         _tool_row_content(tool_row.status, tool_row.tool_name, "")
                     )
-                    self._app._scroll_to_latest()
+                    self._app._scroll_to_latest(self._display)
                 return
             arguments = outbound.metadata.get("arguments")
             if not isinstance(tool_call_id, str) or not isinstance(arguments, str):
@@ -1668,12 +1697,12 @@ class _MessageBusRunProjection:
                     outbound.content,
                     "running",
                     "",
-                    self._app.query_one("#conversation-display", _ConversationDisplay),
+                    self._display,
                     parent=group.content,
                     raw_arguments=arguments,
                 )
                 self._tool_rows[tool_call_id] = _ToolRowState(row, outbound.content, "running")
-                self._app._scroll_to_latest()
+                self._app._scroll_to_latest(self._display)
             return
         if outbound.type == "system_control" and marker == "_streamed":
             finish_reason = outbound.metadata.get("finish_reason")
@@ -1715,15 +1744,15 @@ class _MessageBusRunProjection:
                 return
             self._response_stream = _CoalescedMarkdownStream(
                 Markdown.get_stream(self._assistant),
-                content_changed=self._app._scroll_to_latest,
+                content_changed=partial(self._app._scroll_to_latest, self._display),
             )
         self._response_reopen_allowed = False
         self._response_fragments.append(fragment)
         if self._assistant is None:
-            self._assistant = await self._app._mount_assistant()
+            self._assistant = await self._app._mount_assistant(display=self._display)
             self._response_stream = _CoalescedMarkdownStream(
                 Markdown.get_stream(self._assistant),
-                content_changed=self._app._scroll_to_latest,
+                content_changed=partial(self._app._scroll_to_latest, self._display),
             )
         assert self._response_stream is not None
         self._response_stream.write(fragment)
@@ -1732,11 +1761,12 @@ class _MessageBusRunProjection:
         group = await self._ensure_activity_group()
         if self._reasoning is None:
             self._reasoning = await self._app._mount_assistant(
+                display=self._display,
                 parent=group.content,
             )
             self._reasoning_stream = _CoalescedMarkdownStream(
                 Markdown.get_stream(self._reasoning),
-                content_changed=self._app._scroll_to_latest,
+                content_changed=partial(self._app._scroll_to_latest, self._display),
             )
         assert self._reasoning_stream is not None
         self._reasoning_stream.write(fragment)
@@ -1780,25 +1810,28 @@ class _MessageBusRunProjection:
         if self._outcome == "completed":
             if self._terminal_content:
                 if self._assistant is None:
-                    self._assistant = await self._app._mount_assistant(self._terminal_content)
+                    self._assistant = await self._app._mount_assistant(
+                        self._terminal_content,
+                        display=self._display,
+                    )
                 elif self._terminal_content != "".join(self._response_fragments):
                     await self._assistant.update(self._terminal_content)
-                self._app._scroll_to_latest()
+                self._app._scroll_to_latest(self._display)
             else:
                 if self._assistant is not None:
                     await self._remove_assistant(self._assistant)
                     self._assistant = None
-                await self._app._mount_status("Completed with no response.")
+                await self._app._mount_status("Completed with no response.", display=self._display)
         else:
             if self._assistant is not None or self._response_fragments:
                 await self._move_response_to_activity("".join(self._response_fragments))
             reason = self._terminal_status or (
                 "Turn cancelled." if self._outcome == "cancelled" else "Turn failed."
             )
-            await self._app._mount_status(reason)
+            await self._app._mount_status(reason, display=self._display)
         if self._activity_group is not None:
             self._set_activity_group_terminal(self._outcome or "failed")
-            self._app._scroll_to_latest()
+            self._app._scroll_to_latest(self._display)
 
     async def _move_response_to_activity(self, content: str) -> None:
         if not content:
@@ -1810,7 +1843,7 @@ class _MessageBusRunProjection:
         group = await self._ensure_activity_group()
         assistant = self._assistant
         if assistant is None:
-            await self._app._mount_assistant(content, parent=group.content)
+            await self._app._mount_assistant(content, display=self._display, parent=group.content)
         else:
             await assistant.update(content)
             row = assistant.parent
@@ -1819,20 +1852,19 @@ class _MessageBusRunProjection:
             self._app._reparent_mounted_widget(row, group.content)
         self._assistant = None
         self._response_fragments.clear()
-        self._app._scroll_to_latest()
+        self._app._scroll_to_latest(self._display)
 
     async def _remove_assistant(self, assistant: Markdown) -> None:
         parent = assistant.parent
         if isinstance(parent, Widget):
             await parent.remove()
-        self._app._scroll_to_latest()
+        self._app._scroll_to_latest(self._display)
 
     async def _ensure_activity_group(self) -> _ActivityGroupState:
         if self._activity_group is not None:
             return self._activity_group
-        display = self._app.query_one("#conversation-display", _ConversationDisplay)
         self._activity_group = await self._app._mount_activity_group(
-            display,
+            self._display,
             expanded=True,
             toggleable=False,
             elapsed=self._elapsed,
@@ -1880,6 +1912,18 @@ class _ConsumedRun:
 
 class TerminalConversationApp(App[None]):
     """The two-region Textual application for one foreground Message Bus."""
+
+    class CoordinatorConfirmationRequested(Message):
+        def __init__(
+            self,
+            envelope: ConfirmationEnvelope,
+            token: object,
+            respond: Callable[[object, CoordinatorConfirmationDecision], bool],
+        ) -> None:
+            super().__init__()
+            self.envelope = envelope
+            self.token = token
+            self.respond = respond
 
     class ConfirmationRequested(Message):
         def __init__(
@@ -2120,6 +2164,9 @@ class TerminalConversationApp(App[None]):
         self._control = control
         self._management_dispatcher = management_dispatcher
         self._monotonic = monotonic
+        self._confirmation_coordinator: ConfirmationPresentationCoordinator | None = None
+        self._conversation_display: _ConversationDisplay | None = None
+        self._conversation_input: _ConversationInput | None = None
         self._size_insufficient = False
         self._driver_mode_started = False
         self._driver_mode_stopped = True
@@ -2131,6 +2178,8 @@ class TerminalConversationApp(App[None]):
         self._cancel_requested_turn: object | None = None
         self._active_run_projection: _MessageBusRunProjection | None = None
         self._active_confirmation_id: UUID | None = None
+        self._active_confirmation_token: object | None = None
+        self._dismissed_confirmation_tokens: set[object] = set()
         self._confirmation_result: asyncio.Future[ConfirmationDecision | None] | None = None
         self._session_switch_result: asyncio.Future[bool | None] | None = None
         self._pending_inputs: deque[str] = deque()
@@ -2150,6 +2199,40 @@ class TerminalConversationApp(App[None]):
         self._confirmation_control: TerminalAgentLoopControl | None = None
         self._application_error: Exception | None = None
         self._fatal_management_error: FatalManagementError | None = None
+
+    def bind_confirmation_coordinator(
+        self,
+        coordinator: ConfirmationPresentationCoordinator,
+    ) -> None:
+        """Bind the Runtime Lifetime coordinator without changing the app constructor contract."""
+        if self._confirmation_coordinator is not None and self._confirmation_coordinator is not coordinator:
+            raise RuntimeError("a different confirmation coordinator is already bound")
+        self._confirmation_coordinator = coordinator
+        if self._conversation_display is not None:
+            coordinator.bind_presenter(self)
+
+    def present_confirmation(
+        self,
+        envelope: ConfirmationEnvelope,
+        token: object,
+        respond: Callable[[object, CoordinatorConfirmationDecision], bool],
+    ) -> None:
+        """Project a coordinator item onto the mounted Textual conversation."""
+        if self._closing or self._presentation_quiesced:
+            raise ConfirmationUnavailable("confirmation presenter is not available")
+        accepted = self.post_message(
+            self.CoordinatorConfirmationRequested(envelope, token, respond)
+        )
+        if not accepted:
+            raise ConfirmationUnavailable("confirmation presenter is not available")
+
+    async def dismiss_confirmation(self, token: object) -> None:
+        """Dismiss only the modal owned by this coordinator item."""
+        self._dismissed_confirmation_tokens.add(token)
+        if self._active_confirmation_token is not token:
+            return
+        if isinstance(self.screen, _ToolConfirmationScreen):
+            self.screen.dismiss(None)
 
     def _handle_exception(self, error: Exception) -> None:
         if self._application_error is None:
@@ -2282,9 +2365,14 @@ class TerminalConversationApp(App[None]):
         )
 
     async def on_mount(self) -> None:
+        self._conversation_display = self.query_one("#conversation-display", _ConversationDisplay)
+        self._conversation_input = self.query_one("#conversation-input", _ConversationInput)
         self._bind_bus_callback(self._bus)
         self._bus_snapshot = await self._bus.inbound_snapshot()
-        self._bind_confirmation_callback(self._control, self._bus)
+        if self._confirmation_coordinator is None:
+            self._bind_confirmation_callback(self._control, self._bus)
+        else:
+            self._confirmation_coordinator.bind_presenter(self)
         self._outbound_worker = self.run_worker(
             self._consume_outbound(),
             name="conversation-outbound",
@@ -2307,7 +2395,10 @@ class TerminalConversationApp(App[None]):
         session_switch_result = self._session_switch_result
         if session_switch_result is not None and not session_switch_result.done():
             session_switch_result.cancel()
-        self._unbind_confirmation_callback(self._control)
+        if self._confirmation_coordinator is None:
+            self._unbind_confirmation_callback(self._control)
+        else:
+            await self._confirmation_coordinator.unbind_presenter(self)
         self._unbind_bus_callback(self._bus)
         projection = self._active_run_projection
         self._active_run_projection = None
@@ -2335,6 +2426,8 @@ class TerminalConversationApp(App[None]):
         self._cancel_requested_turn = None
         self._active_confirmation_id = None
         self._confirmation_result = None
+        self._active_confirmation_token = None
+        self._dismissed_confirmation_tokens.clear()
         self._session_switch_result = None
         self._permission_current_level = None
         self._permission_warning_result = None
@@ -2343,6 +2436,9 @@ class TerminalConversationApp(App[None]):
         self._outbound_worker = None
         self._resume_worker = None
         self._presentation_quiesced = True
+        self._active_confirmation_token = None
+        self._conversation_display = None
+        self._conversation_input = None
 
         primary_error = self._application_error
         if primary_error is not None and cleanup_errors:
@@ -2447,7 +2543,8 @@ class TerminalConversationApp(App[None]):
                 await self.screen.dismiss(False)
             else:
                 permission_warning_result.cancel()
-        self._unbind_confirmation_callback(self._control)
+        if self._confirmation_coordinator is None:
+            self._unbind_confirmation_callback(self._control)
         self._unbind_bus_callback(self._bus)
         await self._stop_outbound_worker()
         await self._clear_generation_projection()
@@ -2465,6 +2562,7 @@ class TerminalConversationApp(App[None]):
         self._cancel_requested_turn = None
         self._active_run_projection = None
         self._active_confirmation_id = None
+        self._active_confirmation_token = None
         self._completion_dismissed_text = None
         self._permission_current_level = None
         self._permission_warning_result = None
@@ -2475,7 +2573,7 @@ class TerminalConversationApp(App[None]):
         self._confirmation_result = None
         if confirmation_result is not None and not confirmation_result.done():
             confirmation_result.cancel()
-        if isinstance(self.screen, _ToolConfirmationScreen):
+        if self._confirmation_coordinator is None and isinstance(self.screen, _ToolConfirmationScreen):
             self.screen.dismiss("declined")
         self._set_working(False)
         self._refresh_pending_queue()
@@ -2485,7 +2583,9 @@ class TerminalConversationApp(App[None]):
             input_area.read_only = False
             input_area.text = ""
         self._hide_command_completion()
-        display = self.query_one("#conversation-display", _ConversationDisplay)
+        display = self._conversation_display
+        if display is None:
+            display = self.query_one("#conversation-display", _ConversationDisplay)
         await display.remove_children()
 
     async def rebind_agent_loop(
@@ -2510,7 +2610,8 @@ class TerminalConversationApp(App[None]):
             self._control = control
             self._skill_metadata = target_skill_metadata
             await self._replace_display_from_projection(session_projection)
-            self._bind_confirmation_callback(self._control, self._bus)
+            if self._confirmation_coordinator is None:
+                self._bind_confirmation_callback(self._control, self._bus)
             self._bind_bus_callback(self._bus)
             self._bus_snapshot = await self._bus.inbound_snapshot()
             self._closing = False
@@ -2525,7 +2626,8 @@ class TerminalConversationApp(App[None]):
         except BaseException:
             self._closing = True
             self._presentation_quiesced = True
-            self._unbind_confirmation_callback(control)
+            if self._confirmation_coordinator is None:
+                self._unbind_confirmation_callback(control)
             self._unbind_bus_callback(self._bus)
             await self._stop_outbound_worker()
             with suppress(Exception):
@@ -2964,12 +3066,18 @@ class TerminalConversationApp(App[None]):
 
     def _promote_consumed_inputs(self, count: int) -> None:
         promoted = False
+        display = self._conversation_display
+        if display is None:
+            display = self.query_one("#conversation-display", _ConversationDisplay)
+        input_area = self._conversation_input
+        if input_area is None:
+            input_area = self.query_one("#conversation-input", _ConversationInput)
         for _ in range(count):
             if not self._pending_inputs:
                 break
             text = self._pending_inputs.popleft()
             turn_id = UUID(int=uuid4().int)
-            projection = _MessageBusRunProjection(self, turn_id)
+            projection = _MessageBusRunProjection(self, turn_id, display=display)
             projection.start()
             self._consumed_runs.append(
                 _ConsumedRun(
@@ -2979,7 +3087,6 @@ class TerminalConversationApp(App[None]):
                 )
             )
             promoted = True
-            input_area = self.query_one("#conversation-input", _ConversationInput)
             if input_area.active_turn_token is None:
                 input_area.active_turn_token = turn_id
                 self._set_working(True)
@@ -3041,10 +3148,14 @@ class TerminalConversationApp(App[None]):
         return None
 
     async def _start_consumed_run(self, run: _ConsumedRun) -> None:
-        display = self.query_one("#conversation-display", _ConversationDisplay)
+        display = self._conversation_display
+        if display is None:
+            display = self.query_one("#conversation-display", _ConversationDisplay)
         await self._mount_user_message(run.user_text, display)
         run.started = True
-        input_area = self.query_one("#conversation-input", _ConversationInput)
+        input_area = self._conversation_input
+        if input_area is None:
+            input_area = self.query_one("#conversation-input", _ConversationInput)
         input_area.active_turn_token = run.turn_id
         self._active_run_projection = run.projection
         self._set_working(True)
@@ -3053,7 +3164,9 @@ class TerminalConversationApp(App[None]):
     def _finish_consumed_run(self, run: _ConsumedRun) -> None:
         if self._active_run_projection is run.projection:
             self._active_run_projection = None
-        input_area = self.query_one("#conversation-input", _ConversationInput)
+        input_area = self._conversation_input
+        if input_area is None:
+            input_area = self.query_one("#conversation-input", _ConversationInput)
         if self._consumed_runs:
             input_area.active_turn_token = self._consumed_runs[0].turn_id
             self._set_working(True)
@@ -3083,6 +3196,94 @@ class TerminalConversationApp(App[None]):
             exit_on_error=False,
         )
 
+    @on(CoordinatorConfirmationRequested)
+    def _coordinator_confirmation_requested(
+        self,
+        message: CoordinatorConfirmationRequested,
+    ) -> None:
+        if message.token in self._dismissed_confirmation_tokens:
+            self._dismissed_confirmation_tokens.discard(message.token)
+            return
+        self.run_worker(
+            self._request_coordinator_confirmation(
+                message.envelope,
+                message.token,
+                message.respond,
+            ),
+            name="coordinator-tool-confirmation",
+            group="coordinator-tool-confirmation",
+            exclusive=True,
+            exit_on_error=False,
+        )
+
+    async def _request_coordinator_confirmation(
+        self,
+        envelope: ConfirmationEnvelope,
+        token: object,
+        respond: Callable[[object, CoordinatorConfirmationDecision], bool],
+    ) -> None:
+        coordinator = self._confirmation_coordinator
+        if coordinator is None:
+            return
+        if token in self._dismissed_confirmation_tokens:
+            self._dismissed_confirmation_tokens.discard(token)
+            return
+        if self._closing or self._presentation_quiesced:
+            await coordinator.cancel_owner(envelope.owner)
+            return
+        self._active_confirmation_token = token
+        input_area = self._conversation_input
+        if input_area is None:
+            input_area = self.query_one("#conversation-input", _ConversationInput)
+        input_was_read_only = input_area.read_only
+        input_area.read_only = True
+        result: asyncio.Future[ConfirmationDecision | None] | None = None
+        try:
+            await self._viable_size.wait()
+            if self._closing or self._presentation_quiesced:
+                await coordinator.cancel_owner(envelope.owner)
+                return
+            if token in self._dismissed_confirmation_tokens:
+                self._dismissed_confirmation_tokens.discard(token)
+                return
+            result = asyncio.get_running_loop().create_future()
+            self._confirmation_result = result
+
+            def on_dismissed(value: ConfirmationDecision | None) -> None:
+                if not result.done():
+                    result.set_result(value)
+
+            await self.push_screen(
+                _ToolConfirmationScreen(envelope),
+                callback=on_dismissed,
+            )
+            if token in self._dismissed_confirmation_tokens:
+                self._dismissed_confirmation_tokens.discard(token)
+                if isinstance(self.screen, _ToolConfirmationScreen):
+                    self.screen.dismiss(None)
+            decision = await result
+            if decision in {"approved", "declined"}:
+                respond(token, decision)
+            else:
+                await coordinator.cancel_owner(envelope.owner)
+        except CancelledError:
+            await coordinator.cancel_owner(envelope.owner)
+            raise
+        except Exception:
+            await coordinator.cancel_owner(envelope.owner)
+            raise
+        finally:
+            input_area.read_only = input_was_read_only
+            if result is not None and self._confirmation_result is result:
+                self._confirmation_result = None
+            if self._active_confirmation_token is token:
+                self._active_confirmation_token = None
+            self._dismissed_confirmation_tokens.discard(token)
+            self._refresh_pending_queue()
+            if not self._closing and not self._presentation_quiesced:
+                with suppress(Exception):
+                    input_area.focus()
+
     async def _request_confirmation(
         self,
         request: ConfirmationRequestView,
@@ -3104,7 +3305,9 @@ class TerminalConversationApp(App[None]):
             )
             return
         self._active_confirmation_id = request.confirmation_id
-        input_area = self.query_one("#conversation-input", _ConversationInput)
+        input_area = self._conversation_input
+        if input_area is None:
+            input_area = self.query_one("#conversation-input", _ConversationInput)
         input_was_read_only = input_area.read_only
         input_area.read_only = True
         result: asyncio.Future[ConfirmationDecision | None] | None = None
@@ -3296,17 +3499,29 @@ class TerminalConversationApp(App[None]):
         await parent.mount(row)
         return row
 
-    def _scroll_to_latest(self) -> None:
-        display = self.query_one("#conversation-display", _ConversationDisplay)
+    def _scroll_to_latest(self, display: _ConversationDisplay | None = None) -> None:
+        if display is None:
+            display = self._conversation_display
+        if display is None:
+            display = self.query_one("#conversation-display", _ConversationDisplay)
         display.content_changed()
 
-    async def _mount_status(self, content: str) -> None:
-        display = self.query_one("#conversation-display", _ConversationDisplay)
+    async def _mount_status(
+        self,
+        content: str,
+        display: _ConversationDisplay | None = None,
+    ) -> None:
+        if display is None:
+            display = self._conversation_display
+        if display is None:
+            display = self.query_one("#conversation-display", _ConversationDisplay)
         await display.mount(Static(content, markup=False, classes="turn-status"))
-        self._scroll_to_latest()
+        self._scroll_to_latest(display)
 
     async def _mount_management_rows(self, command: str, output: str | None) -> None:
-        display = self.query_one("#conversation-display", _ConversationDisplay)
+        display = self._conversation_display
+        if display is None:
+            display = self.query_one("#conversation-display", _ConversationDisplay)
         await display.mount(
             Static(
                 f"Command: {command}",
@@ -3319,7 +3534,9 @@ class TerminalConversationApp(App[None]):
         self._scroll_to_latest()
 
     async def _mount_management_output(self, output: str, *, scroll: bool = True) -> None:
-        display = self.query_one("#conversation-display", _ConversationDisplay)
+        display = self._conversation_display
+        if display is None:
+            display = self.query_one("#conversation-display", _ConversationDisplay)
         await display.mount(Static(output, markup=False, classes="management-row"))
         if scroll:
             self._scroll_to_latest()
@@ -3339,7 +3556,9 @@ class TerminalConversationApp(App[None]):
         self._active_run_projection = None
         if run_projection is not None:
             run_projection.stop()
-        display = self.query_one("#conversation-display", _ConversationDisplay)
+        display = self._conversation_display
+        if display is None:
+            display = self.query_one("#conversation-display", _ConversationDisplay)
         await display.remove_children()
         for partition in _persisted_message_partitions(projected_messages):
             historical = _classify_historical_partition(partition)

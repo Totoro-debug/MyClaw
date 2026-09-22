@@ -13,6 +13,7 @@ from uuid import UUID, uuid4
 
 from loguru import logger
 
+from myclaw.agent.confirmation import ConfirmationAborted, ConfirmationUnavailable
 from myclaw.agent.tools.base import (
     ArtifactReference,
     BaseTool,
@@ -473,6 +474,11 @@ class ToolGateway:
                 decision = await confirmation(request)
             except asyncio.CancelledError:
                 raise
+            except ConfirmationAborted:
+                raise
+            except ConfirmationUnavailable as error:
+                confirmation_state[0] = ToolConfirmationMetadata(request=request, decision=None)
+                raise ToolAuthorizationFailure("unavailable") from error
             except Exception as error:
                 self._record_unexpected_failure(tool, error)
                 confirmation_state[0] = ToolConfirmationMetadata(request=request, decision=None)
@@ -578,6 +584,8 @@ class ToolGateway:
             if not isinstance(content, str):
                 raise TypeError("Tool execution must return a string")
         except asyncio.CancelledError:
+            raise
+        except ConfirmationAborted:
             raise
         except ToolAuthorizationFailure as error:
             return _result(
