@@ -38,6 +38,7 @@ from myclaw.agent.tools.permission import (
     PermissionSnapshot,
     ToolAuthorizationFailure,
     ToolAuthorizationSession,
+    ToolInvocationFacts,
     ToolPermissionPolicy,
 )
 from myclaw.schedule.service import ScheduleService
@@ -408,14 +409,10 @@ class ToolGateway:
             return _result(tool_call, "error", "The requested tool is not available.")
 
         try:
-            preparation = await tool.prepare(cast(dict[str, Any], parsed))
-            if (
-                not isinstance(preparation, tuple)
-                or len(preparation) != 2
-                or not isinstance(preparation[0], dict)
-                or (preparation[1] is not None and not isinstance(preparation[1], str))
-            ):
+            facts = await tool.prepare(cast(dict[str, Any], parsed))
+            if not isinstance(facts, ToolInvocationFacts):
                 raise TypeError("Tool preparation returned an invalid value")
+            execution_arguments = facts.execution_arguments
         except asyncio.CancelledError:
             raise
         except ToolError as error:
@@ -424,9 +421,8 @@ class ToolGateway:
             self._record_unexpected_failure(tool, error)
             return _result(tool_call, "error", _generic_tool_failure(tool.name))
 
-        prepared_arguments, safety_reason = preparation
         try:
-            refusal = self._refusal_reason(tool, prepared_arguments)
+            refusal = self._refusal_reason(tool, execution_arguments)
         except asyncio.CancelledError:
             raise
         except ToolError as error:
@@ -438,10 +434,6 @@ class ToolGateway:
             return _result(tool_call, "refused", refusal)
 
         try:
-            facts = await tool.collect_invocation_facts(
-                prepared_arguments,
-                safety_reason=safety_reason,
-            )
             authorization = self._permission_policy.open(facts, self._permission_context)
             authorization_decision = authorization.initial_decision()
         except asyncio.CancelledError:
@@ -498,22 +490,13 @@ class ToolGateway:
             return await self._execute(
                 tool_call,
                 tool,
-                prepared_arguments,
+                execution_arguments,
                 authorization=authorization,
                 confirmation_state=confirmation_state,
             )
 
         try:
-            confirmation_reason = getattr(authorization, "confirmation_reason", None)
-            reason = (
-                confirmation_reason()
-                if callable(confirmation_reason)
-                else (
-                    facts.legacy_safety_reason
-                    if facts.legacy_safety_reason is not None
-                    else "Tool confirmation is required."
-                )
-            )
+            reason = authorization.confirmation_reason()
         except asyncio.CancelledError:
             raise
         except ToolError as error:
@@ -552,7 +535,7 @@ class ToolGateway:
         return await self._execute(
             tool_call,
             tool,
-            prepared_arguments,
+            execution_arguments,
             authorization=authorization,
             confirmation_state=confirmation_state,
         )

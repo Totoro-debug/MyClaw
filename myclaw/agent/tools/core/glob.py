@@ -56,18 +56,6 @@ class GlobTool(BaseTool):
             return "Glob kind must be one of files, dirs, or both."
         return None
 
-    async def check_safety(  # type: ignore[override]
-        self,
-        *,
-        pattern: str,
-        path: str,
-        head_limit: int,
-        offset: int,
-        kind: str,
-    ) -> str | None:
-        del pattern, head_limit, offset, kind
-        return self.workspace_path_safety_reason(workspace=self._workspace, requested=path)
-
     def build_file_accesses(self, prepared_arguments: dict[str, object]) -> tuple[FileAccess, ...]:
         return (
             self.canonical_file_access(

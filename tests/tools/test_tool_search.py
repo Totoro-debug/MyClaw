@@ -190,7 +190,8 @@ async def test_tool_search_preparation_does_not_call_callback_and_invalid_input_
         return ()
 
     tool = ToolSearchTool(search_and_activate)
-    assert await tool.prepare({"query": "find files"}) == ({"query": "find files"}, None)
+    facts = await tool.prepare({"query": "find files"})
+    assert facts.normalized_arguments == {"query": "find files"}
     assert calls == []
 
     with pytest.raises(ToolError):

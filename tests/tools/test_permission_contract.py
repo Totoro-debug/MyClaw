@@ -7,7 +7,11 @@ import pytest
 
 from myclaw.agent.confirmation import ConfirmationAborted
 from myclaw.agent.tools.base import BaseTool, ToolError
+from myclaw.agent.tools.core.exec_policy import ExecAssessment
 from myclaw.agent.tools.permission import (
+    NetworkAssessment,
+    NetworkTargetRisk,
+    NormalizedNetworkTarget,
     PermissionContext,
     PermissionDecision,
     ScheduleAction,
@@ -26,9 +30,13 @@ from myclaw.agent.tools.tool_gateway import (
 class _RecordingSession:
     def __init__(self, decision: PermissionDecision) -> None:
         self.decision = decision
+        self.exec_assessment: ExecAssessment | None = None
 
     def initial_decision(self) -> PermissionDecision:
         return self.decision
+
+    def confirmation_reason(self) -> str:
+        return "Tool confirmation is required."
 
     async def authorize_network_target(
         self,
@@ -82,10 +90,6 @@ class _PreparingTool(BaseTool):
     def __init__(self) -> None:
         self.calls: list[int] = []
 
-    async def check_safety(self, *, count: int) -> str | None:  # type: ignore[override]
-        del count
-        return "legacy safety reason"
-
     async def execute(self, *, count: int) -> str:
         self.calls.append(count)
         return str(count)
@@ -93,7 +97,7 @@ class _PreparingTool(BaseTool):
 
 class _NoSafetyTool(BaseTool):
     name = "no_safety"
-    description = "A Tool with no legacy safety reason."
+    description = "A Tool with no additional authorization facts."
     required = ("value",)
     value: str
 
@@ -113,21 +117,6 @@ class _NoSafetyTool(BaseTool):
         if self.observed_sessions is not None:
             self.observed_sessions.append(authorization)
         return await super().execute_authorized(arguments, authorization)
-
-
-class _EmptySafetyReasonTool(BaseTool):
-    name = "empty_safety_reason"
-    description = "A Tool with an empty legacy safety reason."
-
-    def __init__(self) -> None:
-        self.calls = 0
-
-    async def check_safety(self) -> str | None:  # type: ignore[override]
-        return ""
-
-    async def execute(self) -> str:
-        self.calls += 1
-        return "executed"
 
 
 class _ValidationTool(BaseTool):
@@ -205,10 +194,7 @@ async def test_gateway_opens_a_fresh_session_with_structured_call_facts() -> Non
         {"count": 7},
         {"count": 8},
     ]
-    assert [facts.legacy_safety_reason for facts in policy.facts] == [
-        "legacy safety reason",
-        "legacy safety reason",
-    ]
+    assert all(not hasattr(facts, "safety_reason") for facts in policy.facts)
     assert policy.contexts == [context, context]
     assert policy.sessions[0] is not policy.sessions[1]
     assert tool.calls == [7, 8]
@@ -298,27 +284,6 @@ async def test_execution_time_confirmation_abort_remains_typed() -> None:
 
 
 @pytest.mark.asyncio
-async def test_default_policy_preserves_an_empty_legacy_confirmation_reason() -> None:
-    tool = _EmptySafetyReasonTool()
-    gateway = ToolGateway._for_memory((tool,))
-    requests: list[ConfirmationRequest] = []
-
-    async def decline(request: ConfirmationRequest) -> ConfirmationDecision:
-        requests.append(request)
-        return "declined"
-
-    result = await gateway.call(
-        ModelToolCall(id="call-empty-reason", name=tool.name, arguments="{}"),
-        confirmation=decline,
-    )
-
-    assert result.status == "refused"
-    assert len(requests) == 1
-    assert requests[0].reason == ""
-    assert tool.calls == 0
-
-
-@pytest.mark.asyncio
 async def test_hard_and_business_errors_do_not_open_permission_or_confirmation() -> None:
     policy = _RecordingPolicy()
     gateway = ToolGateway._for_memory(
@@ -401,6 +366,50 @@ def test_invocation_facts_detach_normalized_arguments() -> None:
     assert facts.normalized_arguments == {"nested": {"value": 1}}
 
 
+@pytest.mark.parametrize(
+    ("risk", "expected_reason"),
+    [
+        (
+            "dns_failure",
+            "Exec URL DNS resolution is unavailable or returned no addresses "
+            "and requires confirmation.",
+        ),
+        (
+            "dns_non_global",
+            "Exec URL resolves to a private or non-global address and requires confirmation.",
+        ),
+    ],
+)
+def test_exec_network_confirmation_reason_uses_exec_subject(
+    risk: NetworkTargetRisk,
+    expected_reason: str,
+) -> None:
+    facts = ToolInvocationFacts(
+        tool_name="exec",
+        normalized_arguments={"command": "curl http://private.example", "cwd": "."},
+        exec_assessment=ExecAssessment(syntax_confidence="high", syntax_uncertain=False),
+        network_targets=(
+            NetworkAssessment(
+                target=NormalizedNetworkTarget(
+                    url="http://private.example",
+                    scheme="http",
+                    host="private.example",
+                    port=80,
+                ),
+                static_risk=risk,
+            ),
+        ),
+    )
+
+    authorization = ToolPermissionPolicy().open(
+        facts,
+        PermissionContext(level="read-only", origin="foreground"),
+    )
+
+    assert authorization.initial_decision() == "confirm"
+    assert authorization.confirmation_reason() == expected_reason
+
+
 @pytest.mark.parametrize("action", ["list", "add", "remove"])
 @pytest.mark.parametrize("level", ["read-only", "workspace-write", "full-access"])
 def test_schedule_policy_maps_every_action_and_current_level(
@@ -423,6 +432,25 @@ def test_schedule_policy_maps_every_action_and_current_level(
 
     expected = "direct" if action == "list" or level != "read-only" else "confirm"
     assert authorization.initial_decision() == expected
+
+
+@pytest.mark.parametrize("action", ["add", "remove"])
+def test_schedule_policy_without_run_snapshot_preserves_direct_behavior(action: str) -> None:
+    facts = ToolInvocationFacts(
+        tool_name="schedule",
+        normalized_arguments={"action": action},
+        schedule_action=ScheduleAction(action=action),  # type: ignore[arg-type]
+    )
+
+    authorization = ToolPermissionPolicy().open(
+        facts,
+        PermissionContext(
+            configured_schedule_level="full-access",
+            origin="foreground",
+        ),
+    )
+
+    assert authorization.initial_decision() == "direct"
 
 
 @pytest.mark.parametrize(
@@ -478,7 +506,7 @@ def test_schedule_add_merges_crud_and_escalation_reasons_once() -> None:
     )
 
     assert authorization.initial_decision() == "confirm"
-    reason = authorization.confirmation_reason()  # type: ignore[attr-defined]
+    reason = authorization.confirmation_reason()
     assert "persistent scheduled work" in reason
     assert "configured Schedule level 'full-access'" in reason
     assert reason.count("requires confirmation") == 2

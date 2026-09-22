@@ -126,14 +126,11 @@ class MCPTool(BaseTool):
     def build_invocation_facts(
         self,
         prepared_arguments: dict[str, Any],
-        *,
-        safety_reason: str | None,
     ) -> ToolInvocationFacts:
         """Attach the complete remote identity to the normalized call facts."""
         return ToolInvocationFacts(
             tool_name=self.name,
             normalized_arguments=prepared_arguments,
-            legacy_safety_reason=safety_reason,
             mcp_identity=MCPToolIdentity(
                 server_name=self.server_name,
                 remote_name=self.remote_name,

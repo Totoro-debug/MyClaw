@@ -1,9 +1,4 @@
-"""Run-local Tool authorization contracts.
-
-This module owns the authorization boundary without depending on concrete Tools.  The
-legacy safety reason remains an input to the default policy during the expand phase;
-later policies can replace it with structured classification facts.
-"""
+"""Run-local Tool authorization contracts and the single permission policy."""
 
 from __future__ import annotations
 
@@ -24,13 +19,13 @@ from myclaw.agent.permission import (
 from myclaw.agent.tools.core.exec_policy import (
     EXEC_CATASTROPHIC_REASON,
     EXEC_CONFIRMATION_REASON,
+    EXEC_DESTRUCTIVE_REASON,
     ExecAssessment,
     ExecPathAccess,
     ResolvedExecShell,
     bash_recursive_forced_delete_targets,
     classify_bash_command,
     classify_powershell_command,
-    requires_legacy_destructive_confirmation,
 )
 
 type PermissionDecision = Literal["direct", "confirm"]
@@ -83,7 +78,7 @@ class NormalizedNetworkTarget:
 
 @dataclass(frozen=True, slots=True)
 class NetworkAssessment:
-    """Static facts for the initial Web Fetch target."""
+    """Static facts for one network target discovered during preparation."""
 
     target: NormalizedNetworkTarget
     static_risk: NetworkTargetRisk | None = None
@@ -116,6 +111,7 @@ class FileAccess:
     role: FileAccessRole
     base: Path
     workspace_root: Path
+    allowed_roots: tuple[Path, ...] = ()
 
     def __post_init__(self) -> None:
         if not isinstance(self.path, Path):
@@ -124,6 +120,9 @@ class FileAccess:
             raise ValueError("File access role is invalid")
         if not isinstance(self.base, Path) or not isinstance(self.workspace_root, Path):
             raise TypeError("File access roots must be Paths")
+        if any(not isinstance(root, Path) for root in self.allowed_roots):
+            raise TypeError("File access allowed roots must be Paths")
+        object.__setattr__(self, "allowed_roots", tuple(self.allowed_roots))
 
 
 @dataclass(frozen=True, slots=True)
@@ -251,7 +250,7 @@ class ToolInvocationFacts:
 
     tool_name: str
     _normalized_arguments: dict[str, Any] = field(repr=False)
-    legacy_safety_reason: str | None
+    _execution_arguments: dict[str, Any] = field(repr=False)
     file_accesses: tuple[FileAccess, ...]
     exec_assessment: ExecAssessment | None
     schedule_action: ScheduleAction | None
@@ -263,7 +262,7 @@ class ToolInvocationFacts:
         tool_name: str,
         normalized_arguments: Mapping[str, Any],
         *,
-        legacy_safety_reason: str | None = None,
+        execution_arguments: Mapping[str, Any] | None = None,
         file_accesses: tuple[FileAccess, ...] = (),
         exec_assessment: ExecAssessment | None = None,
         schedule_action: ScheduleAction | None = None,
@@ -276,13 +275,16 @@ class ToolInvocationFacts:
             raise TypeError("Tool invocation normalized_arguments must be a mapping")
         if any(not isinstance(name, str) for name in normalized_arguments):
             raise TypeError("Tool invocation argument names must be strings")
-        if legacy_safety_reason is not None and not isinstance(legacy_safety_reason, str):
-            raise TypeError("Tool invocation legacy_safety_reason must be a string or None")
+        execution_source = normalized_arguments if execution_arguments is None else execution_arguments
+        if not isinstance(execution_source, Mapping):
+            raise TypeError("Tool invocation execution_arguments must be a mapping")
+        if any(not isinstance(name, str) for name in execution_source):
+            raise TypeError("Tool invocation execution argument names must be strings")
         if mcp_identity is not None and not isinstance(mcp_identity, MCPToolIdentity):
             raise TypeError("Tool invocation MCP identity must be MCPToolIdentity or None")
         object.__setattr__(self, "tool_name", tool_name)
         object.__setattr__(self, "_normalized_arguments", deepcopy(dict(normalized_arguments)))
-        object.__setattr__(self, "legacy_safety_reason", legacy_safety_reason)
+        object.__setattr__(self, "_execution_arguments", deepcopy(dict(execution_source)))
         object.__setattr__(self, "file_accesses", tuple(deepcopy(file_accesses)))
         object.__setattr__(self, "exec_assessment", deepcopy(exec_assessment))
         object.__setattr__(self, "schedule_action", deepcopy(schedule_action))
@@ -295,43 +297,24 @@ class ToolInvocationFacts:
         return deepcopy(self._normalized_arguments)
 
     @property
-    def safety_reason(self) -> str | None:
-        """Expose the legacy reason while the expand-phase bridge is active."""
-        return self.legacy_safety_reason
-
+    def execution_arguments(self) -> dict[str, Any]:
+        """Return the prepared argument object used by the Tool execution seam."""
+        return deepcopy(self._execution_arguments)
 
 class ToolAuthorizationSession(Protocol):
     """One authorization state machine owned by one Gateway call."""
 
     def initial_decision(self) -> PermissionDecision: ...
 
+    def confirmation_reason(self) -> str: ...
+
+    exec_assessment: ExecAssessment | None
+
     async def authorize_network_target(
         self,
         target: NormalizedNetworkTarget,
         resolved_addresses: tuple[IPAddress, ...],
     ) -> None: ...
-
-
-class _LegacyAuthorizationSession:
-    def __init__(self, safety_reason: str | None) -> None:
-        self._safety_reason = safety_reason
-
-    def initial_decision(self) -> PermissionDecision:
-        return "confirm" if self._safety_reason is not None else "direct"
-
-    def confirmation_reason(self) -> str:
-        return (
-            self._safety_reason
-            if self._safety_reason is not None
-            else "Tool confirmation is required."
-        )
-
-    async def authorize_network_target(
-        self,
-        target: NormalizedNetworkTarget,
-        resolved_addresses: tuple[IPAddress, ...],
-    ) -> None:
-        del target, resolved_addresses
 
 
 class ToolPermissionPolicy:
@@ -351,15 +334,13 @@ class ToolPermissionPolicy:
             if context.origin == "schedule" and context.snapshot is None:
                 return _DecisionAuthorizationSession("direct")
             if context.level is None:
-                return _LegacyAuthorizationSession(facts.legacy_safety_reason)
+                return _DecisionAuthorizationSession("direct")
             if context.level == "full-access":
                 return _DecisionAuthorizationSession("direct")
             return _DecisionAuthorizationSession(
                 "confirm",
                 _mcp_confirmation_reason(facts.mcp_identity),
             )
-        if facts.network_targets and context.origin != "memory":
-            return _NetworkAuthorizationSession(facts.network_targets, context.level)
         if (
             facts.tool_name == "exec"
             and facts.exec_assessment is not None
@@ -373,12 +354,12 @@ class ToolPermissionPolicy:
             )
         ):
             return _classify_exec_invocation(facts, context)
+        if facts.network_targets and context.origin != "memory":
+            return _NetworkAuthorizationSession(facts.network_targets, context.level)
         if facts.file_accesses and context.origin != "memory":
-            if context.origin == "schedule" and context.level is None:
-                return _LegacyAuthorizationSession(facts.legacy_safety_reason)
             decision, reason = _classify_file_accesses(facts.file_accesses, context)
             return _DecisionAuthorizationSession(decision, reason)
-        return _LegacyAuthorizationSession(facts.legacy_safety_reason)
+        return _DecisionAuthorizationSession("direct")
 
 
 class _NetworkAuthorizationSession:
@@ -390,6 +371,7 @@ class _NetworkAuthorizationSession:
         level: ToolPermissionLevel | None,
     ) -> None:
         self._level = level
+        self.exec_assessment: ExecAssessment | None = None
         self._requester: NetworkConfirmationRequester | None = None
         self._approved = False
         static_risk = next(
@@ -458,10 +440,14 @@ def _network_confirmation_reason(
     *,
     addresses: tuple[IPAddress, ...],
     risk: NetworkTargetRisk | None = None,
+    subject: str = "Web Fetch target",
 ) -> str:
     if not addresses and risk not in {"literal_non_global", "dns_non_global"}:
-        return "Web Fetch target DNS resolution is unavailable or returned no addresses and requires confirmation."
-    return "Web Fetch target resolves to a private or non-global address and requires confirmation."
+        return (
+            f"{subject} DNS resolution is unavailable or returned no addresses "
+            "and requires confirmation."
+        )
+    return f"{subject} resolves to a private or non-global address and requires confirmation."
 
 
 class _DecisionAuthorizationSession:
@@ -473,7 +459,7 @@ class _DecisionAuthorizationSession:
         exec_assessment: ExecAssessment | None = None,
     ) -> None:
         self._decision = decision
-        self._reason = reason or "Tool confirmation is required."
+        self._reason = reason if reason is not None else "Tool confirmation is required."
         self.exec_assessment = exec_assessment
 
     def initial_decision(self) -> PermissionDecision:
@@ -510,9 +496,9 @@ def _classify_schedule_invocation(
     action = facts.schedule_action
     if action is None or context.origin != "foreground":
         return _DecisionAuthorizationSession("direct")
-    if context.level is None:
-        return _LegacyAuthorizationSession(facts.legacy_safety_reason)
     if action.action == "list":
+        return _DecisionAuthorizationSession("direct")
+    if context.level is None:
         return _DecisionAuthorizationSession("direct")
 
     reasons: list[str] = []
@@ -547,7 +533,10 @@ def _classify_exec_invocation(
 ) -> ToolAuthorizationSession:
     assessment = facts.exec_assessment
     if assessment is None:
-        return _LegacyAuthorizationSession(facts.legacy_safety_reason)
+        return _DecisionAuthorizationSession(
+            "confirm",
+            "Exec command facts are incomplete.",
+        )
     if assessment.catastrophic_matches:
         return _DecisionAuthorizationSession(
             "confirm",
@@ -560,23 +549,70 @@ def _classify_exec_invocation(
             EXEC_CONFIRMATION_REASON,
             exec_assessment=assessment,
         )
+    if context.level is None and assessment.destructive_matches:
+        return _DecisionAuthorizationSession(
+            "confirm",
+            EXEC_DESTRUCTIVE_REASON,
+            exec_assessment=assessment,
+        )
+
+    if context.level != "full-access":
+        network_risk = next(
+            (
+                item.static_risk
+                for item in facts.network_targets
+                if item.static_risk is not None
+            ),
+            None,
+        )
+        if network_risk is not None:
+            return _DecisionAuthorizationSession(
+                "confirm",
+                _network_confirmation_reason(
+                    addresses=(),
+                    risk=network_risk,
+                    subject="Exec URL",
+                ),
+                exec_assessment=assessment,
+            )
 
     shell = context.exec_shell
     if shell is None:
-        command = facts.normalized_arguments.get("command")
-        if isinstance(command, str) and requires_legacy_destructive_confirmation(command):
-            return _DecisionAuthorizationSession(
-                "confirm",
-                "The Exec command matches a known destructive operation and requires confirmation.",
-                exec_assessment=assessment,
-            )
-        return _LegacyAuthorizationSession(facts.legacy_safety_reason)
+        if context.level is None:
+            if facts.file_accesses:
+                path_decision, path_reason = _classify_file_accesses(
+                    facts.file_accesses,
+                    context,
+                )
+                if path_decision == "confirm":
+                    return _DecisionAuthorizationSession(
+                        "confirm",
+                        path_reason,
+                        exec_assessment=assessment,
+                    )
+            return _DecisionAuthorizationSession("direct", exec_assessment=assessment)
+        return _DecisionAuthorizationSession(
+            "confirm",
+            "Exec shell facts are incomplete.",
+            exec_assessment=assessment,
+        )
     if shell.family == "bash":
         if context.level is None:
-            return _LegacyAuthorizationSession(facts.legacy_safety_reason)
+            path_decision, path_reason = _classify_exec_paths(
+                assessment.file_accesses,
+                facts=facts,
+                context=context,
+            )
+            if path_decision == "confirm":
+                return _DecisionAuthorizationSession(
+                    "confirm",
+                    path_reason,
+                    exec_assessment=assessment,
+                )
+            return _DecisionAuthorizationSession("direct", exec_assessment=assessment)
         return _classify_bash_invocation(facts, context)
     if shell.family not in {"powershell", "pwsh"}:
-        return _LegacyAuthorizationSession(facts.legacy_safety_reason)
+        return _DecisionAuthorizationSession("direct", exec_assessment=assessment)
 
     if context.level == "full-access":
         return _DecisionAuthorizationSession("direct", exec_assessment=assessment)
@@ -640,6 +676,7 @@ def _classify_bash_invocation(
         return _DecisionAuthorizationSession(
             "confirm",
             "Exec command facts are incomplete.",
+            exec_assessment=assessment,
         )
     command = facts.normalized_arguments.get("command")
     if not isinstance(command, str):
@@ -813,21 +850,34 @@ def _classify_file_accesses(
 ) -> tuple[PermissionDecision, str | None]:
     level = context.level
     has_external = any(
-        not _is_host_path_within(access.path, access.workspace_root) for access in accesses
+        not _is_host_path_within(access.path, access.workspace_root)
+        and not _is_schedule_allowed_file_access(access, context)
+        for access in accesses
     )
     has_write = any(access.role == "write" for access in accesses)
 
     if level == "full-access":
         return "direct", None
+
+    reasons: list[str] = []
     if level == "read-only" and has_write:
-        return "confirm", "Write access requires confirmation in read-only mode."
+        reasons.append("Write access requires confirmation in read-only mode.")
     if has_external:
-        return "confirm", (
+        reasons.append(
             "The requested path resolves outside the Workspace and requires confirmation."
         )
-    if level is None:
-        return "direct", None
+    if reasons:
+        return "confirm", _merge_confirmation_reasons(reasons)
     return "direct", None
+
+
+def _is_schedule_allowed_file_access(
+    access: FileAccess,
+    context: PermissionContext,
+) -> bool:
+    if context.origin != "schedule" or context.snapshot is not None:
+        return False
+    return any(_is_host_path_within(access.path, root) for root in access.allowed_roots)
 
 
 def _is_host_path_within(path: Path, root: Path) -> bool:

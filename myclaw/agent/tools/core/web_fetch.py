@@ -24,6 +24,7 @@ from myclaw.agent.tools.base import (
     is_public_ip,
     truncate_text,
 )
+from myclaw.agent.tools.core.exec_policy import ExecAssessment
 from myclaw.agent.tools.network_safety import (
     DNSResolver,
     SocketDNSResolver,
@@ -286,21 +287,9 @@ class WebFetchTool(BaseTool):
             return "Web Fetch format must be either markdown or text."
         return None
 
-    async def check_safety(  # type: ignore[override]
-        self,
-        *,
-        url: str,
-        format: str,
-        maxChars: int,
-    ) -> str | None:
-        del url, format, maxChars
-        return None
-
     def build_invocation_facts(
         self,
         prepared_arguments: dict[str, Any],
-        *,
-        safety_reason: str | None,
     ) -> ToolInvocationFacts:
         url = prepared_arguments.get("url")
         if not isinstance(url, str):
@@ -309,7 +298,6 @@ class WebFetchTool(BaseTool):
         return ToolInvocationFacts(
             tool_name=self.name,
             normalized_arguments=prepared_arguments,
-            legacy_safety_reason=safety_reason,
             network_targets=(
                 NetworkAssessment(
                     target=evaluation.target,
@@ -455,8 +443,13 @@ class WebFetchTool(BaseTool):
 
 
 class _DirectNetworkAuthorization:
+    exec_assessment: ExecAssessment | None = None
+
     def initial_decision(self) -> Literal["direct"]:
         return "direct"
+
+    def confirmation_reason(self) -> str:
+        return "Tool confirmation is required."
 
     async def authorize_network_target(
         self,

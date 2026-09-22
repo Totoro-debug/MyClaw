@@ -30,16 +30,6 @@ class ListDirTool(BaseTool):
     def __init__(self, *, workspace: Path) -> None:
         self._workspace = workspace
 
-    async def check_safety(  # type: ignore[override]
-        self,
-        *,
-        path: str,
-        recursive: bool,
-        max_entries: int,
-    ) -> str | None:
-        del recursive, max_entries
-        return self.workspace_path_safety_reason(workspace=self._workspace, requested=path)
-
     def build_file_accesses(self, prepared_arguments: dict[str, object]) -> tuple[FileAccess, ...]:
         return (
             self.canonical_file_access(

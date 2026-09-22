@@ -150,8 +150,6 @@ class ScheduleTool(BaseTool):
     def build_invocation_facts(
         self,
         prepared_arguments: dict[str, Any],
-        *,
-        safety_reason: str | None,
     ) -> ToolInvocationFacts:
         action = prepared_arguments.get("action")
         if not isinstance(action, str) or action not in {"list", "add", "remove"}:
@@ -168,7 +166,7 @@ class ScheduleTool(BaseTool):
         return ToolInvocationFacts(
             tool_name=self.name,
             normalized_arguments=normalized_arguments,
-            legacy_safety_reason=safety_reason,
+            execution_arguments=prepared_arguments,
             schedule_action=ScheduleAction(action=cast(ScheduleActionName, action)),
         )
 

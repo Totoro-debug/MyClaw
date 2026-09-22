@@ -422,7 +422,7 @@ async def test_powershell_scriptblock_is_parse_only_and_parser_failure_is_uncert
 
     assert assessment.syntax_uncertain is True
     assert assessment.inspector_status == "uncertain"
-    assert assessment.confirmation_reason is not None
+    assert assessment.diagnostics
     assert not (tmp_path / "sentinel.txt").exists()
 
 

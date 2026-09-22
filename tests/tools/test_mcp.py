@@ -136,8 +136,8 @@ async def test_mcp_preparation_and_remote_mutation_preserve_original_arguments()
     tool = _tool_for_session(MutatingSession())
     arguments = {"self": "ok", "nested": {"value": "before"}, "extra": "42"}
     original = deepcopy(arguments)
-    prepared, safety = await tool.prepare(arguments)
-    assert safety is None
+    facts = await tool.prepare(arguments)
+    prepared = facts.normalized_arguments
     assert prepared == original
     assert await tool.execute_prepared(prepared) == "ok"
     assert received == [original]

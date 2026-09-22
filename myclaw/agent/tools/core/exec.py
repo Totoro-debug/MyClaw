@@ -3,9 +3,9 @@
 from __future__ import annotations
 
 import asyncio
-import re
+from dataclasses import replace
 from pathlib import Path
-from typing import Annotated, Any, Final
+from typing import Annotated, Any, Final, Literal
 from urllib.parse import urlsplit
 
 from myclaw.agent.tools.base import BaseTool, ToolError, ToolParam, truncate_text
@@ -18,20 +18,21 @@ from myclaw.agent.tools.core.exec_host import (
     resolve_exec_shell,
 )
 from myclaw.agent.tools.core.exec_policy import (
+    CatastrophicMatch,
     ExecAssessment,
-    requires_legacy_destructive_confirmation,
+    catastrophic_matches,
+    destructive_matches,
 )
 from myclaw.agent.tools.network_safety import DNSResolver, SocketDNSResolver, assess_target
-from myclaw.agent.tools.permission import ToolAuthorizationSession, ToolInvocationFacts
+from myclaw.agent.tools.permission import (
+    NetworkAssessment,
+    NetworkTargetRisk,
+    NormalizedNetworkTarget,
+    ToolAuthorizationSession,
+    ToolInvocationFacts,
+)
 
 _OUTPUT_LIMIT: Final[int] = 4000
-_URL_PATTERN: Final[re.Pattern[str]] = re.compile(
-    r"https?://[^\s\"'`<>]+",
-    re.IGNORECASE,
-)
-_URL_TRAILING_CHARACTERS: Final[str] = ".,;:!?)]}"
-
-
 class ExecTool(BaseTool):
     """Adapt one normalized Tool call to the process-lifetime Host Exec boundary."""
 
@@ -98,33 +99,6 @@ class ExecTool(BaseTool):
             return "Exec working directory must be a directory."
         return None
 
-    async def check_safety(  # type: ignore[override]
-        self,
-        *,
-        command: str,
-        cwd: str,
-        timeout: int,
-    ) -> str | None:
-        del timeout
-        reasons: list[str] = []
-        if (
-            self._host.resolved_shell.family == "bash"
-            and requires_legacy_destructive_confirmation(command)
-        ):
-            reasons.append(
-                "The Exec command matches a known destructive operation and requires confirmation."
-            )
-        cwd_reason = self.workspace_path_safety_reason(
-            workspace=self._workspace,
-            requested=cwd,
-        )
-        if cwd_reason is not None:
-            reasons.append(cwd_reason)
-        url_reason = await self._url_safety_reason(command)
-        if url_reason is not None:
-            reasons.append(url_reason)
-        return " ".join(dict.fromkeys(reasons)) or None
-
     async def execute(self, *, command: str, cwd: str, timeout: int) -> str:
         return await self._execute_host(
             command=command,
@@ -144,7 +118,7 @@ class ExecTool(BaseTool):
         timeout = arguments.get("timeout")
         if not isinstance(command, str) or not isinstance(cwd, str) or not isinstance(timeout, int):
             raise ToolError("Exec arguments are invalid.")
-        assessment = getattr(authorization, "exec_assessment", None)
+        assessment = authorization.exec_assessment
         return await self._execute_host(
             command=command,
             cwd=cwd,
@@ -195,8 +169,6 @@ class ExecTool(BaseTool):
     async def collect_invocation_facts(
         self,
         prepared_arguments: dict[str, Any],
-        *,
-        safety_reason: str | None,
     ) -> ToolInvocationFacts:
         """Attach one detached Host assessment to the shared authorization facts."""
         command = prepared_arguments["command"]
@@ -221,48 +193,88 @@ class ExecTool(BaseTool):
                 "Exec inspection failed.",
                 status="failed",
             )
-        reasons = [reason for reason in (safety_reason, assessment.confirmation_reason) if reason]
+        assessment = _complete_command_risk_facts(assessment, command)
+        network_targets = tuple(
+            [await self._assess_url(url) for url in assessment.network_targets]
+        )
+        cwd_access = self.canonical_file_access(
+            workspace=self._workspace,
+            base=self._workspace,
+            requested=target,
+            role="read",
+        )
         return ToolInvocationFacts(
             tool_name=self.name,
             normalized_arguments=prepared_arguments,
-            legacy_safety_reason=" ".join(dict.fromkeys(reasons)) or None,
+            file_accesses=(cwd_access,),
             exec_assessment=assessment,
+            network_targets=network_targets,
         )
 
-    async def _url_safety_reason(self, command: str) -> str | None:
-        reasons: list[str] = []
-        for raw_url in _URL_PATTERN.findall(command):
-            url = raw_url.rstrip(_URL_TRAILING_CHARACTERS)
-            reason = await self._check_url(url)
-            if reason is not None and reason not in reasons:
-                reasons.append(reason)
-        return " ".join(reasons) or None
-
-    async def _check_url(self, url: str) -> str | None:
+    async def _assess_url(self, url: str) -> NetworkAssessment:
         try:
             parsed = urlsplit(url)
             hostname = parsed.hostname
             port = parsed.port
         except ValueError:
-            return "An Exec URL could not be verified and requires confirmation."
+            return NetworkAssessment(
+                target=NormalizedNetworkTarget(
+                    url=url,
+                    scheme="http",
+                    host="invalid",
+                    port=80,
+                ),
+                static_risk="dns_failure",
+            )
+        scheme: Literal["http", "https"] = (
+            "https" if parsed.scheme.lower() == "https" else "http"
+        )
         if hostname is None:
-            return "An Exec URL has no hostname and requires confirmation."
+            hostname = "invalid"
+            risk: NetworkTargetRisk | None = "dns_failure"
+        else:
+            risk = None
         effective_port = (
             port if port is not None else (443 if parsed.scheme.lower() == "https" else 80)
         )
+        target = NormalizedNetworkTarget(
+            url=url,
+            scheme=scheme,
+            host=hostname,
+            port=effective_port,
+        )
+        if risk is None:
+            risk = (await assess_target(hostname, effective_port, self._resolver)).risk
+        return NetworkAssessment(target=target, static_risk=risk)
 
-        assessment = await assess_target(hostname, effective_port, self._resolver)
-        reasons = {
-            "literal_non_global": (
-                "An Exec URL uses a private or non-global address and requires confirmation."
-            ),
-            "dns_failure": "An Exec URL has a DNS failure and requires confirmation.",
-            "dns_empty": "An Exec URL has no DNS result and requires confirmation.",
-            "dns_non_global": (
-                "An Exec URL resolves to a private or non-global address and requires confirmation."
-            ),
-        }
-        return None if assessment.risk is None else reasons[assessment.risk]
+
+def _complete_command_risk_facts(
+    assessment: ExecAssessment,
+    command: str,
+) -> ExecAssessment:
+    """Keep command-level risk facts complete across custom Host adapters."""
+    catastrophic = _merge_matches(assessment.catastrophic_matches, catastrophic_matches(command))
+    destructive = tuple(
+        dict.fromkeys((*assessment.destructive_matches, *destructive_matches(command)))
+    )
+    if (
+        catastrophic == assessment.catastrophic_matches
+        and destructive == assessment.destructive_matches
+    ):
+        return assessment
+    return replace(
+        assessment,
+        catastrophic_matches=catastrophic,
+        destructive_matches=destructive,
+    )
+
+
+def _merge_matches(
+    existing: tuple[CatastrophicMatch, ...],
+    additions: tuple[CatastrophicMatch, ...],
+) -> tuple[CatastrophicMatch, ...]:
+    seen = {item.rule for item in existing}
+    return (*existing, *(item for item in additions if item.rule not in seen))
 
 def _format_result(*, exit_code: int | None, stdout: bytes, stderr: bytes) -> str:
     return _format_streams(

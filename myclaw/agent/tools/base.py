@@ -5,7 +5,7 @@ from __future__ import annotations
 import inspect
 import re
 from abc import ABC, ABCMeta, update_abstractmethods
-from collections.abc import Callable, Collection
+from collections.abc import Callable
 from copy import deepcopy
 from dataclasses import dataclass
 from ipaddress import IPv6Address, ip_address
@@ -44,11 +44,6 @@ _ARTIFACT_ID_PATTERN = re.compile(r"^[A-Za-z0-9_-]+$")
 _ARTIFACT_SESSION_PATTERN = re.compile(r"^[^./\\]+$")
 _DEFAULT_TRUNCATION_MARKER = "\n\n...[truncated]"
 _ARTIFACT_WRITE_FAILURE_MARKER = "\n\n...[artifact write failed; full result was not stored]"
-_EXTERNAL_PATH_SAFETY_REASON = (
-    "The requested path resolves outside the Workspace and requires confirmation."
-)
-
-
 class ToolError(Exception):
     """An expected Tool failure whose message is safe to return to the model."""
 
@@ -261,27 +256,6 @@ class BaseTool(ABC, metaclass=_BaseToolMeta):
             raise self._path_resolution_error(error) from error
 
     @final
-    def workspace_path_safety_reason(
-        self,
-        *,
-        workspace: Path,
-        requested: str | Path,
-        additional_roots: Collection[Path] = (),
-    ) -> str | None:
-        """Return the shared confirmation reason for a path outside allowed roots."""
-        resolved = self.resolve_path_argument(workspace=workspace, requested=requested)
-        try:
-            contained = is_workspace_path(workspace, resolved)
-            if not contained:
-                contained = any(
-                    resolved.is_relative_to(Path(root).resolve(strict=False))
-                    for root in additional_roots
-                )
-        except (OSError, RuntimeError, ValueError) as error:
-            raise self._path_resolution_error(error) from error
-        return None if contained else _EXTERNAL_PATH_SAFETY_REASON
-
-    @final
     def canonical_file_access(
         self,
         *,
@@ -366,8 +340,8 @@ class BaseTool(ABC, metaclass=_BaseToolMeta):
     async def prepare(
         self,
         arguments: dict[str, Any],
-    ) -> tuple[dict[str, Any], str | None]:
-        """Return the final asynchronous preparation, validation, and safety pipeline."""
+    ) -> ToolInvocationFacts:
+        """Normalize, validate, and collect detached authorization facts."""
         prepared_arguments = await self.prepare_arguments(arguments)
         if not isinstance(prepared_arguments, dict):
             raise TypeError("Tool argument preparation must return a dictionary")
@@ -380,24 +354,16 @@ class BaseTool(ABC, metaclass=_BaseToolMeta):
         if validation is False:
             raise ToolError("Tool arguments are invalid.")
 
-        safety: object = self.check_safety(**deepcopy(prepared_arguments))
-        if inspect.isawaitable(safety):
-            safety = await safety
-        if safety is not None and not isinstance(safety, str):
-            raise TypeError("Tool safety checks must return a string reason or None")
-        return prepared_arguments, safety if isinstance(safety, str) else None
+        return await self.collect_invocation_facts(prepared_arguments)
 
     def build_invocation_facts(
         self,
         prepared_arguments: dict[str, Any],
-        *,
-        safety_reason: str | None,
     ) -> ToolInvocationFacts:
         """Build detached authorization facts after normalization and validation."""
         return ToolInvocationFacts(
             tool_name=self.name,
             normalized_arguments=prepared_arguments,
-            legacy_safety_reason=safety_reason,
             file_accesses=self.build_file_accesses(prepared_arguments),
         )
 
@@ -412,14 +378,9 @@ class BaseTool(ABC, metaclass=_BaseToolMeta):
     async def collect_invocation_facts(
         self,
         prepared_arguments: dict[str, Any],
-        *,
-        safety_reason: str | None,
     ) -> ToolInvocationFacts:
         """Collect detached facts, allowing Host-backed Tools to inspect asynchronously."""
-        return self.build_invocation_facts(
-            prepared_arguments,
-            safety_reason=safety_reason,
-        )
+        return self.build_invocation_facts(prepared_arguments)
 
     async def prepare_arguments(self, arguments: dict[str, Any]) -> dict[str, Any]:
         """Cast, default, filter, and validate one Built-in Tool argument object."""
@@ -443,18 +404,12 @@ class BaseTool(ABC, metaclass=_BaseToolMeta):
         return _schema_from_class(type(self), getattr(type(self), "execute", None))
 
     def validate_arguments(self, /, **arguments: Any) -> Any:
-        """Validate normalized Tool-specific arguments before safety checks.
+        """Validate normalized Tool-specific arguments before fact collection.
 
         Concrete Tools may raise ``ToolError`` with a model-safe domain message.  The
-        default keeps the expand-phase bridge usable while later Tool migrations add
-        capability-specific validation.
+        default accepts the normalized arguments without adding validation.
         """
         del arguments
-
-    async def check_safety(self, /, **arguments: Any) -> str | None:
-        """Return a confirmation reason for an unsafe normalized invocation."""
-        del arguments
-        return None
 
     @final
     def to_schema(self) -> dict[str, Any]:

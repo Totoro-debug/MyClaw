@@ -9,6 +9,7 @@ from uuid import UUID
 import pytest
 
 from myclaw.agent.tools.base import BaseTool, ToolError, ToolParam
+from myclaw.agent.tools.permission import ToolInvocationFacts
 
 
 class _RepresentativeTool(BaseTool):
@@ -49,7 +50,6 @@ class _RepresentativeTool(BaseTool):
 async def test_default_hooks_accept_a_property_named_self() -> None:
     tool = _RepresentativeTool()
     assert tool.validate_arguments(**{"self": "ok"}) is None
-    assert await tool.check_safety(**{"self": "ok"}) is None
 
 
 def test_base_tool_generates_complete_openai_function_calling_schema() -> None:
@@ -171,7 +171,7 @@ def test_tool_error_contains_only_a_public_safe_message() -> None:
 
 
 @pytest.mark.asyncio
-async def test_base_tool_prepare_returns_normalized_arguments_and_safety_reason() -> None:
+async def test_base_tool_prepare_returns_normalized_arguments_and_structured_facts() -> None:
     observed: list[tuple[str, int, bool]] = []
 
     class PreparingTool(BaseTool):
@@ -187,25 +187,15 @@ async def test_base_tool_prepare_returns_normalized_arguments_and_safety_reason(
         ) -> None:
             observed.append(("validation", count, enabled))
 
-        async def check_safety(  # type: ignore[override]
-            self, *, count: int, enabled: bool
-        ) -> str:
-            observed.append(("safety", count, enabled))
-            return "Confirmation is required."
-
         async def execute(self, *, count: int, enabled: bool) -> str:
             return f"{count}:{enabled}"
 
-    prepared = await PreparingTool().prepare({"count": "3"})
+    facts = await PreparingTool().prepare({"count": "3"})
 
-    assert prepared == (
-        {"count": 3, "enabled": False},
-        "Confirmation is required.",
-    )
-    assert observed == [
-        ("validation", 3, False),
-        ("safety", 3, False),
-    ]
+    assert isinstance(facts, ToolInvocationFacts)
+    assert facts.normalized_arguments == {"count": 3, "enabled": False}
+    assert facts.tool_name == "preparing"
+    assert observed == [("validation", 3, False)]
 
 
 @pytest.mark.asyncio
@@ -219,10 +209,9 @@ async def test_base_tool_prepare_casts_integer_text() -> None:
         async def execute(self, *, count: int) -> str:
             return str(count)
 
-    prepared, safety_reason = await IntegerTool().prepare({"count": "7"})
+    facts = await IntegerTool().prepare({"count": "7"})
 
-    assert prepared == {"count": 7}
-    assert safety_reason is None
+    assert facts.normalized_arguments == {"count": 7}
 
 
 @pytest.mark.asyncio
@@ -236,9 +225,9 @@ async def test_base_tool_prepare_casts_boolean_text() -> None:
         async def execute(self, *, enabled: bool) -> str:
             return str(enabled)
 
-    prepared, _ = await BooleanTool().prepare({"enabled": "true"})
+    facts = await BooleanTool().prepare({"enabled": "true"})
 
-    assert prepared == {"enabled": True}
+    assert facts.normalized_arguments == {"enabled": True}
 
 
 @pytest.mark.asyncio
@@ -251,9 +240,9 @@ async def test_base_tool_prepare_applies_declared_defaults() -> None:
         async def execute(self, *, value: str) -> str:
             return value
 
-    prepared, _ = await DefaultTool().prepare({})
+    facts = await DefaultTool().prepare({})
 
-    assert prepared == {"value": "fallback"}
+    assert facts.normalized_arguments == {"value": "fallback"}
 
 
 @pytest.mark.asyncio
@@ -266,9 +255,9 @@ async def test_base_tool_prepare_filters_unknown_fields() -> None:
         async def execute(self, *, value: str) -> str:
             return value
 
-    prepared, _ = await FilterTool().prepare({"value": "kept", "extra": "removed"})
+    facts = await FilterTool().prepare({"value": "kept", "extra": "removed"})
 
-    assert prepared == {"value": "kept"}
+    assert facts.normalized_arguments == {"value": "kept"}
 
 
 @pytest.mark.asyncio
@@ -351,7 +340,7 @@ async def test_base_tool_prepare_runs_validation_after_cast() -> None:
 
 
 @pytest.mark.asyncio
-async def test_base_tool_prepare_runs_safety_after_validation() -> None:
+async def test_base_tool_prepare_collects_facts_after_validation() -> None:
     observed: list[tuple[str, int]] = []
 
     class SafeTool(BaseTool):
@@ -363,16 +352,16 @@ async def test_base_tool_prepare_runs_safety_after_validation() -> None:
         def validate_arguments(self, *, count: int) -> None:  # type: ignore[override]
             observed.append(("validate", count))
 
-        async def check_safety(self, *, count: int) -> str | None:  # type: ignore[override]
-            observed.append(("safety", count))
-            return None
+        def build_invocation_facts(self, prepared_arguments: dict[str, Any]) -> ToolInvocationFacts:
+            observed.append(("facts", prepared_arguments["count"]))
+            return super().build_invocation_facts(prepared_arguments)
 
         async def execute(self, *, count: int) -> str:
             return str(count)
 
     await SafeTool().prepare({"count": "4"})
 
-    assert observed == [("validate", 4), ("safety", 4)]
+    assert observed == [("validate", 4), ("facts", 4)]
 
 
 @pytest.mark.asyncio
@@ -393,19 +382,23 @@ async def test_base_tool_prepare_propagates_cancellation_from_argument_preparati
 
 
 @pytest.mark.asyncio
-async def test_base_tool_prepare_propagates_cancellation_from_safety() -> None:
-    class CancelledSafetyTool(BaseTool):
-        name = "cancelled_safety"
-        description = "Cancel while checking safety."
+async def test_base_tool_prepare_propagates_cancellation_from_fact_collection() -> None:
+    class CancelledFactsTool(BaseTool):
+        name = "cancelled_facts"
+        description = "Cancel while collecting facts."
 
-        async def check_safety(self) -> str | None:  # type: ignore[override]
+        async def collect_invocation_facts(
+            self,
+            prepared_arguments: dict[str, Any],
+        ) -> ToolInvocationFacts:
+            del prepared_arguments
             raise asyncio.CancelledError
 
         async def execute(self) -> str:
             return "unreachable"
 
     with pytest.raises(asyncio.CancelledError):
-        await CancelledSafetyTool().prepare({})
+        await CancelledFactsTool().prepare({})
 
 
 @pytest.mark.asyncio

@@ -230,11 +230,12 @@ Full-Access calls directly.
 The existing Skill Loader remains responsible for its own internal reads, and
 ADR-0016 no longer defines a confirmation-free boundary for model-issued
 `read_file` calls. Exec uses the same structured, detached authorization facts
-for its PowerShell and Bash policies; legacy safety reasons remain only for
-calls without a strict foreground permission snapshot and other compatibility
-paths.
+for its PowerShell and Bash policies. Calls without a foreground permission
+snapshot use explicit origin and fact-based policy decisions; they do not enter
+an alternate Tool authorization path.
 
-Consequences: permission policy is now expressed with structured, detached
-facts while legacy safety reasons continue to support non-File Tools during
-the contract transition. The foreground run has a stable authorization view
-even if runtime control state changes while the model is working.
+Consequences: every Gateway authorization decision is expressed with structured,
+detached facts and one call-local authorization session. No Tool supplies a
+free-form authorization reason or bypasses the policy boundary. The foreground
+run has a stable authorization view even if runtime control state changes while
+the model is working.

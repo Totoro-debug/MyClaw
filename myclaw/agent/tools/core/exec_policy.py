@@ -36,6 +36,9 @@ EXEC_CONFIRMATION_REASON: Final = (
 EXEC_CATASTROPHIC_REASON: Final = (
     "The Exec command matches a known catastrophic operation and requires confirmation."
 )
+EXEC_DESTRUCTIVE_REASON: Final = (
+    "The Exec command matches a known destructive operation and requires confirmation."
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -124,6 +127,7 @@ class ExecAssessment:
     network_targets: tuple[str, ...] = ()
     dynamic_constructs: tuple[ExecDynamicConstruct, ...] = ()
     catastrophic_matches: tuple[CatastrophicMatch, ...] = ()
+    destructive_matches: tuple[str, ...] = ()
     git_delegation_safe: bool | None = None
     inspector_status: ExecInspectorStatus = "available"
     diagnostics: tuple[str, ...] = ()
@@ -134,21 +138,13 @@ class ExecAssessment:
         object.__setattr__(self, "network_targets", tuple(self.network_targets))
         object.__setattr__(self, "dynamic_constructs", tuple(self.dynamic_constructs))
         object.__setattr__(self, "catastrophic_matches", tuple(self.catastrophic_matches))
+        object.__setattr__(self, "destructive_matches", tuple(self.destructive_matches))
         object.__setattr__(self, "diagnostics", tuple(self.diagnostics))
 
     @property
     def uncertain(self) -> bool:
         """Return whether inspection failed closed to an unknown classification."""
         return self.syntax_uncertain or self.inspector_status != "available"
-
-    @property
-    def confirmation_reason(self) -> str | None:
-        """Return a legacy-compatible reason while later policy consumes typed facts."""
-        if self.catastrophic_matches:
-            return EXEC_CATASTROPHIC_REASON
-        if self.uncertain:
-            return EXEC_CONFIRMATION_REASON
-        return None
 
     @classmethod
     def uncertain_result(
@@ -323,10 +319,16 @@ def bash_recursive_forced_delete_targets(command: str) -> tuple[str, ...]:
     return tuple(targets)
 
 
-def requires_legacy_destructive_confirmation(command: str) -> bool:
-    """Preserve the pre-level Exec confirmation surface for destructive syntax."""
-    if catastrophic_matches(command):
-        return True
+def destructive_matches(command: str) -> tuple[str, ...]:
+    """Return typed facts for known destructive command forms."""
+    if not isinstance(command, str):
+        raise TypeError("Exec command must be a string")
+    matches: list[str] = []
+
+    def add(rule: str) -> None:
+        if rule not in matches:
+            matches.append(rule)
+
     for segment in _command_segments(command):
         invocation = _unwrap_invocation(segment)
         if not invocation:
@@ -336,15 +338,15 @@ def requires_legacy_destructive_confirmation(command: str) -> bool:
         if deletion is not None:
             recursive, force, _targets = deletion
             if recursive or force:
-                return True
+                add("recursive-or-forced-delete")
         lowered = tuple(token.lower() for token in invocation[1:])
         if name in {"del", "erase"} and any(
             "f" in token[1:] for token in lowered if token.startswith("/")
         ):
-            return True
+            add("forced-windows-delete")
         if name == "dd" and any(token.startswith("if=") for token in lowered):
-            return True
-    return False
+            add("device-read-or-write")
+    return tuple(matches)
 
 
 def _command_segments(command: str) -> tuple[tuple[str, ...], ...]:
@@ -1035,6 +1037,7 @@ def assess_command(
         network_targets=tuple(match.group(0).rstrip(".,;:!?)]}") for match in _URL_PATTERN.finditer(command)),
         dynamic_constructs=dynamic,
         catastrophic_matches=catastrophic_matches(command),
+        destructive_matches=destructive_matches(command),
         git_delegation_safe=git_delegation_safe,
         inspector_status=inspector_status,
         diagnostics=diagnostics,
@@ -2699,6 +2702,9 @@ __all__ = [
     "BASH_APPROVED_BUILTINS",
     "BASH_READ_CANDIDATES",
     "BASH_WRITE_CANDIDATES",
+    "EXEC_CATASTROPHIC_REASON",
+    "EXEC_CONFIRMATION_REASON",
+    "EXEC_DESTRUCTIVE_REASON",
     "GIT_READ_FORMS",
     "POWERSHELL_READ_CANDIDATES",
     "POWERSHELL_WRITE_CANDIDATES",
@@ -2723,6 +2729,6 @@ __all__ = [
     "catastrophic_matches",
     "classify_bash_command",
     "classify_powershell_command",
+    "destructive_matches",
     "powershell_git_audit_targets",
-    "requires_legacy_destructive_confirmation",
 ]

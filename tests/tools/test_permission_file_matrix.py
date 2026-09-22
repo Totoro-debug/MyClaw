@@ -182,10 +182,8 @@ class _UnavailableCapabilityTool(BaseTool):
     async def collect_invocation_facts(
         self,
         prepared_arguments: dict[str, Any],
-        *,
-        safety_reason: str | None,
     ) -> ToolInvocationFacts:
-        del prepared_arguments, safety_reason
+        del prepared_arguments
         raise ToolError("capability unavailable")
 
     async def execute(self) -> str:
@@ -308,6 +306,10 @@ async def test_foreground_file_write_matrix(
         assert requests[0].tool_name == tool_name
         assert requests[0].details == normalized_arguments
         assert target.read_text(encoding="utf-8") == original_content
+        if level == "read-only" and location == "outside":
+            assert "Write access requires confirmation in read-only mode." in requests[0].reason
+            assert "resolves outside the Workspace" in requests[0].reason
+            assert requests[0].reason.count("requires confirmation") == 2
 
 
 class _DirectAuthorizationSession:

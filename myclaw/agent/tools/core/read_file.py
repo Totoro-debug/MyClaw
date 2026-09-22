@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 from pathlib import Path
 from typing import Annotated
 
@@ -32,29 +33,16 @@ class ReadFileTool(BaseTool):
         self._workspace = workspace
         self._skill_root = None if skill_root is None else Path(skill_root).resolve(strict=False)
 
-    async def check_safety(  # type: ignore[override]
-        self,
-        *,
-        path: str,
-        offset: int,
-        limit: int,
-    ) -> str | None:
-        del offset, limit
-        return self.workspace_path_safety_reason(
-            workspace=self._workspace,
-            requested=path,
-            additional_roots=() if self._skill_root is None else (self._skill_root,),
-        )
-
     def build_file_accesses(self, prepared_arguments: dict[str, object]) -> tuple[FileAccess, ...]:
-        return (
-            self.canonical_file_access(
-                workspace=self._workspace,
-                base=self._workspace,
-                requested=str(prepared_arguments["path"]),
-                role="read",
-            ),
+        access = self.canonical_file_access(
+            workspace=self._workspace,
+            base=self._workspace,
+            requested=str(prepared_arguments["path"]),
+            role="read",
         )
+        if self._skill_root is not None and access.path.is_relative_to(self._skill_root):
+            access = replace(access, allowed_roots=(self._skill_root,))
+        return (access,)
 
     async def execute(self, *, path: str, offset: int, limit: int) -> str:
         target = self.resolve_path_argument(workspace=self._workspace, requested=path)

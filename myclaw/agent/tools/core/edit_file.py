@@ -29,17 +29,6 @@ class EditFileTool(BaseTool):
     def __init__(self, *, workspace: Path) -> None:
         self._workspace = workspace
 
-    async def check_safety(  # type: ignore[override]
-        self,
-        *,
-        path: str,
-        old_text: str,
-        new_text: str,
-        replace_all: bool,
-    ) -> str | None:
-        del old_text, new_text, replace_all
-        return self.workspace_path_safety_reason(workspace=self._workspace, requested=path)
-
     def build_file_accesses(self, prepared_arguments: dict[str, object]) -> tuple[FileAccess, ...]:
         requested = str(prepared_arguments["path"])
         return (

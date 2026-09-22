@@ -137,23 +137,6 @@ class GrepTool(BaseTool):
                 return f"Grep pattern is invalid: {error}"
         return None
 
-    async def check_safety(  # type: ignore[override]
-        self,
-        *,
-        pattern: str,
-        path: str,
-        glob: str | None,
-        type: str | None,
-        output_mode: str,
-        fixed_string: bool,
-        ignore_case: bool,
-        context: int,
-        head_limit: int,
-        offset: int,
-    ) -> str | None:
-        del pattern, glob, type, output_mode, fixed_string, ignore_case, context, head_limit, offset
-        return self.workspace_path_safety_reason(workspace=self._workspace, requested=path)
-
     def build_file_accesses(self, prepared_arguments: dict[str, object]) -> tuple[FileAccess, ...]:
         return (
             self.canonical_file_access(

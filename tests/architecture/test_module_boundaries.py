@@ -29,8 +29,9 @@ _CLI_TOOL_IMPORTS = frozenset(
     }
 )
 _TOOL_EXECUTION_DISPATCH_METHODS = frozenset(
-    {"execute_prepared", "execute_authorized"}
+    {"execute", "execute_prepared", "execute_authorized"}
 )
+_TOOL_RUNTIME_STATE_MARKERS = ("permission", "authorization")
 
 
 @dataclass(frozen=True, slots=True)
@@ -207,14 +208,152 @@ def _tool_execution_dispatch_violations(
         if path in allowed_dispatchers:
             continue
         tree = ast.parse(sources[path], filename=str(path))
+        typed_tool_names = _typed_tool_names(tree)
         display_path = path.relative_to(PROJECT_ROOT) if path.is_absolute() else path
-        violations.extend(
-            f"{display_path}:{node.lineno} calls {node.func.attr}"
-            for node in ast.walk(tree)
-            if isinstance(node, ast.Call)
-            and isinstance(node.func, ast.Attribute)
-            and node.func.attr in _TOOL_EXECUTION_DISPATCH_METHODS
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Attribute):
+                continue
+            method = node.func.attr
+            if method not in _TOOL_EXECUTION_DISPATCH_METHODS:
+                continue
+            if method == "execute" and not _looks_like_tool_receiver(
+                node.func.value,
+                typed_tool_names=typed_tool_names,
+            ):
+                continue
+            violations.append(f"{display_path}:{node.lineno} calls {method}")
+    return tuple(violations)
+
+
+def _typed_tool_names(tree: ast.AST) -> frozenset[str]:
+    names: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.arg) and _annotation_names_tool(node.annotation):
+            names.add(node.arg)
+        elif (
+            isinstance(node, ast.AnnAssign)
+            and isinstance(node.target, ast.Name)
+            and _annotation_names_tool(node.annotation)
+        ):
+            names.add(node.target.id)
+        elif isinstance(node, ast.Assign) and _constructs_tool(node.value):
+            names.update(target.id for target in node.targets if isinstance(target, ast.Name))
+    return frozenset(names)
+
+
+def _annotation_names_tool(annotation: ast.expr | None) -> bool:
+    if annotation is None:
+        return False
+    return any(
+        (isinstance(node, ast.Name) and (node.id == "BaseTool" or node.id.endswith("Tool")))
+        or (
+            isinstance(node, ast.Attribute)
+            and (node.attr == "BaseTool" or node.attr.endswith("Tool"))
         )
+        for node in ast.walk(annotation)
+    )
+
+
+def _constructs_tool(value: ast.expr) -> bool:
+    if not isinstance(value, ast.Call):
+        return False
+    constructor = value.func
+    return (
+        isinstance(constructor, ast.Name)
+        and (constructor.id == "BaseTool" or constructor.id.endswith("Tool"))
+    ) or (
+        isinstance(constructor, ast.Attribute)
+        and (constructor.attr == "BaseTool" or constructor.attr.endswith("Tool"))
+    )
+
+
+def _looks_like_tool_receiver(
+    receiver: ast.expr,
+    *,
+    typed_tool_names: frozenset[str],
+) -> bool:
+    if isinstance(receiver, ast.Name):
+        return (
+            receiver.id in typed_tool_names
+            or receiver.id == "tool"
+            or receiver.id.endswith("_tool")
+        )
+    if isinstance(receiver, ast.Attribute):
+        return receiver.attr == "tool" or receiver.attr.endswith("_tool")
+    if isinstance(receiver, ast.Call):
+        return _constructs_tool(receiver)
+    return (
+        isinstance(receiver, ast.Subscript)
+        and isinstance(receiver.value, ast.Attribute)
+        and receiver.value.attr in {"catalog", "_tools"}
+    )
+
+
+def _base_tool_runtime_state_violations(sources: Mapping[Path, str]) -> tuple[str, ...]:
+    violations: list[str] = []
+    for path in sorted(sources, key=str):
+        tree = ast.parse(sources[path], filename=str(path))
+        display_path = path.relative_to(PROJECT_ROOT) if path.is_absolute() else path
+        for class_node in (node for node in ast.walk(tree) if isinstance(node, ast.ClassDef)):
+            if not any(
+                (isinstance(base, ast.Name) and base.id == "BaseTool")
+                or (isinstance(base, ast.Attribute) and base.attr == "BaseTool")
+                for base in class_node.bases
+            ):
+                continue
+            for node in ast.walk(class_node):
+                if not (
+                    isinstance(node, ast.Attribute)
+                    and isinstance(node.ctx, ast.Store)
+                    and isinstance(node.value, ast.Name)
+                    and node.value.id == "self"
+                ):
+                    continue
+                if any(marker in node.attr.casefold() for marker in _TOOL_RUNTIME_STATE_MARKERS):
+                    violations.append(
+                        f"{display_path}:{node.lineno} stores {node.attr} on {class_node.name}"
+                    )
+    return tuple(violations)
+
+
+def _base_tool_prepare_contract_violations(sources: Mapping[Path, str]) -> tuple[str, ...]:
+    violations: list[str] = []
+    for path in sorted(sources, key=str):
+        tree = ast.parse(sources[path], filename=str(path))
+        display_path = path.relative_to(PROJECT_ROOT) if path.is_absolute() else path
+        for class_node in (node for node in ast.walk(tree) if isinstance(node, ast.ClassDef)):
+            prepare = next(
+                (
+                    node
+                    for node in class_node.body
+                    if isinstance(node, ast.AsyncFunctionDef) and node.name == "prepare"
+                ),
+                None,
+            )
+            if class_node.name == "BaseTool":
+                if prepare is None:
+                    violations.append(f"{display_path}:{class_node.lineno} lacks BaseTool.prepare")
+                    continue
+                decorators = {
+                    decorator.id
+                    for decorator in prepare.decorator_list
+                    if isinstance(decorator, ast.Name)
+                }
+                returns = None if prepare.returns is None else ast.unparse(prepare.returns)
+                if "final" not in decorators or returns != "ToolInvocationFacts":
+                    violations.append(
+                        f"{display_path}:{prepare.lineno} has an invalid BaseTool.prepare contract"
+                    )
+                continue
+            is_base_tool_subclass = any(
+                (isinstance(base, ast.Name) and base.id == "BaseTool")
+                or (isinstance(base, ast.Attribute) and base.attr == "BaseTool")
+                for base in class_node.bases
+            )
+            if is_base_tool_subclass and prepare is not None:
+                violations.append(
+                    f"{display_path}:{prepare.lineno} overrides final BaseTool.prepare"
+                )
     return tuple(violations)
 
 
@@ -286,6 +425,60 @@ def test_production_tool_execution_dispatch_has_one_gateway_boundary() -> None:
     assert violations == ()
 
 
+def test_production_tools_have_no_legacy_string_authorization_surface() -> None:
+    """Keep authorization decisions on typed invocation facts and one policy."""
+    forbidden_identifiers = {
+        "check_safety",
+        "workspace_path_safety_reason",
+        "safety_reason",
+        "safety_assessment",
+        "legacy_safety_reason",
+        "_LegacyAuthorizationSession",
+        "requires_confirmation",
+        "requires_legacy_destructive_confirmation",
+        "authorization_callback",
+        "_authorization_callback",
+    }
+    violations: list[str] = []
+    for path in _python_files(PACKAGE_ROOT / "agent" / "tools"):
+        source = path.read_text(encoding="utf-8")
+        tree = ast.parse(source, filename=str(path))
+        for node in ast.walk(tree):
+            identifier: str | None = None
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                identifier = node.name
+            elif isinstance(node, ast.Name):
+                identifier = node.id
+            elif isinstance(node, ast.arg):
+                identifier = node.arg
+            elif isinstance(node, ast.keyword):
+                identifier = node.arg
+            elif isinstance(node, ast.Attribute):
+                identifier = node.attr
+            if identifier in forbidden_identifiers:
+                violations.append(
+                    f"{path.relative_to(PROJECT_ROOT)}:{getattr(node, 'lineno', 0)}:{identifier}"
+                )
+
+    assert violations == []
+
+
+def test_base_tool_prepare_is_the_final_structured_fact_seam() -> None:
+    sources = {
+        path: path.read_text(encoding="utf-8") for path in _python_files(PACKAGE_ROOT)
+    }
+
+    assert _base_tool_prepare_contract_violations(sources) == ()
+
+
+def test_shared_tools_store_no_permission_or_authorization_runtime_state() -> None:
+    sources = {
+        path: path.read_text(encoding="utf-8") for path in _python_files(PACKAGE_ROOT)
+    }
+
+    assert _base_tool_runtime_state_violations(sources) == ()
+
+
 @pytest.mark.parametrize("method", sorted(_TOOL_EXECUTION_DISPATCH_METHODS))
 def test_tool_execution_dispatch_checker_rejects_gateway_bypasses(method: str) -> None:
     path = Path("myclaw/agent/bypass.py")
@@ -308,6 +501,42 @@ def test_tool_execution_dispatch_checker_allows_unrelated_execute_methods() -> N
         )
         == ()
     )
+
+
+def test_tool_execution_dispatch_checker_uses_tool_types_not_only_names() -> None:
+    path = Path("myclaw/agent/bypass.py")
+    source = "async def bypass(candidate: BaseTool):\n    await candidate.execute()"
+
+    assert _tool_execution_dispatch_violations(
+        {path: source},
+        allowed_dispatchers=frozenset(),
+    ) == (f"{path}:2 calls execute",)
+
+
+@pytest.mark.parametrize("attribute", ["_permission_context", "_authorization_session"])
+def test_shared_tool_state_checker_rejects_permission_runtime_state(attribute: str) -> None:
+    path = Path("myclaw/agent/unsafe_tool.py")
+    source = (
+        "class UnsafeTool(BaseTool):\n"
+        "    def __init__(self, value):\n"
+        f"        self.{attribute} = value\n"
+    )
+
+    assert _base_tool_runtime_state_violations({path: source}) == (
+        f"{path}:3 stores {attribute} on UnsafeTool",
+    )
+
+
+def test_prepare_contract_checker_rejects_tuple_and_subclass_override() -> None:
+    path = Path("myclaw/agent/unsafe_tool.py")
+    source = (
+        "class BaseTool:\n"
+        "    async def prepare(self, arguments) -> tuple[dict, str | None]: ...\n"
+        "class UnsafeTool(BaseTool):\n"
+        "    async def prepare(self, arguments) -> ToolInvocationFacts: ...\n"
+    )
+
+    assert len(_base_tool_prepare_contract_violations({path: source})) == 2
 
 
 @pytest.mark.parametrize("root", [PACKAGE_ROOT / "utils", PACKAGE_ROOT / "errors.py"])
