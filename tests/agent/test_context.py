@@ -68,6 +68,38 @@ def test_schedule_runtime_context_projects_the_permission_snapshot(
     assert "- Tool Confirmation: Permission checks may require one confirmation" in content
 
 
+@pytest.mark.parametrize("schedule_run", [False, True], ids=["foreground", "schedule"])
+def test_system_prompt_describes_run_local_tool_permission_contract(
+    monkeypatch: pytest.MonkeyPatch,
+    workspace: Path,
+    schedule_run: bool,
+) -> None:
+    builder = _builder(monkeypatch, workspace, "UTC")
+    messages = [{"role": "user", "content": "Question."}]
+    rendered = (
+        builder.build_schedule_messages(messages, session_id="schedule-session")
+        if schedule_run
+        else builder.build_foreground_messages(messages, session_id="foreground-session")
+    )
+    assert rendered[0]["role"] == "system"
+    content = rendered[0]["content"]
+    assert isinstance(content, str)
+
+    assert "本次 Run 捕获的不可变 Tool Permission Level 快照及 Tool Gateway 约束" in content
+    for tool in ("File", "Exec", "Web Fetch", "MCP", "Schedule Tool"):
+        assert tool in content
+    assert "私有或非全局 Web Fetch 目标" in content
+    assert "灾难性或不确定的 Exec 确认仍然有效" in content
+    assert "能力缺失、业务拒绝、Tool 执行错误" in content
+    assert "配置的 MCP Tool 按用户配置授予的信任执行" not in content
+    assert "只取消前台 File Tool 的普通权限确认" not in content
+    assert "`/permission` 只影响后续前台 Run 的快照" in content
+    assert "不改变已开始的 Run 或 User Schedule Agent Run 的启动配置权限" in content
+    if schedule_run:
+        assert "Schedule Run Boundary" in content
+        assert "`schedule` Tool is unavailable" in content
+
+
 class _FrozenDateTime(datetime):
     @classmethod
     def now(cls, tz: object = None) -> _FrozenDateTime:
