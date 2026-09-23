@@ -48,12 +48,17 @@ For POSIX Bash, Read-Only and Workspace-Write direct execution is limited to
 the fixed read candidates (`pwd`, `ls`, `cat`, `head`, `tail`, `wc`, `stat`,
 `file`, `grep`, `rg`, `find`, `sort`, `uniq`, `cut`, and `diff`) and write
 candidates (`mkdir`, `touch`, `cp`, `mv`, and `rm`) recorded in ADR-0010. The
-Host returns AST dynamic-construct facts, unique native PATH identity, and
-static path-role facts. Only the approved `pwd` builtin and unique native
-executables outside the Workspace can be direct; aliases, functions, scripts,
-shims, symlinks, duplicate PATH entries, ambiguous or unknown identities,
-dynamic syntax, unlisted options, follow/watch modes, external preprocessors,
-`find` actions, and unsafe pipelines require one confirmation. Full-Access
+Host returns AST dynamic-construct facts, native PATH identity, and static
+path-role facts. Only the approved `pwd` builtin and one matching PATH entry
+for a native executable outside the Workspace can be direct. A symlink in that
+entry's parent directory alone does not change a one-hit identity. Repeated
+PATH entries, two entries where one directory symlinks to the other, and two
+distinct executable targets are ambiguous and require one confirmation, even
+when the hits resolve to the same target. A final-component executable symlink
+is a shim and requires one confirmation even with one hit. Aliases, functions,
+scripts, other shims, unknown identities, dynamic syntax, unlisted options,
+follow/watch modes, external preprocessors, `find` actions, and unsafe
+pipelines also require one confirmation. Full-Access
 directly executes parseable non-catastrophic dynamic Bash commands while
 retaining catastrophic and inspector-uncertain confirmation.
 

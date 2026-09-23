@@ -1084,6 +1084,89 @@ async def test_bash_identity_rejects_symlink(tmp_path: Path) -> None:
     assert linked.command_identities[0].kind == "shim"
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("level", ("read-only", "workspace-write"))
+@pytest.mark.parametrize(
+    ("case", "expected_kind", "expected_hits"),
+    (
+        ("single", "native", 1),
+        ("symlinked-directory", "native", 1),
+        ("duplicate-entry", "ambiguous", 2),
+        ("directory-alias", "ambiguous", 2),
+        ("final-file-symlink", "shim", 1),
+        ("distinct-targets", "ambiguous", 2),
+    ),
+)
+async def test_bash_path_identity_crosses_gateway(
+    tmp_path: Path,
+    level: Literal["read-only", "workspace-write"],
+    case: str,
+    expected_kind: str,
+    expected_hits: int,
+) -> None:
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    executable = bin_dir / "cat"
+    executable.write_bytes(b"\x7fELF")
+    executable.chmod(0o755)
+    path_entries = (bin_dir,)
+
+    if case in {"symlinked-directory", "directory-alias"}:
+        alias_dir = tmp_path / "alias-bin"
+        try:
+            alias_dir.symlink_to(bin_dir, target_is_directory=True)
+        except (OSError, NotImplementedError):
+            pytest.skip("symbolic links are unavailable on this host")
+        path_entries = (alias_dir,) if case == "symlinked-directory" else (bin_dir, alias_dir)
+    elif case == "duplicate-entry":
+        path_entries = (bin_dir, bin_dir)
+    elif case == "final-file-symlink":
+        link_dir = tmp_path / "link-bin"
+        link_dir.mkdir()
+        try:
+            (link_dir / "cat").symlink_to(executable)
+        except (OSError, NotImplementedError):
+            pytest.skip("symbolic links are unavailable on this host")
+        path_entries = (link_dir,)
+    elif case == "distinct-targets":
+        second_dir = tmp_path / "second-bin"
+        second_dir.mkdir()
+        second_executable = second_dir / "cat"
+        second_executable.write_bytes(b"\x7fELF")
+        second_executable.chmod(0o755)
+        path_entries = (bin_dir, second_dir)
+
+    workspace, host = _synthetic_bash_host(tmp_path, set(), path_entries=path_entries)
+    (workspace / "inside.txt").write_text("inside\n", encoding="utf-8")
+    command = "cat ./inside.txt"
+    identity = (await host.inspect(command, workspace)).command_identities[0]
+    assert identity.kind == expected_kind
+    assert identity.resolution_count == expected_hits
+    if expected_kind == "native":
+        assert identity.resolved == str(executable.resolve())
+
+    requests: list[ConfirmationRequest] = []
+    result = await _gateway(workspace, host, level=level).call(
+        _call(command),
+        confirmation=lambda request: _decline(requests, request),
+    )
+
+    if expected_kind == "native":
+        assert result.status == "success"
+        assert result.confirmation is None
+        assert requests == []
+        assert len(host.executions) == 1
+    else:
+        assert result.status == "refused"
+        assert len(requests) == 1
+        assert requests[0].details == {
+            "command": command,
+            "cwd": str(workspace.resolve()),
+            "timeout": 7,
+        }
+        assert host.executions == []
+
+
 def test_windows_shell_resolution_never_discovers_git_bash() -> None:
     requested: list[str] = []
 

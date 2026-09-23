@@ -14,12 +14,18 @@ and `diff`; direct write candidates are `mkdir`, `touch`, `cp`, `mv`, and
 `grep`/`rg` patterns must be fixed, `find` cannot use action or delegation
 expressions, and `cp`/`mv` distinguish source reads from destination writes.
 A simple fixed pipeline is allowed when every command identity and operand is
-classified. Bash identities must resolve uniquely through the selected PATH to
-a native executable, or be the approved `pwd` builtin; duplicate PATH entries,
-symlinks, aliases, functions, scripts, shims, ambiguous or unknown identities,
-Workspace executables, dynamic expansions, redirection, command lists, control
-flow, glob/home expansion, follow/watch modes, external preprocessors, and
-unlisted commands require one confirmation. Read-Only permits
+classified. Bash identities must have one matching PATH entry for a native
+executable outside the Workspace, or be the approved `pwd` builtin. A single
+hit remains eligible when its parent PATH directory is a symlink. Each matching
+PATH entry counts separately: a repeated directory, two directories where one
+symlinks to the other, or two distinct executable targets is ambiguous and
+requires one confirmation, even when the hits resolve to the same target. A
+symlink at the executable's final path component is a shim and requires one
+confirmation even with one hit; a symlink in a parent directory alone is not a
+shim. Aliases, functions, scripts, other shims, unknown identities, Workspace
+executables, dynamic expansions, redirection, command lists, control flow,
+glob/home expansion, follow/watch modes, external preprocessors, and unlisted
+commands also require one confirmation. Read-Only permits
 only Workspace reads; Workspace-Write permits Workspace reads and writes.
 Full-Access allows parseable non-catastrophic dynamic Bash commands directly,
 but never bypasses catastrophic confirmation, inspector uncertainty, argument
