@@ -21,6 +21,7 @@ from myclaw.agent.tools.core.exec_policy import (
     EXEC_CONFIRMATION_REASON,
     EXEC_DESTRUCTIVE_REASON,
     ExecAssessment,
+    ExecGrammarClassification,
     ExecPathAccess,
     ResolvedExecShell,
     bash_recursive_forced_delete_targets,
@@ -638,6 +639,21 @@ def _classify_exec_invocation(
             exec_assessment=assessment,
         )
     grammar = classify_powershell_command(command, assessment)
+    return _classify_exec_grammar_result(
+        grammar,
+        facts=facts,
+        context=context,
+        assessment=assessment,
+    )
+
+
+def _classify_exec_grammar_result(
+    grammar: ExecGrammarClassification,
+    *,
+    facts: ToolInvocationFacts,
+    context: PermissionContext,
+    assessment: ExecAssessment,
+) -> ToolAuthorizationSession:
     if not grammar.accepted:
         return _DecisionAuthorizationSession(
             "confirm",
@@ -712,32 +728,12 @@ def _classify_bash_invocation(
         )
 
     grammar = classify_bash_command(command, assessment)
-    if not grammar.accepted:
-        return _DecisionAuthorizationSession(
-            "confirm",
-            grammar.reason,
-            exec_assessment=assessment,
-        )
-    path_decision, path_reason = _classify_exec_paths(
-        grammar.file_accesses,
+    return _classify_exec_grammar_result(
+        grammar,
         facts=facts,
         context=context,
+        assessment=assessment,
     )
-    if path_decision == "confirm":
-        return _DecisionAuthorizationSession(
-            "confirm",
-            path_reason,
-            exec_assessment=assessment,
-        )
-    if context.level == "read-only" and any(
-        access.role == "write" for access in grammar.file_accesses
-    ):
-        return _DecisionAuthorizationSession(
-            "confirm",
-            "Write access requires confirmation in read-only mode.",
-            exec_assessment=assessment,
-        )
-    return _DecisionAuthorizationSession("direct", exec_assessment=assessment)
 
 
 def _bash_deletes_workspace_root(

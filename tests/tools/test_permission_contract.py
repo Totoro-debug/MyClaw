@@ -1,13 +1,19 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
 from typing import Any
 
 import pytest
 
 from myclaw.agent.confirmation import ConfirmationAborted
+from myclaw.agent.permission import ToolPermissionLevel
 from myclaw.agent.tools.base import BaseTool, ToolError
-from myclaw.agent.tools.core.exec_policy import ExecAssessment
+from myclaw.agent.tools.core.exec_policy import (
+    ExecAssessment,
+    ExecCommandIdentity,
+    ResolvedExecShell,
+)
 from myclaw.agent.tools.permission import (
     NetworkAssessment,
     NetworkTargetRisk,
@@ -408,6 +414,122 @@ def test_exec_network_confirmation_reason_uses_exec_subject(
 
     assert authorization.initial_decision() == "confirm"
     assert authorization.confirmation_reason() == expected_reason
+
+
+@pytest.mark.parametrize("shell_family", ["pwsh", "bash"])
+@pytest.mark.parametrize(
+    ("case", "level", "expected_decision", "expected_reason"),
+    [
+        ("grammar_rejection", "read-only", "confirm", None),
+        ("workspace_read", "read-only", "direct", "Tool confirmation is required."),
+        (
+            "readonly_write",
+            "read-only",
+            "confirm",
+            "Write access requires confirmation in read-only mode.",
+        ),
+        ("workspace_write", "workspace-write", "direct", "Tool confirmation is required."),
+        (
+            "external_read",
+            "workspace-write",
+            "confirm",
+            "The requested path resolves outside the Workspace and requires confirmation.",
+        ),
+        (
+            "external_write_readonly",
+            "read-only",
+            "confirm",
+            "The requested path resolves outside the Workspace and requires confirmation.",
+        ),
+    ],
+)
+def test_exec_post_grammar_policy_preserves_shell_parity(
+    tmp_path: Path,
+    shell_family: str,
+    case: str,
+    level: ToolPermissionLevel,
+    expected_decision: PermissionDecision,
+    expected_reason: str | None,
+) -> None:
+    (tmp_path / "inside.txt").write_text("inside", encoding="utf-8")
+    (tmp_path.parent / "outside.txt").write_text("outside", encoding="utf-8")
+    commands = {
+        "pwsh": {
+            "grammar_rejection": "Write-Host hello",
+            "workspace_read": r"Get-Content -LiteralPath .\inside.txt",
+            "readonly_write": r"Clear-Content -LiteralPath .\inside.txt",
+            "workspace_write": r"Clear-Content -LiteralPath .\inside.txt",
+            "external_read": r"Get-Content -LiteralPath ..\outside.txt",
+            "external_write_readonly": r"Clear-Content -LiteralPath ..\outside.txt",
+        },
+        "bash": {
+            "grammar_rejection": "printf hello",
+            "workspace_read": "cat ./inside.txt",
+            "readonly_write": "touch ./inside.txt",
+            "workspace_write": "touch ./inside.txt",
+            "external_read": "cat ../outside.txt",
+            "external_write_readonly": "touch ../outside.txt",
+        },
+    }
+    command = commands[shell_family][case]
+    command_name = command.split(maxsplit=1)[0]
+    identity = (
+        ExecCommandIdentity(
+            requested=command_name,
+            canonical=command_name,
+            resolved="Microsoft.PowerShell.Management",
+            module="Microsoft.PowerShell.Management",
+            kind="cmdlet",
+            resolution_count=1,
+        )
+        if shell_family == "pwsh"
+        else ExecCommandIdentity(
+            requested=command_name,
+            canonical=command_name,
+            resolved=str(tmp_path.parent / "bin" / command_name),
+            kind="native",
+            resolution_count=1,
+        )
+    )
+    assessment = ExecAssessment(
+        syntax_confidence="high",
+        syntax_uncertain=False,
+        command_identities=(identity,),
+    )
+    shell = ResolvedExecShell(
+        selector="pwsh" if shell_family == "pwsh" else "auto",
+        platform="windows" if shell_family == "pwsh" else "posix",
+        family="pwsh" if shell_family == "pwsh" else "bash",
+        executable="pwsh" if shell_family == "pwsh" else "bash",
+        flags=(),
+        environment=(),
+        available=True,
+    )
+    facts = ToolInvocationFacts(
+        tool_name="exec",
+        normalized_arguments={"command": command, "cwd": str(tmp_path)},
+        exec_assessment=assessment,
+    )
+
+    authorization = ToolPermissionPolicy().open(
+        facts,
+        PermissionContext(
+            level=level,
+            origin="foreground",
+            workspace_root=tmp_path,
+            exec_shell=shell,
+        ),
+    )
+
+    if expected_reason is None:
+        expected_reason = (
+            "The PowerShell command is not on the fixed candidate list."
+            if shell_family == "pwsh"
+            else "The Bash command is not on the fixed candidate list."
+        )
+    assert authorization.initial_decision() == expected_decision
+    assert authorization.confirmation_reason() == expected_reason
+    assert authorization.exec_assessment == assessment
 
 
 @pytest.mark.parametrize("action", ["list", "add", "remove"])
