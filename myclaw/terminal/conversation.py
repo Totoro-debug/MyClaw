@@ -535,11 +535,17 @@ class _FullAccessWarningScreen(ModalScreen[bool]):
     #permission-warning-panel {
         width: 80%;
         max-width: 72;
-        height: auto;
+        height: 90%;
         max-height: 90%;
         padding: 1 2;
         border: round $warning;
         background: $surface;
+        overflow-y: hidden;
+    }
+
+    #permission-warning-copy {
+        width: 100%;
+        height: 1fr;
         overflow-y: auto;
     }
 
@@ -584,29 +590,30 @@ class _FullAccessWarningScreen(ModalScreen[bool]):
         super().__init__(id="permission-warning")
 
     def compose(self) -> ComposeResult:
-        with Center():
-            with Vertical(id="permission-warning-panel"):
-                yield Static("Enable Full-Access?", id="permission-warning-heading", markup=False)
+        with Vertical(id="permission-warning-panel"):
+            yield Static("Enable Full-Access?", id="permission-warning-heading", markup=False)
+            with VerticalScroll(id="permission-warning-copy"):
                 yield Static(
-                    "Full-Access cancels ordinary permission confirmation for valid foreground"
-                    " File Tool calls. It is process-local and is not persisted.",
+                    "Full-Access skips ordinary permission prompts for valid foreground File,"
+                    " eligible non-catastrophic Exec, private or non-global Web Fetch, MCP,"
+                    " and available Schedule Tool calls. Process-local; not persisted.",
                     id="permission-warning-message",
                     markup=False,
                 )
                 yield Static(
-                    "This is not an OS sandbox. Validation, unavailable capabilities, business"
-                    " refusals, and Tool errors still apply. Exec, Web, MCP, and Schedule keep"
-                    " their existing behavior.",
+                    "No OS sandbox. Validation, unavailable capabilities, business refusals,"
+                    " and Tool errors still apply. Catastrophic or uncertain Exec still"
+                    " requires confirmation.",
                     id="permission-warning-details",
                     markup=False,
                 )
-                with Horizontal(id="permission-warning-actions"):
-                    yield Button("Cancel", id="permission-warning-cancel")
-                    yield Button(
-                        "Enable",
-                        variant="warning",
-                        id="permission-warning-confirm",
-                    )
+            with Horizontal(id="permission-warning-actions"):
+                yield Button("Cancel", id="permission-warning-cancel")
+                yield Button(
+                    "Enable",
+                    variant="warning",
+                    id="permission-warning-confirm",
+                )
 
     def on_mount(self) -> None:
         self.query_one("#permission-warning-cancel", Button).focus()

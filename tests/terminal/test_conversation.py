@@ -6510,11 +6510,24 @@ async def test_permission_full_access_requires_cancel_focused_warning_and_explic
         assert app.screen.id == "permission-warning"
         assert app.screen.focused is not None
         assert app.screen.focused.id == "permission-warning-cancel"
-        warning = _visible_screen_text(app)
+        warning = " ".join(_visible_screen_text(app).split())
         assert "Full-Access" in warning
-        assert "ordinary permission confirmation" in warning
+        assert "ordinary permission prompts" in warning
         assert "OS sandbox" in warning
         assert "validation" in warning.casefold()
+        for tool in ("File", "Exec", "Web Fetch", "MCP", "Schedule"):
+            assert tool in warning
+        assert "private or non-global" in warning
+        for protection in (
+            "Catastrophic or uncertain Exec",
+            "unavailable",
+            "capabilities",
+            "business refusals",
+            "Tool errors",
+            "confirmation",
+        ):
+            assert protection in warning
+        assert "keep their existing behavior" not in warning
         assert management.updated == []
 
         await pilot.press("enter")
@@ -6535,6 +6548,38 @@ async def test_permission_full_access_requires_cancel_focused_warning_and_explic
         assert management.updated == ["full-access"]
         assert app.screen.id == "_default"
         assert "Foreground permission level: full-access" in _visible_screen_text(app)
+
+
+@pytest.mark.asyncio
+async def test_permission_full_access_warning_actions_fit_narrow_viewport() -> None:
+    conversation = ScriptedRunSource()
+    runtime = _terminal_backend(conversation)
+    management = _PermissionManagement("workspace-write")
+    app = _terminal_app(
+        cast(Any, runtime),
+        management_dispatcher=ManagementCommandDispatcher(cast(Any, management)),
+    )
+
+    async with app.run_test(size=(40, 18)) as pilot:
+        await pilot.press(*list("/permission"), "enter")
+        await pilot.pause()
+        await pilot.press("right", "enter")
+        await pilot.pause()
+
+        assert app.screen.id == "permission-warning"
+        assert app.screen.focused is not None
+        assert app.screen.focused.id == "permission-warning-cancel"
+        cancel = app.screen.query_one("#permission-warning-cancel", Button)
+        confirm = app.screen.query_one("#permission-warning-confirm", Button)
+        assert cancel.region.width > 0 and confirm.region.width > 0
+        assert cancel.region.y >= 0 and confirm.region.y >= 0
+        assert cancel.region.bottom <= 18 and confirm.region.bottom <= 18
+        assert not cancel.region.overlaps(confirm.region)
+        assert management.updated == []
+
+        assert await pilot.click(confirm, offset=(confirm.size.width // 2, confirm.size.height // 2))
+        await pilot.pause()
+        assert management.updated == ["full-access"]
 
 
 @pytest.mark.asyncio
