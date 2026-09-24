@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 from typing import Any
 
@@ -451,6 +452,12 @@ def test_exec_post_grammar_policy_preserves_shell_parity(
     expected_decision: PermissionDecision,
     expected_reason: str | None,
 ) -> None:
+    if os.name != "nt" and shell_family == "pwsh" and case in {
+        "workspace_read",
+        "external_read",
+        "external_write_readonly",
+    }:
+        pytest.skip("requires native Windows PowerShell paths")
     (tmp_path / "inside.txt").write_text("inside", encoding="utf-8")
     (tmp_path.parent / "outside.txt").write_text("outside", encoding="utf-8")
     commands = {

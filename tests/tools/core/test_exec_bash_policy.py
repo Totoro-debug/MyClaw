@@ -360,7 +360,15 @@ async def test_bash_catastrophic_operation_confirms_at_full_access(
 
 @pytest.mark.asyncio
 async def test_bash_inspector_resolves_builtin_and_marks_dynamic_ast(tmp_path: Path) -> None:
-    host = BashExecHost(_shell())
+    empty_bin = tmp_path / "empty-bin"
+    empty_bin.mkdir()
+    shell = resolve_exec_shell(
+        "auto",
+        platform="posix",
+        which=lambda name: "/usr/bin/bash" if name == "bash" else None,
+        environment={"PATH": str(empty_bin)},
+    )
+    host = BashExecHost(shell)
 
     assessment = await host.inspect("value=$(pwd); cat \"$value\"", tmp_path)
 
@@ -1109,7 +1117,7 @@ async def test_bash_path_identity_crosses_gateway(
     executable = bin_dir / "cat"
     executable.write_bytes(b"\x7fELF")
     executable.chmod(0o755)
-    path_entries = (bin_dir,)
+    path_entries: tuple[Path, ...] = (bin_dir,)
 
     if case in {"symlinked-directory", "directory-alias"}:
         alias_dir = tmp_path / "alias-bin"

@@ -146,6 +146,7 @@ def test_initialization_rejects_workspace_beneath_agent_home_without_reading_leg
     assert {path: path.read_bytes() for path in legacy_files} == legacy_files
 
 
+@windows_only
 def test_initialization_rejects_case_and_junction_aliases_of_agent_home(
     agent_home: Path,
     tmp_path: Path,
@@ -250,6 +251,7 @@ def test_initialization_rejects_non_directory_root(
     assert root.read_text(encoding="utf-8") == "collision"
 
 
+@windows_only
 def test_initialization_rejects_junction_root(
     agent_home: Path,
     workspace: Path,
@@ -268,6 +270,7 @@ def test_initialization_rejects_junction_root(
     assert not (target / "memory").exists()
 
 
+@windows_only
 def test_initialization_rejects_external_memory_directory_alias(
     workspace: Path,
 ) -> None:
@@ -284,6 +287,7 @@ def test_initialization_rejects_external_memory_directory_alias(
     assert not (outside / "memory.md").exists()
 
 
+@windows_only
 def test_initialization_rejects_external_sessions_directory_alias(
     workspace: Path,
 ) -> None:

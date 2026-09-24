@@ -660,7 +660,7 @@ async def test_schedule_uses_context_builder_complete_context_projection(
         "role": "user",
         "content": (
             "## Runtime Context\n\n"
-            f"- Current time: {NOW.isoformat(timespec='milliseconds')}\n"
+            f"- Current time: {NOW.astimezone().isoformat(timespec='milliseconds')}\n"
             f"- Session ID: schedule_{JOB_UUID}\n\n"
             "## User Input\n\n"
             "Run this."
@@ -1037,7 +1037,7 @@ timeout = 120
         first_projection_count = len(builder_projections)
         assert first_projection_count > 1
         first_projection_times = _runtime_current_times(builder_projections)
-        assert set(first_projection_times) == {NOW.isoformat(timespec="milliseconds")}
+        assert set(first_projection_times) == {NOW.astimezone().isoformat(timespec="milliseconds")}
         summary_records = [
             json.loads(line)
             for line in (state.memory_directory / "summary.jsonl")

@@ -1,4 +1,4 @@
-"""Auditable Windows release validation for the multilevel tool permissions work."""
+"""Auditable Windows and POSIX release validation for tool permissions."""
 
 from __future__ import annotations
 
@@ -7,6 +7,7 @@ import asyncio
 import json
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -21,13 +22,14 @@ from typing import Final, Literal, cast
 from myclaw.agent.permission import PermissionSnapshot
 from myclaw.agent.tools.core.exec import ExecTool
 from myclaw.agent.tools.core.exec_host import (
+    BashExecHost,
     PowerShellExecHost,
     ResolvedExecShell,
     resolve_exec_shell,
 )
 from myclaw.agent.tools.core.exec_policy import ExecAssessment
 from myclaw.agent.tools.permission import PermissionContext
-from myclaw.agent.tools.tool_gateway import ModelToolCall, ToolGateway
+from myclaw.agent.tools.tool_gateway import ConfirmationRequest, ModelToolCall, ToolGateway
 
 ROOT: Final[Path] = Path(__file__).resolve().parents[1]
 COMMAND_TIMEOUT_SECONDS: Final[int] = 1_800
@@ -37,6 +39,22 @@ POWERSHELL_FLAGS: Final[tuple[str, ...]] = (
     "-NonInteractive",
 )
 RELEASE_SHELLS: Final[tuple[str, ...]] = ("powershell", "pwsh")
+POSIX_CASES: Final[frozenset[str]] = frozenset(
+    {
+        "read-inside",
+        "read-outside",
+        "write-inside",
+        "write-outside",
+        "full-access-ordinary",
+        "full-access-catastrophic",
+        "identity-duplicate-path",
+        "identity-single-hit",
+    }
+)
+
+
+def _platform() -> Literal["windows", "posix"]:
+    return "windows" if os.name == "nt" else "posix"
 
 COLLECTION_PATHS: Final[tuple[str, ...]] = (
     "tests/tools/core/test_exec_host.py",
@@ -619,10 +637,193 @@ async def _exercise_powershell_host(selector: str) -> dict[str, object]:
         }
 
 
+async def _exercise_bash_host() -> dict[str, object]:
+    bash_path = shutil.which("bash")
+    if bash_path is None:
+        raise RuntimeError("bash executable was not found")
+    with tempfile.TemporaryDirectory(prefix="myclaw-bash-release-") as temporary:
+        root = Path(temporary).resolve()
+        workspace = root / "workspace"
+        workspace.mkdir()
+        bin_dir = root / "bin"
+        bin_dir.mkdir()
+        for name in ("cat", "touch", "rm"):
+            source = shutil.which(name)
+            if source is None:
+                raise RuntimeError(f"{name} native executable was not found")
+            shutil.copy2(Path(source).resolve(strict=True), bin_dir / name)
+
+        environment = dict(os.environ)
+        environment["PATH"] = str(bin_dir)
+        shell = resolve_exec_shell(
+            "auto",
+            platform="posix",
+            which=lambda name: bash_path if name == "bash" else None,
+            environment=environment,
+        )
+        if not shell.available or shell.executable is None or shell.family != "bash":
+            raise RuntimeError("bash did not resolve to an available POSIX host")
+        host = BashExecHost(shell)
+        spec = host.process_spec(workspace)
+        if (
+            spec.executable != shell.executable
+            or spec.flags != shell.flags
+            or spec.cwd != workspace
+            or spec.environment != shell.environment
+        ):
+            raise RuntimeError("bash changed process inputs between resolution and execution")
+
+        inside = workspace / "inside.txt"
+        inside.write_text("inside-release-sentinel\n", encoding="utf-8")
+        outside = root / "outside.txt"
+        outside.write_text("outside-release-sentinel\n", encoding="utf-8")
+        cases: list[dict[str, object]] = []
+
+        async def check_case(
+            name: str,
+            level: Literal["read-only", "workspace-write", "full-access"],
+            command: str,
+            *,
+            expected: Literal["direct", "confirm"],
+            active_host: BashExecHost = host,
+            identity_kind: str = "native",
+            identity_hits: int = 1,
+        ) -> None:
+            assessment = await active_host.inspect(command, workspace)
+            identities = assessment.command_identities
+            if (
+                assessment.uncertain
+                or len(identities) != 1
+                or identities[0].kind != identity_kind
+                or identities[0].resolution_count != identity_hits
+            ):
+                raise RuntimeError(f"bash {name} executable identity did not match expectations")
+            identity = identities[0]
+            if identity_kind == "native" and identity.resolved != str(bin_dir / command.split()[0]):
+                raise RuntimeError(f"bash {name} did not select the controlled native executable")
+            gateway = ToolGateway._for_memory(
+                (ExecTool(workspace=workspace, host=active_host),),
+                permission_context=PermissionContext.from_snapshot(
+                    PermissionSnapshot(level=level, exec_shell=active_host.resolved_shell),
+                    workspace_root=workspace,
+                ),
+            )
+            requests: list[ConfirmationRequest] = []
+
+            async def decline(request: ConfirmationRequest) -> Literal["declined"]:
+                requests.append(request)
+                return "declined"
+
+            result = await gateway.call(
+                ModelToolCall(
+                    id=f"release-bash-{name}",
+                    name="exec",
+                    arguments=json.dumps({"command": command}),
+                ),
+                confirmation=decline,
+            )
+            if expected == "direct":
+                if (
+                    result.status != "success"
+                    or not result.content.startswith("Exit code: 0")
+                    or result.confirmation is not None
+                    or requests
+                ):
+                    raise RuntimeError(f"bash {name} did not execute directly and successfully")
+            elif (
+                result.status != "refused"
+                or len(requests) != 1
+                or result.confirmation is None
+                or result.confirmation.decision != "declined"
+            ):
+                raise RuntimeError(f"bash {name} did not request and decline confirmation")
+            if name in {"read-inside", "full-access-ordinary", "identity-single-hit"}:
+                if "inside-release-sentinel" not in result.content:
+                    raise RuntimeError(f"bash {name} did not return the workspace file")
+            if name in {"read-outside", "write-outside"}:
+                if "outside the Workspace" not in requests[0].reason:
+                    raise RuntimeError(f"bash {name} was not classified as an external path")
+                if "outside-release-sentinel" in result.content:
+                    raise RuntimeError(f"bash {name} exposed the declined outside file")
+            if name == "full-access-catastrophic" and "catastrophic" not in requests[0].reason.lower():
+                raise RuntimeError("bash catastrophic command was not classified as catastrophic")
+            if name == "identity-duplicate-path" and "identity" not in requests[0].reason.lower():
+                raise RuntimeError("bash repeated PATH was not classified as ambiguous identity")
+            cases.append(
+                {
+                    "name": name,
+                    "level": level,
+                    "decision": expected,
+                    "confirmation": "not-requested" if expected == "direct" else "declined",
+                    "confirmation_reason": None if expected == "direct" else requests[0].reason,
+                    "status": result.status,
+                    "exit_code": 0 if expected == "direct" else None,
+                    "identity": {
+                        "kind": identity.kind,
+                        "resolved": identity.resolved,
+                        "resolution_count": identity.resolution_count,
+                    },
+                }
+            )
+
+        await check_case("read-inside", "read-only", "cat ./inside.txt", expected="direct")
+        await check_case("read-outside", "read-only", "cat ../outside.txt", expected="confirm")
+        if outside.read_text(encoding="utf-8") != "outside-release-sentinel\n":
+            raise RuntimeError("declined outside read changed its sentinel")
+        await check_case("write-inside", "workspace-write", "touch ./created.txt", expected="direct")
+        if not (workspace / "created.txt").is_file():
+            raise RuntimeError("direct workspace write did not create its file")
+        await check_case("write-outside", "workspace-write", "rm ../outside.txt", expected="confirm")
+        if outside.read_text(encoding="utf-8") != "outside-release-sentinel\n":
+            raise RuntimeError("declined outside write changed its sentinel")
+        await check_case("full-access-ordinary", "full-access", "cat ./inside.txt", expected="direct")
+        await check_case(
+            "full-access-catastrophic",
+            "full-access",
+            f"rm -rf {shlex.quote(str(workspace))}",
+            expected="confirm",
+        )
+        if not inside.is_file():
+            raise RuntimeError("declined catastrophic command changed the workspace")
+
+        duplicate_environment = dict(shell.env)
+        duplicate_environment["PATH"] = os.pathsep.join((str(bin_dir), str(bin_dir)))
+        duplicate_shell = resolve_exec_shell(
+            "auto",
+            platform="posix",
+            which=lambda name: bash_path if name == "bash" else None,
+            environment=duplicate_environment,
+        )
+        await check_case(
+            "identity-duplicate-path",
+            "read-only",
+            "cat ./inside.txt",
+            expected="confirm",
+            active_host=BashExecHost(duplicate_shell),
+            identity_kind="ambiguous",
+            identity_hits=2,
+        )
+        await check_case("identity-single-hit", "read-only", "cat ./inside.txt", expected="direct")
+        if {case["name"] for case in cases} != POSIX_CASES:
+            raise RuntimeError("bash host evidence did not cover every required case")
+        return {
+            "selector": "auto",
+            "platform": "posix",
+            "family": "bash",
+            "status": "passed",
+            "executable": shell.executable,
+            "flags": list(shell.flags),
+            "cwd": str(workspace),
+            "cases": cases,
+        }
+
+
 def run_host_integration(selectors: Sequence[str]) -> list[dict[str, object]]:
-    """Run real PowerShell inspection and execution for each requested selector."""
-    if os.name != "nt":
-        raise RuntimeError("Windows host integration requires a Windows runner")
+    """Run real inspection and execution on the current release host."""
+    if _platform() == "posix":
+        if tuple(selectors) != ("auto",):
+            raise RuntimeError("POSIX host integration requires the default Bash selector")
+        return [asyncio.run(_exercise_bash_host())]
     return [asyncio.run(_exercise_powershell_host(selector)) for selector in selectors]
 
 
@@ -782,6 +983,7 @@ class SkipRule:
     category: str
     node_patterns: tuple[str, ...]
     message_pattern: str
+    platforms: tuple[str, ...] = ("windows",)
 
 
 SKIP_RULES: Final[tuple[SkipRule, ...]] = (
@@ -792,6 +994,14 @@ SKIP_RULES: Final[tuple[SkipRule, ...]] = (
             "test_real_posix_bash_inspect_policy_execute_smoke",
         ),
         r"^requires a real POSIX production host$",
+    ),
+    SkipRule(
+        "waived-posix-release-host-scope",
+        _node_patterns(
+            "tests/test_release_validation.py",
+            "test_real_posix_release_host_covers_permission_and_identity_cases",
+        ),
+        r"^requires a real POSIX release host$",
     ),
     SkipRule(
         "covered-by-headless-windows-terminal-suite",
@@ -845,6 +1055,118 @@ SKIP_RULES: Final[tuple[SkipRule, ...]] = (
             r"symbolic links are unavailable on this host)(?::.*)?$"
         ),
     ),
+    SkipRule(
+        "waived-windows-junction-scope",
+        _node_patterns(
+            "tests/tools/core/test_directory_tools.py",
+            "test_directory_junction_roots_are_never_traversed",
+        ),
+        r"^Windows junction behavior$",
+        ("posix",),
+    ),
+    SkipRule(
+        "waived-native-windows-path-scope",
+        _node_patterns(
+            "tests/test_atomic_files.py",
+            "test_path_for_io_normalizes_windows_local_and_unc_paths",
+            "test_path_for_io_preserves_existing_windows_extended_path",
+            "test_atomic_create_and_replace_use_windows_extended_paths",
+        )
+        + _node_patterns(
+            "tests/test_host_filesystem.py",
+            "test_windows_host_filesystem_prepares_local_and_unc_io_paths",
+            "test_windows_host_filesystem_accepts_an_owned_directory",
+            "test_windows_host_filesystem_rejects_redirected_or_external_directory",
+            "test_windows_host_filesystem_accepts_an_owned_regular_file",
+            "test_windows_host_filesystem_rejects_an_open_file_with_mismatched_path",
+        )
+        + _node_patterns(
+            "tests/test_session_log.py",
+            "test_session_log_rejects_a_junction_logs_directory_without_stopping_work",
+            "test_session_log_preserves_windows_acl_inheritance",
+        )
+        + _node_patterns(
+            "tests/test_windows_filesystem.py",
+            "test_require_owned_directory_returns_normalized_owned_path",
+            "test_require_owned_directory_rejects_junction_and_external_paths",
+            "test_require_owned_regular_file_returns_normalized_owned_path",
+            "test_require_owned_regular_file_rejects_directories_and_hard_links",
+        )
+        + _node_patterns(
+            "tests/test_workspace_state.py",
+            "test_windows_drive_workspace_path_has_the_accepted_identity",
+            "test_unc_workspace_path_has_the_accepted_identity",
+            "test_windows_workspace_path_is_lexically_normalized",
+            "test_relative_pure_windows_workspace_path_is_rejected",
+            "test_initialization_rejects_case_and_junction_aliases_of_agent_home",
+            "test_initialization_rejects_junction_root",
+            "test_initialization_rejects_external_memory_directory_alias",
+            "test_initialization_rejects_external_sessions_directory_alias",
+        ),
+        r"^requires native Windows paths$",
+        ("posix",),
+    ),
+    SkipRule(
+        "waived-windows-path-case-scope",
+        _node_patterns(
+            "tests/tools/test_permission_file_matrix.py",
+            "test_windows_path_case_uses_host_case_insensitive_containment",
+        ),
+        r"^Windows host path semantics$",
+        ("posix",),
+    ),
+    SkipRule(
+        "waived-windows-drive-scope",
+        _node_patterns(
+            "tests/tools/test_permission_file_matrix.py",
+            "test_windows_different_drive_is_external",
+        ),
+        r"^Windows drive semantics$",
+        ("posix",),
+    ),
+    SkipRule(
+        "waived-windows-unc-scope",
+        _node_patterns(
+            "tests/tools/test_permission_file_matrix.py",
+            "test_windows_reachable_unc_path_is_classified_by_real_host_semantics",
+        ),
+        r"^Windows UNC semantics$",
+        ("posix",),
+    ),
+    SkipRule(
+        "waived-powershell-host-scope",
+        _node_patterns(
+            "tests/tools/core/test_exec_powershell_policy.py",
+            "test_real_powershell_host_inspects_and_executes_canonical_cmdlet",
+        ),
+        r"^(?:powershell|pwsh) is not installed$",
+        ("posix",),
+    ),
+    SkipRule(
+        "waived-pwsh-inspection-scope",
+        _node_patterns(
+            "tests/tools/core/test_exec_powershell_policy.py",
+            "test_real_pwsh_inspection_does_not_autoload_an_untrusted_module",
+        ),
+        r"^pwsh is not installed$",
+        ("posix",),
+    ),
+    SkipRule(
+        "waived-windows-powershell-path-scope",
+        _node_patterns(
+            "tests/tools/core/test_exec_powershell_policy.py",
+            "test_windows_powershell_51_canonical_workspace_read_executes_directly",
+            "test_every_approved_powershell_candidate_has_a_direct_fixture",
+            "test_powershell_path_roles_follow_level_and_canonical_containment",
+            "test_every_cross_host_git_read_form_has_a_direct_powershell_fixture",
+        )
+        + _node_patterns(
+            "tests/tools/test_permission_contract.py",
+            "test_exec_post_grammar_policy_preserves_shell_parity",
+        ),
+        r"^requires native Windows PowerShell paths$",
+        ("posix",),
+    ),
 )
 
 REQUIRED_WINDOWS_ALTERNATIVE_NODES: Final[frozenset[str]] = frozenset(
@@ -862,6 +1184,12 @@ REQUIRED_WINDOWS_ALTERNATIVE_NODES: Final[frozenset[str]] = frozenset(
         "tests/terminal/test_conversation.py::test_coordinator_background_confirmation_uses_stable_modal_projection",
     }
 )
+REQUIRED_POSIX_SMOKE_NODES: Final[frozenset[str]] = frozenset(
+    {
+        "tests/tools/core/test_exec_bash_policy.py::test_real_posix_bash_inspect_policy_execute_smoke",
+        "tests/test_release_validation.py::test_real_posix_release_host_covers_permission_and_identity_cases",
+    }
+)
 
 
 def _classify_skip(skip: Mapping[str, str]) -> str:
@@ -870,7 +1198,8 @@ def _classify_skip(skip: Mapping[str, str]) -> str:
     matches = tuple(
         rule.category
         for rule in SKIP_RULES
-        if any(re.fullmatch(pattern, nodeid) is not None for pattern in rule.node_patterns)
+        if _platform() in rule.platforms
+        and any(re.fullmatch(pattern, nodeid) is not None for pattern in rule.node_patterns)
         and re.fullmatch(rule.message_pattern, message) is not None
     )
     return matches[0] if len(matches) == 1 else "unclassified"
@@ -883,20 +1212,38 @@ def _validate_skips(
     path_evidence: Mapping[str, object],
     passed_nodes: Sequence[str],
 ) -> list[dict[str, str]]:
-    if {result.get("selector") for result in host_results} != set(RELEASE_SHELLS):
-        raise RuntimeError("skip validation requires both PowerShell host integrations")
-    junction = cast(Mapping[str, object], path_evidence["junction"])
-    if junction.get("available") is not True:
-        raise RuntimeError("skip validation requires a working Windows junction capability")
-    hardlink = cast(Mapping[str, object], path_evidence["hardlink"])
-    if hardlink.get("available") is not True:
-        raise RuntimeError("skip validation requires a working Windows hard-link capability")
-    missing_alternatives = sorted(REQUIRED_WINDOWS_ALTERNATIVE_NODES - set(passed_nodes))
-    if missing_alternatives:
-        raise RuntimeError(
-            "required Windows alternative regression nodes did not pass: "
-            + ", ".join(missing_alternatives)
-        )
+    if _platform() == "windows":
+        if {result.get("selector") for result in host_results} != set(RELEASE_SHELLS):
+            raise RuntimeError("skip validation requires both PowerShell host integrations")
+        junction = cast(Mapping[str, object], path_evidence["junction"])
+        if junction.get("available") is not True:
+            raise RuntimeError("skip validation requires a working Windows junction capability")
+        hardlink = cast(Mapping[str, object], path_evidence["hardlink"])
+        if hardlink.get("available") is not True:
+            raise RuntimeError("skip validation requires a working Windows hard-link capability")
+        missing_alternatives = sorted(REQUIRED_WINDOWS_ALTERNATIVE_NODES - set(passed_nodes))
+        if missing_alternatives:
+            raise RuntimeError(
+                "required Windows alternative regression nodes did not pass: "
+                + ", ".join(missing_alternatives)
+            )
+    else:
+        if (
+            len(host_results) != 1
+            or host_results[0].get("selector") != "auto"
+            or host_results[0].get("platform") != "posix"
+            or host_results[0].get("family") != "bash"
+            or host_results[0].get("status") != "passed"
+            or {
+                case.get("name")
+                for case in cast(Sequence[Mapping[str, object]], host_results[0].get("cases", ()))
+            }
+            != POSIX_CASES
+        ):
+            raise RuntimeError("skip validation requires complete real POSIX Bash host evidence")
+        missing_smoke = sorted(REQUIRED_POSIX_SMOKE_NODES - set(passed_nodes))
+        if missing_smoke:
+            raise RuntimeError("required POSIX smoke nodes did not pass: " + ", ".join(missing_smoke))
     classified: list[dict[str, str]] = []
     for skip in skips:
         category = _classify_skip(skip)
@@ -917,12 +1264,10 @@ def _validate_skips(
 
 
 def _run_quality(host_results: Sequence[Mapping[str, object]] | None = None) -> dict[str, object]:
-    if os.name != "nt":
-        raise RuntimeError("Windows quality validation requires a Windows runner")
     actual_hosts = (
-        list(host_results) if host_results is not None else run_host_integration(RELEASE_SHELLS)
+        list(host_results) if host_results is not None else run_host_integration(_selectors("both"))
     )
-    path_evidence = _windows_path_capability_evidence()
+    path_evidence = _windows_path_capability_evidence() if _platform() == "windows" else {}
     with tempfile.TemporaryDirectory(prefix="myclaw-release-quality-") as temporary:
         report_dir = Path(temporary)
         targeted = _run_pytest_with_report(
@@ -966,6 +1311,7 @@ def _run_quality(host_results: Sequence[Mapping[str, object]] | None = None) -> 
             "full": full.to_dict(),
             "validated_skips": skips,
             "required_windows_alternatives": sorted(REQUIRED_WINDOWS_ALTERNATIVE_NODES),
+            "required_posix_smoke": sorted(REQUIRED_POSIX_SMOKE_NODES),
         },
         "static": {"ruff": "passed", "mypy": "passed"},
         "build": {"artifacts": artifacts},
@@ -1063,8 +1409,6 @@ print(
 
 
 def _run_artifact_smoke() -> dict[str, object]:
-    if os.name != "nt":
-        raise RuntimeError("Windows artifact validation requires a Windows runner")
     with tempfile.TemporaryDirectory(prefix="myclaw-release-artifact-") as temporary:
         root = Path(temporary)
         wheel_dir = root / "wheel"
@@ -1085,10 +1429,11 @@ def _run_artifact_smoke() -> dict[str, object]:
             raise RuntimeError(f"expected one wheel, found {len(wheels)}")
         venv_dir = root / "venv"
         _run_command([sys.executable, "-m", "venv", str(venv_dir)])
-        python = venv_dir / "Scripts" / "python.exe"
-        entry_point = venv_dir / "Scripts" / "myclaw.exe"
+        scripts_dir = venv_dir / ("Scripts" if _platform() == "windows" else "bin")
+        python = scripts_dir / ("python.exe" if _platform() == "windows" else "python")
+        entry_point = scripts_dir / ("myclaw.exe" if _platform() == "windows" else "myclaw")
         if not python.is_file():
-            raise RuntimeError("wheel smoke virtual environment has no Windows Python")
+            raise RuntimeError("wheel smoke virtual environment has no Python executable")
         environment = dict(os.environ)
         for inherited in ("PYTHONPATH", "PYTHONHOME", "VIRTUAL_ENV"):
             environment.pop(inherited, None)
@@ -1181,6 +1526,10 @@ def _parser() -> argparse.ArgumentParser:
 
 
 def _selectors(value: str) -> tuple[str, ...]:
+    if _platform() == "posix":
+        if value != "both":
+            raise ValueError("POSIX release validation uses Bash; --shell must remain both")
+        return ("auto",)
     return RELEASE_SHELLS if value == "both" else (value,)
 
 
@@ -1197,7 +1546,7 @@ def _run_phase(phase: ReleasePhase, shell_option: str) -> dict[str, object]:
         return {"phase": phase.value, "artifact_smoke": _run_artifact_smoke()}
 
     nodes = collect_pytest_nodes()
-    hosts = run_host_integration(RELEASE_SHELLS)
+    hosts = run_host_integration(_selectors(shell_option))
     quality = _run_quality(hosts)
     return {
         "phase": ReleasePhase.ALL.value,
@@ -1209,7 +1558,10 @@ def _run_phase(phase: ReleasePhase, shell_option: str) -> dict[str, object]:
 
 
 def main(argv: Sequence[str] | None = None) -> int:
-    arguments = _parser().parse_args(argv)
+    parser = _parser()
+    arguments = parser.parse_args(argv)
+    if _platform() == "posix" and arguments.shell != "both":
+        parser.error("POSIX release validation uses Bash; --shell must remain both")
     try:
         report = _run_phase(ReleasePhase(arguments.phase), arguments.shell)
     except (AssertionError, OSError, RuntimeError, subprocess.SubprocessError) as error:

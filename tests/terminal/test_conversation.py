@@ -1282,8 +1282,13 @@ async def _wait_for_session_picker(
             await pilot.pause()
 
 
-async def _wait_for_confirmation(app: TerminalConversationApp, pilot: Pilot[None]) -> None:
-    async with asyncio.timeout(5):
+async def _wait_for_confirmation(
+    app: TerminalConversationApp,
+    pilot: Pilot[None],
+    *,
+    timeout: float = 5,
+) -> None:
+    async with asyncio.timeout(timeout):
         while (
             app.screen.id is None
             or not app.screen.id.startswith("confirmation-")
@@ -3301,7 +3306,7 @@ async def test_activity_heading_starts_with_accumulated_time_and_freezes_on_succ
         projection = app._active_run_projection
         assert projection is not None
         async with asyncio.timeout(1):
-            while not app.query(".agent-run-activity-heading"):
+            while projection._started_at is None or not app.query(".agent-run-activity-heading"):
                 await pilot.pause()
 
         clock[0] = 5.9
@@ -3439,7 +3444,10 @@ async def test_tool_confirmation_defaults_to_decline_and_shows_effective_operati
         assert str(app.screen.query_one("#confirmation-heading", Static).content) == (
             "Tool Confirmation"
         )
-        assert "Tool: Read File" in visible_text
+        tool_label = app.screen.query_one("#confirmation-tool", Static)
+        assert str(tool_label.content) == "Tool: Read File"
+        assert tool_label.region.height > 0
+        assert 0 <= tool_label.region.y < app.screen.size.height
         assert "Reason: The path resolves outside the current" in visible_text
         assert "Workspace." in visible_text
         assert "Warning: Review the target before allowing access." in visible_text
@@ -4757,7 +4765,7 @@ async def test_direct_terminal_loop_exec_confirmation_preserves_the_exact_long_c
     agent_home: Path,
     workspace: Path,
 ) -> None:
-    command = f'printf "{"x" * 300}" && rm -rf "build output"'
+    command = f'printf "{"x" * 300}" && rm -rf "{workspace.resolve()}"'
     provider = _FixedCatalogProvider(
         (
             _response(
@@ -4776,7 +4784,7 @@ async def test_direct_terminal_loop_exec_confirmation_preserves_the_exact_long_c
 
     async with app.run_test(size=(80, 24)) as pilot:
         submission = asyncio.create_task(pilot.press(*list("run it"), "enter"))
-        await _wait_for_confirmation(app, pilot)
+        await _wait_for_confirmation(app, pilot, timeout=15)
 
         details = [
             str(cast(Static, item).content) for item in app.screen.query(".confirmation-details")
@@ -4808,7 +4816,9 @@ async def test_direct_terminal_loop_close_cancels_the_pending_confirmation_futur
                 tool_call=ModelToolCall(
                     id="call_close",
                     name="exec",
-                    arguments=json.dumps({"command": 'rm -rf "build output"', "cwd": "."}),
+                    arguments=json.dumps(
+                        {"command": f'rm -rf "{workspace.resolve()}"', "cwd": "."}
+                    ),
                 ),
             ),
         )
@@ -4818,7 +4828,7 @@ async def test_direct_terminal_loop_close_cancels_the_pending_confirmation_futur
 
     async with app.run_test(size=(80, 24)) as pilot:
         submission = asyncio.create_task(pilot.press(*list("run it"), "enter"))
-        await _wait_for_confirmation(app, pilot)
+        await _wait_for_confirmation(app, pilot, timeout=15)
 
     await asyncio.gather(submission, return_exceptions=True)
     assert provider.closed

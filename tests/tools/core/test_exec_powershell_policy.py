@@ -251,6 +251,7 @@ async def test_powershell_alias_requires_confirmation_and_never_executes_on_decl
 
 
 @pytest.mark.asyncio
+@pytest.mark.skipif(os.name != "nt", reason="requires native Windows PowerShell paths")
 async def test_windows_powershell_51_canonical_workspace_read_executes_directly(
     tmp_path: Path,
 ) -> None:
@@ -334,6 +335,17 @@ async def test_every_approved_powershell_candidate_has_a_direct_fixture(
     command: str,
     level: str,
 ) -> None:
+    if os.name != "nt" and command in {
+        "Get-Content -LiteralPath .\\inside.txt",
+        "Get-Content -LiteralPath .\\inside.txt -Tail 1",
+        "Get-FileHash -LiteralPath .\\inside.txt",
+        "Select-String -Pattern content -LiteralPath .\\inside.txt",
+        "Test-Path -LiteralPath .\\inside.txt",
+        "Resolve-Path -LiteralPath .\\inside.txt",
+        "Copy-Item -LiteralPath .\\inside.txt -Destination .\\copy.txt",
+        "Move-Item -LiteralPath .\\inside.txt -Destination .\\moved.txt",
+    }:
+        pytest.skip("requires native Windows PowerShell paths")
     inside = tmp_path / "inside.txt"
     inside.write_text("content", encoding="utf-8")
     executable = r"C:\PowerShell\pwsh.exe"
@@ -705,6 +717,13 @@ async def test_powershell_path_roles_follow_level_and_canonical_containment(
     cwd: str,
     expected_confirmation: bool,
 ) -> None:
+    if os.name != "nt" and command_template in {
+        "Get-Content -LiteralPath .\\inside.txt",
+        "Get-Content -LiteralPath {inside_case}",
+        "New-Item -Path {inside} -Name ..\\outside",
+        "Rename-Item -LiteralPath {inside} -NewName ..\\outside.txt",
+    }:
+        pytest.skip("requires native Windows PowerShell paths")
     workspace = tmp_path / "workspace"
     outside = tmp_path / "outside"
     workspace.mkdir()
@@ -873,6 +892,7 @@ async def test_powershell_read_through_workspace_reparse_point_confirms(
 
 
 @pytest.mark.asyncio
+@pytest.mark.skipif(os.name != "nt", reason="requires native Windows PowerShell paths")
 @pytest.mark.parametrize(
     "command",
     (

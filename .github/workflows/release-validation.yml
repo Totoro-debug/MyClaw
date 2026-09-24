@@ -1,4 +1,4 @@
-name: Windows release validation
+name: Release validation
 
 on:
   push:
@@ -12,7 +12,7 @@ permissions:
 
 jobs:
   windows-release:
-    name: Windows release gate
+    name: Windows release validation
     runs-on: windows-latest
     steps:
       - name: Check out source
@@ -22,9 +22,78 @@ jobs:
         with:
           python-version: "3.12"
       - name: Install test dependencies
-        run: python -m pip install -e ".[dev]"
+        run: python -m pip install -e ".[dev]" "setuptools>=77"
+      - name: Warm Windows PowerShell 5.1
+        shell: pwsh
+        run: |
+          $native = "$env:WINDIR\System32\WindowsPowerShell\v1.0\powershell.exe"
+          & $native -NoLogo -NoProfile -NonInteractive -Command '$PSVersionTable.PSVersion.ToString()'
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Warm Windows PowerShell host resolution
+        shell: pwsh
+        run: |
+          @'
+          import os
+          import time
+          from pathlib import Path
+          from myclaw.agent.tools.core.exec_host import _minimal_environment, _probe_powershell_version
+
+          executable = str(Path(os.environ["WINDIR"]) / "System32" / "WindowsPowerShell" / "v1.0" / "powershell.exe")
+          environment = _minimal_environment(os.environ, platform="windows")
+          for attempt in range(3):
+              start = time.perf_counter()
+              version = _probe_powershell_version(executable, environment)
+              print(f"attempt={attempt + 1} version={version!r} elapsed={time.perf_counter() - start:.3f}s", flush=True)
+              if version is not None and version[:2] == (5, 1):
+                  break
+          else:
+              raise SystemExit("Windows PowerShell 5.1 version probe did not succeed")
+          '@ | python -
       - name: Run the Windows release gate
         run: >-
           python scripts/release_validation.py
           --phase all
           --report "$env:RUNNER_TEMP\windows-release.json"
+      - name: Upload Windows report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-release-report
+          path: ${{ runner.temp }}/windows-release.json
+          if-no-files-found: warn
+
+  posix-release:
+    name: POSIX release validation
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install test dependencies
+        run: python -m pip install -e ".[dev]" "setuptools>=77"
+      - name: Run the POSIX release gate
+        run: >-
+          python scripts/release_validation.py
+          --phase all
+          --report "$RUNNER_TEMP/posix-release.json"
+      - name: Upload POSIX report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: posix-release-report
+          path: ${{ runner.temp }}/posix-release.json
+          if-no-files-found: warn
+
+  release-gate:
+    needs: [windows-release, posix-release]
+    if: always()
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Require both release validations
+        shell: bash
+        run: |
+          test '${{ needs.windows-release.result }}' = success
+          test '${{ needs.posix-release.result }}' = success
