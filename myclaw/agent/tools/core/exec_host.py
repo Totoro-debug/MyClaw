@@ -35,6 +35,7 @@ from myclaw.agent.tools.core.exec_policy import (
     powershell_git_audit_targets,
 )
 from myclaw.utils.async_tasks import await_task_preserving_cancellation
+from myclaw.utils.host_filesystem import host_path_is_within
 
 EXEC_CAPABILITY_ERROR: Final = "Exec capability is unavailable because the selected shell is missing."
 _PROCESS_REAP_TIMEOUT: Final[float] = 5.0
@@ -364,15 +365,6 @@ def _is_lexically_within(path: Path, root: Path) -> bool:
         absolute = os.path.abspath(path)
         return os.path.commonpath(
             (os.path.normcase(absolute), os.path.normcase(str(root)))
-        ) == os.path.normcase(str(root))
-    except ValueError:
-        return False
-
-
-def _is_host_path_within(path: Path, root: Path) -> bool:
-    try:
-        return os.path.commonpath(
-            (os.path.normcase(str(path)), os.path.normcase(str(root)))
         ) == os.path.normcase(str(root))
     except ValueError:
         return False
@@ -754,13 +746,13 @@ class BashExecHost(_BaseExecHost):
                 if _is_lexically_within(executable, root):
                     return assessment
                 canonical_executable = executable.resolve(strict=False)
-                if _is_host_path_within(canonical_executable, root):
+                if host_path_is_within(canonical_executable, root):
                     return assessment
                 candidate = Path(target)
                 if not _is_lexically_within(candidate, root):
                     return assessment
                 canonical_target = candidate.resolve(strict=True)
-                if not canonical_target.is_dir() or not _is_host_path_within(
+                if not canonical_target.is_dir() or not host_path_is_within(
                     canonical_target,
                     root,
                 ):
@@ -1066,13 +1058,13 @@ class PowerShellExecHost(_BaseExecHost):
                 if _is_lexically_within(executable, root):
                     return assessment
                 canonical_executable = executable.resolve(strict=False)
-                if _is_host_path_within(canonical_executable, root):
+                if host_path_is_within(canonical_executable, root):
                     return assessment
                 candidate = Path(target)
                 if not _is_lexically_within(candidate, root):
                     return assessment
                 canonical_target = candidate.resolve(strict=True)
-                if not canonical_target.is_dir() or not _is_host_path_within(
+                if not canonical_target.is_dir() or not host_path_is_within(
                     canonical_target,
                     root,
                 ):
@@ -1448,7 +1440,7 @@ def _bash_executable_candidates(
 def _bash_executable_kind(resolved: str, *, cwd: Path) -> ExecIdentityKind:
     path = Path(resolved)
     try:
-        if _is_host_path_within(path, cwd.resolve(strict=True)):
+        if host_path_is_within(path, cwd.resolve(strict=True)):
             return "workspace"
     except (OSError, RuntimeError, ValueError):
         return "unknown"

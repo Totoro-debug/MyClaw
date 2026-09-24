@@ -28,6 +28,7 @@ from myclaw.agent.tools.core.exec_policy import (
     classify_bash_command,
     classify_powershell_command,
 )
+from myclaw.utils.host_filesystem import host_path_is_within
 
 type PermissionDecision = Literal["direct", "confirm"]
 type ToolRunOrigin = Literal["foreground", "schedule", "memory"]
@@ -757,10 +758,10 @@ def _bash_deletes_workspace_root(
             )
         except (OSError, RuntimeError, ValueError):
             continue
-        if _is_host_path_within(
+        if host_path_is_within(
             access.path,
             access.workspace_root,
-        ) and _is_host_path_within(access.workspace_root, access.path):
+        ) and host_path_is_within(access.workspace_root, access.path):
             return True
     return False
 
@@ -778,7 +779,7 @@ def _is_workspace_bash_identity(identity: object, workspace_root: Path) -> bool:
         root = workspace_root.resolve(strict=True)
     except (OSError, RuntimeError, ValueError):
         return True
-    return _is_host_path_within(canonical, root)
+    return host_path_is_within(canonical, root)
 
 
 def _is_workspace_git_identity(identity: object, workspace_root: Path) -> bool:
@@ -790,7 +791,7 @@ def _is_workspace_git_identity(identity: object, workspace_root: Path) -> bool:
         root = workspace_root.resolve(strict=True)
     except (OSError, RuntimeError, ValueError):
         return True
-    return _is_host_path_within(canonical, root)
+    return host_path_is_within(canonical, root)
 
 
 def _classify_exec_paths(
@@ -815,7 +816,7 @@ def _classify_exec_paths(
         )
     except (OSError, RuntimeError, ValueError):
         return "confirm", "Exec working directory could not be classified."
-    if not _is_host_path_within(canonical_cwd.path, canonical_cwd.workspace_root):
+    if not host_path_is_within(canonical_cwd.path, canonical_cwd.workspace_root):
         return "confirm", "The Exec working directory is outside the Workspace."
     for access in accesses:
         candidate = Path(access.path)
@@ -832,7 +833,7 @@ def _classify_exec_paths(
             )
         except (OSError, RuntimeError, ValueError):
             return "confirm", "Exec path could not be classified and requires confirmation."
-        if not _is_host_path_within(canonical.path, canonical.workspace_root):
+        if not host_path_is_within(canonical.path, canonical.workspace_root):
             return (
                 "confirm",
                 "The requested path resolves outside the Workspace and requires confirmation.",
@@ -846,7 +847,7 @@ def _classify_file_accesses(
 ) -> tuple[PermissionDecision, str | None]:
     level = context.level
     has_external = any(
-        not _is_host_path_within(access.path, access.workspace_root)
+        not host_path_is_within(access.path, access.workspace_root)
         and not _is_schedule_allowed_file_access(access, context)
         for access in accesses
     )
@@ -873,16 +874,7 @@ def _is_schedule_allowed_file_access(
 ) -> bool:
     if context.origin != "schedule" or context.snapshot is not None:
         return False
-    return any(_is_host_path_within(access.path, root) for root in access.allowed_roots)
-
-
-def _is_host_path_within(path: Path, root: Path) -> bool:
-    try:
-        return os.path.commonpath(
-            (os.path.normcase(str(path)), os.path.normcase(str(root)))
-        ) == os.path.normcase(str(root))
-    except ValueError:
-        return False
+    return any(host_path_is_within(access.path, root) for root in access.allowed_roots)
 
 
 __all__ = [

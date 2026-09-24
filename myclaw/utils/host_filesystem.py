@@ -39,6 +39,15 @@ _POSIX_UNSUPPORTED_SYNC_ERRNOS: Final = frozenset(
 _LOCK_RETRY_INTERVAL_SECONDS: Final = 0.01
 
 
+def host_path_is_within(path: Path, root: Path) -> bool:
+    try:
+        return os.path.commonpath(
+            (os.path.normcase(str(path)), os.path.normcase(str(root)))
+        ) == os.path.normcase(str(root))
+    except ValueError:
+        return False
+
+
 class UnsafeFilesystemPath(PermissionError):
     """An existing filesystem object violates owned-path safety rules."""
 

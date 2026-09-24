@@ -14,6 +14,7 @@ from myclaw.utils.host_filesystem import (
     POSIX_HOST_FILESYSTEM,
     WINDOWS_HOST_FILESYSTEM,
     PosixFilesystemAdapter,
+    host_path_is_within,
 )
 
 windows_only = pytest.mark.skipif(os.name != "nt", reason="requires native Windows paths")
@@ -37,6 +38,25 @@ else:
 
 def _lock_process_command(lock_path: Path, timeout: float) -> list[str]:
     return [sys.executable, "-c", _LOCK_PROCESS_SCRIPT, str(lock_path), str(timeout)]
+
+
+def test_host_path_is_within_accepts_child_and_rejects_sibling_prefix(tmp_path: Path) -> None:
+    root = tmp_path / "workspace"
+
+    assert host_path_is_within(root / "child", root)
+    assert not host_path_is_within(tmp_path / "workspace-copy" / "child", root)
+
+
+@windows_only
+def test_host_path_is_within_uses_host_case_rules(tmp_path: Path) -> None:
+    root = tmp_path / "workspace"
+
+    assert host_path_is_within(Path(str(root).swapcase()) / "child", root)
+
+
+@windows_only
+def test_host_path_is_within_rejects_incompatible_drives() -> None:
+    assert not host_path_is_within(Path("C:/workspace/child"), Path("D:/workspace"))
 
 
 @windows_only
