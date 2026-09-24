@@ -4,14 +4,13 @@ import asyncio
 import json
 from collections.abc import AsyncIterator
 from pathlib import Path
-from typing import ClassVar, cast
+from typing import cast
 
 import pytest
 
 from myclaw.agent.tools.core.web_fetch import (
     HTTPClientBoundary,
     HTTPResponseBoundary,
-    JinaReaderBoundary,
     WebFetchTool,
 )
 from myclaw.agent.tools.network_safety import DNSResolver
@@ -46,18 +45,6 @@ class FakeResolver:
         if isinstance(self._answers, dict):
             return self._answers[hostname]
         return self._answers
-
-
-class FakeJina:
-    outcomes: ClassVar[list[str | BaseException]] = []
-    calls: ClassVar[list[tuple[str, str]]] = []
-
-    async def fetch(self, url: str, *, output_format: str) -> str:
-        self.calls.append((url, output_format))
-        outcome = self.outcomes.pop(0)
-        if isinstance(outcome, BaseException):
-            raise outcome
-        return outcome
 
 
 class FakeResponse:
@@ -105,11 +92,10 @@ class FakeHTTPClient:
 def _gateway(
     *,
     resolver: DNSResolver,
-    jina: JinaReaderBoundary | None = None,
     http: HTTPClientBoundary | None = None,
     confirmation: ConfirmationRequester | None = None,
 ) -> SingleToolGateway:
-    tool = WebFetchTool(resolver=resolver, jina_reader=jina, http_client=http)
+    tool = WebFetchTool(resolver=resolver, http_client=http)
     return SingleToolGateway(
         (tool,),
         confirmation=confirmation,
@@ -118,12 +104,6 @@ def _gateway(
             workspace_root=Path.cwd(),
         ),
     )
-
-
-@pytest.fixture(autouse=True)
-def reset_jina() -> None:
-    FakeJina.outcomes = []
-    FakeJina.calls = []
 
 
 def test_web_fetch_schema_declares_format_and_max_chars() -> None:
@@ -165,22 +145,19 @@ def test_web_fetch_schema_declares_format_and_max_chars() -> None:
 @pytest.mark.asyncio
 async def test_web_fetch_uses_the_audited_direct_client_for_public_targets() -> None:
     resolver = FakeResolver(("93.184.216.34",))
-    jina = FakeJina()
-    FakeJina.outcomes = [RuntimeError("must not run")]
     response = FakeResponse(
         headers={"content-type": "text/plain"},
         chunks=(b"Public page",),
     )
     http = FakeHTTPClient((cast(HTTPResponseBoundary, response),))
 
-    result = await _gateway(resolver=resolver, jina=jina, http=http).call(
+    result = await _gateway(resolver=resolver, http=http).call(
         _call({"url": "  https://public.example/page  "})
     )
 
     assert result.status == "success"
     assert result.content == "Public page"
     assert resolver.calls == [("public.example", 443)]
-    assert jina.calls == []
     assert http.calls == [("https://public.example/page", 10.0, 30.0)]
     assert response.closed
 
@@ -188,21 +165,18 @@ async def test_web_fetch_uses_the_audited_direct_client_for_public_targets() -> 
 @pytest.mark.asyncio
 async def test_web_fetch_direct_text_preserves_declared_charset() -> None:
     resolver = FakeResolver(("93.184.216.34",))
-    jina = FakeJina()
-    FakeJina.outcomes = [RuntimeError("must not run")]
     response = FakeResponse(
         headers={"Content-Type": "text/plain; charset=utf-8"},
         chunks=(b"Direct ", b"content"),
     )
     http = FakeHTTPClient((cast(HTTPResponseBoundary, response),))
 
-    result = await _gateway(resolver=resolver, jina=jina, http=http).call(
+    result = await _gateway(resolver=resolver, http=http).call(
         _call({"url": "https://public.example/page", "format": "text"})
     )
 
     assert result.status == "success"
     assert result.content == "Direct content"
-    assert jina.calls == []
     assert http.calls == [("https://public.example/page", 10.0, 30.0)]
     assert response.closed
 
@@ -258,44 +232,37 @@ async def test_web_fetch_rejects_invalid_parameters_before_dns(
     arguments: dict[str, object],
 ) -> None:
     resolver = FakeResolver(("93.184.216.34",))
-    jina = FakeJina()
-    FakeJina.outcomes = ["must not run"]
     http = FakeHTTPClient(())
 
-    result = await _gateway(resolver=resolver, jina=jina, http=http).call(_call(arguments))
+    result = await _gateway(resolver=resolver, http=http).call(_call(arguments))
 
     assert result.status == "error"
     assert resolver.calls == []
-    assert jina.calls == []
     assert http.calls == []
 
 
 @pytest.mark.asyncio
-async def test_web_fetch_does_not_delegate_target_fetching_to_the_remote_reader() -> None:
+async def test_web_fetch_uses_direct_http_response_content() -> None:
     resolver = FakeResolver(("93.184.216.34",))
-    jina = FakeJina()
-    FakeJina.outcomes = ["remote content must not win"]
     response = FakeResponse(
         headers={"content-type": "text/plain"},
         chunks=(b"direct",),
     )
     http = FakeHTTPClient((cast(HTTPResponseBoundary, response),))
 
-    result = await _gateway(resolver=resolver, jina=jina, http=http).call(
+    result = await _gateway(resolver=resolver, http=http).call(
         _call({"url": "https://public.example/page"})
     )
 
     assert result.status == "success"
     assert result.content == "direct"
-    assert jina.calls == []
+    assert http.calls == [("https://public.example/page", 10.0, 30.0)]
     assert response.closed
 
 
 @pytest.mark.asyncio
-async def test_web_fetch_approved_private_target_skips_jina() -> None:
+async def test_web_fetch_approved_private_target_uses_direct_http() -> None:
     resolver = FakeResolver(("127.0.0.1",))
-    jina = FakeJina()
-    FakeJina.outcomes = [RuntimeError("must not run")]
     response = FakeResponse(
         headers={"content-type": "text/plain"},
         chunks=(b"private",),
@@ -309,14 +276,13 @@ async def test_web_fetch_approved_private_target_skips_jina() -> None:
 
     result = await _gateway(
         resolver=resolver,
-        jina=jina,
         http=http,
         confirmation=approve,
     ).call(_call({"url": "http://private.example/status"}))
 
     assert result.status == "success"
     assert result.content == "private"
-    assert jina.calls == []
+    assert http.calls == [("http://private.example/status", 10.0, 30.0)]
     assert len(requests) == 1
     assert "private" in requests[0].reason
 
@@ -336,8 +302,6 @@ async def test_concurrent_web_fetch_calls_keep_target_evaluations_isolated() -> 
             del hostname, port
             return next(self._answers)
 
-    jina = FakeJina()
-    FakeJina.outcomes = ["must not run"]
     public_response = FakeResponse(
         headers={"content-type": "text/plain"},
         chunks=(b"public-direct",),
@@ -364,7 +328,6 @@ async def test_concurrent_web_fetch_calls_keep_target_evaluations_isolated() -> 
 
     gateway = _gateway(
         resolver=SequencedResolver(),
-        jina=jina,
         http=http,
         confirmation=approve,
     )
@@ -400,8 +363,6 @@ async def test_concurrent_web_fetch_calls_keep_target_evaluations_isolated() -> 
 async def test_web_fetch_dns_failure_requests_confirmation_then_returns_tool_error() -> None:
     resolver = FakeResolver(())
     resolver.failure = OSError("DNS unavailable")
-    jina = FakeJina()
-    FakeJina.outcomes = [RuntimeError("must not run")]
     response = FakeResponse(headers={"content-type": "text/plain"}, chunks=(b"approved",))
     http = FakeHTTPClient((cast(HTTPResponseBoundary, response),))
     requests: list[ConfirmationRequest] = []
@@ -412,14 +373,12 @@ async def test_web_fetch_dns_failure_requests_confirmation_then_returns_tool_err
 
     result = await _gateway(
         resolver=resolver,
-        jina=jina,
         http=http,
         confirmation=approve,
     ).call(_call({"url": "https://missing.example/page"}))
 
     assert result.status == "error"
     assert "DNS" in result.content
-    assert jina.calls == []
     assert len(requests) == 1
     assert http.calls == []
 
@@ -427,8 +386,6 @@ async def test_web_fetch_dns_failure_requests_confirmation_then_returns_tool_err
 @pytest.mark.asyncio
 async def test_web_fetch_maps_ipv4_mapped_ipv6_before_requesting_confirmation() -> None:
     resolver = FakeResolver(("::ffff:10.0.0.7",))
-    jina = FakeJina()
-    FakeJina.outcomes = [RuntimeError("must not run")]
     response = FakeResponse(headers={"content-type": "text/plain"}, chunks=(b"approved",))
     http = FakeHTTPClient((cast(HTTPResponseBoundary, response),))
     requests: list[ConfirmationRequest] = []
@@ -439,7 +396,6 @@ async def test_web_fetch_maps_ipv4_mapped_ipv6_before_requesting_confirmation() 
 
     result = await _gateway(
         resolver=resolver,
-        jina=jina,
         http=http,
         confirmation=approve,
     ).call(_call({"url": "https://mapped.example/page"}))
@@ -453,16 +409,13 @@ async def test_web_fetch_maps_ipv4_mapped_ipv6_before_requesting_confirmation() 
 @pytest.mark.asyncio
 async def test_web_fetch_refuses_private_target_without_confirmation_channel() -> None:
     resolver = FakeResolver(("192.168.1.7",))
-    jina = FakeJina()
-    FakeJina.outcomes = [RuntimeError("must not run")]
     http = FakeHTTPClient(())
 
-    result = await _gateway(resolver=resolver, jina=jina, http=http).call(
+    result = await _gateway(resolver=resolver, http=http).call(
         _call({"url": "https://private.example/page"})
     )
 
     assert result.status == "refused"
-    assert jina.calls == []
     assert http.calls == []
 
 
@@ -474,8 +427,6 @@ async def test_web_fetch_follows_public_redirects_and_rechecks_each_target() -> 
             "next.example": ("8.8.8.8",),
         }
     )
-    jina = FakeJina()
-    FakeJina.outcomes = [RuntimeError("Jina unavailable")]
     redirect = FakeResponse(
         status_code=302,
         headers={"location": "https://next.example/final"},
@@ -491,7 +442,7 @@ async def test_web_fetch_follows_public_redirects_and_rechecks_each_target() -> 
         )
     )
 
-    result = await _gateway(resolver=resolver, jina=jina, http=http).call(
+    result = await _gateway(resolver=resolver, http=http).call(
         _call({"url": "https://public.example/start"})
     )
 
@@ -517,8 +468,6 @@ async def test_web_fetch_authorizes_a_newly_unsafe_redirect_in_the_same_call() -
             "internal.example": ("10.0.0.7",),
         }
     )
-    jina = FakeJina()
-    FakeJina.outcomes = [RuntimeError("Jina unavailable")]
     redirect = FakeResponse(
         status_code=302,
         headers={"location": "http://internal.example/admin"},
@@ -536,7 +485,6 @@ async def test_web_fetch_authorizes_a_newly_unsafe_redirect_in_the_same_call() -
 
     result = await _gateway(
         resolver=resolver,
-        jina=jina,
         http=http,
         confirmation=approve,
     ).call(
@@ -558,8 +506,6 @@ async def test_web_fetch_authorizes_a_newly_unsafe_redirect_in_the_same_call() -
 @pytest.mark.asyncio
 async def test_web_fetch_follows_at_most_five_redirects() -> None:
     resolver = FakeResolver(("93.184.216.34",))
-    jina = FakeJina()
-    FakeJina.outcomes = [RuntimeError("Jina unavailable")]
     redirects = tuple(
         FakeResponse(
             status_code=302,
@@ -569,7 +515,7 @@ async def test_web_fetch_follows_at_most_five_redirects() -> None:
     )
     http = FakeHTTPClient(tuple(cast(HTTPResponseBoundary, response) for response in redirects))
 
-    result = await _gateway(resolver=resolver, jina=jina, http=http).call(
+    result = await _gateway(resolver=resolver, http=http).call(
         _call({"url": "https://public.example/hop-0"})
     )
 
@@ -590,12 +536,10 @@ async def test_web_fetch_accepts_textual_media_and_declared_charset() -> None:
     )
     for content_type, body, expected in cases:
         resolver = FakeResolver(("93.184.216.34",))
-        jina = FakeJina()
-        FakeJina.outcomes = [RuntimeError("Jina unavailable")]
         response = FakeResponse(headers={"content-type": content_type}, chunks=(body,))
         http = FakeHTTPClient((cast(HTTPResponseBoundary, response),))
 
-        result = await _gateway(resolver=resolver, jina=jina, http=http).call(
+        result = await _gateway(resolver=resolver, http=http).call(
             _call({"url": "https://public.example/data"})
         )
 
@@ -607,12 +551,10 @@ async def test_web_fetch_accepts_textual_media_and_declared_charset() -> None:
 @pytest.mark.asyncio
 async def test_web_fetch_decodes_missing_content_type_with_utf8_replacement() -> None:
     resolver = FakeResolver(("93.184.216.34",))
-    jina = FakeJina()
-    FakeJina.outcomes = [RuntimeError("Jina unavailable")]
     response = FakeResponse(chunks=(b"valid\xff",))
     http = FakeHTTPClient((cast(HTTPResponseBoundary, response),))
 
-    result = await _gateway(resolver=resolver, jina=jina, http=http).call(
+    result = await _gateway(resolver=resolver, http=http).call(
         _call({"url": "https://public.example/data"})
     )
 
@@ -623,15 +565,13 @@ async def test_web_fetch_decodes_missing_content_type_with_utf8_replacement() ->
 @pytest.mark.asyncio
 async def test_web_fetch_rejects_explicit_binary_media() -> None:
     resolver = FakeResolver(("93.184.216.34",))
-    jina = FakeJina()
-    FakeJina.outcomes = [RuntimeError("Jina unavailable")]
     response = FakeResponse(
         headers={"content-type": "application/octet-stream"},
         chunks=(b"binary",),
     )
     http = FakeHTTPClient((cast(HTTPResponseBoundary, response),))
 
-    result = await _gateway(resolver=resolver, jina=jina, http=http).call(
+    result = await _gateway(resolver=resolver, http=http).call(
         _call({"url": "https://public.example/download"})
     )
 
@@ -644,8 +584,6 @@ async def test_web_fetch_rejects_explicit_binary_media() -> None:
 @pytest.mark.asyncio
 async def test_web_fetch_extracts_readable_html_without_ignored_elements() -> None:
     resolver = FakeResolver(("93.184.216.34",))
-    jina = FakeJina()
-    FakeJina.outcomes = [RuntimeError("Jina unavailable")]
     response = FakeResponse(
         headers={"content-type": "text/html; charset=utf-8"},
         chunks=(
@@ -657,7 +595,7 @@ async def test_web_fetch_extracts_readable_html_without_ignored_elements() -> No
     )
     http = FakeHTTPClient((cast(HTTPResponseBoundary, response),))
 
-    result = await _gateway(resolver=resolver, jina=jina, http=http).call(
+    result = await _gateway(resolver=resolver, http=http).call(
         _call({"url": "https://public.example/page", "format": "text"})
     )
 
@@ -670,15 +608,13 @@ async def test_web_fetch_extracts_readable_html_without_ignored_elements() -> No
 @pytest.mark.asyncio
 async def test_web_fetch_applies_final_shared_prefix_truncation_to_direct_output() -> None:
     resolver = FakeResolver(("93.184.216.34",))
-    jina = FakeJina()
-    FakeJina.outcomes = ["must not run"]
     response = FakeResponse(
         headers={"content-type": "text/plain"},
         chunks=(b"abcdefghijklmnopqrstuvwxyz",),
     )
     http = FakeHTTPClient((cast(HTTPResponseBoundary, response),))
 
-    result = await _gateway(resolver=resolver, jina=jina, http=http).call(
+    result = await _gateway(resolver=resolver, http=http).call(
         _call({"url": "https://public.example/page", "maxChars": 20})
     )
 
@@ -739,10 +675,8 @@ async def test_web_fetch_cancellation_propagates_from_direct_client() -> None:
             raise AssertionError("unreachable")
 
     resolver = FakeResolver(("93.184.216.34",))
-    jina = FakeJina()
-    FakeJina.outcomes = [RuntimeError("Jina unavailable")]
     task = asyncio.create_task(
-        _gateway(resolver=resolver, jina=jina, http=HangingHTTP()).call(
+        _gateway(resolver=resolver, http=HangingHTTP()).call(
             _call({"url": "https://public.example/slow"})
         )
     )

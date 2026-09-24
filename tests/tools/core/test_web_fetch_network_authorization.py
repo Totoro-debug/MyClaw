@@ -102,12 +102,6 @@ class FakeResolver:
         return self.answers[hostname]
 
 
-class FailingJina:
-    async def fetch(self, url: str, *, output_format: str) -> str:
-        del url, output_format
-        raise RuntimeError("Jina unavailable")
-
-
 class FakeResponse:
     def __init__(
         self,
@@ -168,7 +162,7 @@ def _gateway(
     tool: WebFetchTool | None = None,
 ) -> ToolGateway:
     fetch = (
-        WebFetchTool(resolver=resolver, jina_reader=FailingJina(), http_client=http)
+        WebFetchTool(resolver=resolver, http_client=http)
         if tool is None
         else tool
     )
@@ -687,7 +681,7 @@ async def test_schedule_keeps_legacy_fail_closed_behavior_for_unsafe_web_fetch()
     resolver = FakeResolver({"private.example": ("10.0.0.7",)})
     http = AuditedHTTPClient(())
     gateway = ToolGateway._for_memory(
-        (WebFetchTool(resolver=resolver, jina_reader=FailingJina(), http_client=http),),
+        (WebFetchTool(resolver=resolver, http_client=http),),
         permission_context=PermissionContext(
             origin="schedule",
             workspace_root=Path.cwd(),

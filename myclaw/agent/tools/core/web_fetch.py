@@ -44,7 +44,6 @@ TOTAL_TIMEOUT_SECONDS = 30.0
 MAX_REDIRECTS = 5
 DEFAULT_MAX_CHARS = 50000
 
-_JINA_READER_URL = "https://r.jina.ai/"
 _TEXTUAL_APPLICATION_MEDIA_TYPES = frozenset(
     {
         "application/ecmascript",
@@ -65,10 +64,6 @@ _HTML_BLOCK_TAG_PATTERN = re.compile(
     re.IGNORECASE,
 )
 _HTML_TAG_PATTERN = re.compile(r"<[^>]*>")
-
-
-class JinaReaderBoundary(Protocol):
-    async def fetch(self, url: str, *, output_format: str) -> str: ...
 
 
 class HTTPResponseBoundary(Protocol):
@@ -193,34 +188,6 @@ class AioHttpWebFetchClient:
         return _AioHttpResponse(session=session, response=response)
 
 
-class JinaReaderClient:
-    """Fetch one public target through anonymous Jina Reader."""
-
-    async def fetch(self, url: str, *, output_format: str) -> str:
-        timeout = ClientTimeout(
-            total=None,
-            connect=CONNECT_TIMEOUT_SECONDS,
-            sock_connect=CONNECT_TIMEOUT_SECONDS,
-        )
-        async with ClientSession(
-            timeout=timeout,
-            auto_decompress=True,
-            trust_env=False,
-        ) as session:
-            async with session.get(
-                f"{_JINA_READER_URL}{url}",
-                headers={
-                    "Accept": "text/plain",
-                    "X-Respond-With": output_format,
-                },
-                allow_redirects=False,
-            ) as response:
-                if not 200 <= response.status < 300:
-                    return ""
-                content = await response.text(encoding="utf-8", errors="replace")
-                return content if content.strip() else ""
-
-
 @dataclass(frozen=True, slots=True)
 class _TargetEvaluation:
     target: NormalizedNetworkTarget
@@ -251,13 +218,9 @@ class WebFetchTool(BaseTool):
         self,
         *,
         resolver: DNSResolver | None = None,
-        jina_reader: JinaReaderBoundary | None = None,
         http_client: HTTPClientBoundary | None = None,
     ) -> None:
         self._resolver = SocketDNSResolver() if resolver is None else resolver
-        # Preserve construction compatibility without delegating target fetches
-        # to a remote service that cannot expose redirect hops for authorization.
-        del jina_reader
         self._http_client = AioHttpWebFetchClient() if http_client is None else http_client
 
     async def prepare_arguments(self, arguments: dict[str, Any]) -> dict[str, Any]:
@@ -687,7 +650,5 @@ __all__ = [
     "AioHttpWebFetchClient",
     "HTTPClientBoundary",
     "HTTPResponseBoundary",
-    "JinaReaderBoundary",
-    "JinaReaderClient",
     "WebFetchTool",
 ]
