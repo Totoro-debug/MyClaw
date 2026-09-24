@@ -148,7 +148,7 @@ class ScheduleService:
         self._timezone_name = timezone_name
         self._loop_task: asyncio.Task[None] | None = None
         self._run_tasks: set[asyncio.Task[None]] = set()
-        self._terminal_commit_tasks: set[asyncio.Task[ScheduleJob | None]] = set()
+        self._terminal_commit_tasks: set[asyncio.Task[bool | ScheduleJob | None]] = set()
         self._reservation_gate = asyncio.Lock()
         self._active_job_ids: set[str] = set()
         self._active_runs: dict[str, _ActiveScheduleRun] = {}
@@ -937,7 +937,7 @@ class ScheduleService:
                 every_seconds=every_seconds,
             )
         operation = asyncio.create_task(
-            self._remove_at_job(job)
+            self._store._remove_terminal_job(job.job_id, expected=job)
             if job.schedule.kind == "at"
             else (
                 self._store._commit_system_terminal
@@ -1003,9 +1003,6 @@ class ScheduleService:
                 ) from failure
         if cancellation is not None:
             raise cancellation
-
-    async def _remove_at_job(self, job: ScheduleJob) -> None:
-        await self._store._remove_terminal_job(job.job_id, expected=job)
 
     def _run_finished(self, task: asyncio.Task[None]) -> None:
         self._run_tasks.discard(task)
