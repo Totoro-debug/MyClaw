@@ -71,14 +71,6 @@ def resolve_tool_path(workspace: Path, requested: str | Path) -> Path:
     return resolved
 
 
-def is_workspace_path(workspace: Path, resolved: Path) -> bool:
-    """Return whether a previously resolved path remains inside the Workspace."""
-    if not isinstance(workspace, Path):
-        raise TypeError("Tool workspace must be a Path")
-    root = workspace.resolve(strict=True)
-    return resolved.is_relative_to(root)
-
-
 def normalize_public_ip(value: str) -> str:
     """Normalize one globally routable IPv4/IPv6 address or reject it."""
     if not isinstance(value, str) or "%" in value:
@@ -640,7 +632,6 @@ __all__ = [
     "ToolParam",
     "ToolResultContent",
     "is_public_ip",
-    "is_workspace_path",
     "normalize_public_ip",
     "resolve_tool_path",
     "truncate_text",
