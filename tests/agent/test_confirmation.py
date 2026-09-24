@@ -147,6 +147,12 @@ def _owners() -> tuple[ForegroundConfirmationOwner, BackgroundConfirmationOwner]
     )
 
 
+def _assert_coordinator_idle(coordinator: ToolConfirmationCoordinator) -> None:
+    assert coordinator._active is None
+    assert not coordinator._foreground
+    assert not coordinator._background
+
+
 def test_owner_union_and_envelope_are_typed_runtime_values() -> None:
     foreground, background = _owners()
 
@@ -280,8 +286,7 @@ async def test_producer_cancellation_removes_queued_item_and_active_item_dismiss
         await active
     await asyncio.sleep(0)
     assert presenter.dismissed == [presenter.presented[0][1]]
-    assert coordinator.queued_counts == (0, 0)
-    assert coordinator.active_envelope is None
+    _assert_coordinator_idle(coordinator)
     await coordinator.close()
 
 
@@ -301,8 +306,7 @@ async def test_async_presenter_is_stopped_and_producer_cancellation_stays_cancel
         await pending
     assert presenter.stopped.is_set()
     assert presenter.dismissed == [token]
-    assert coordinator.active_envelope is None
-    assert coordinator.queued_counts == (0, 0)
+    _assert_coordinator_idle(coordinator)
     await coordinator.close()
 
 
@@ -428,7 +432,7 @@ async def test_unbind_current_aborts_all_and_non_current_cannot_break_binding() 
     await first_presenter.wait_for_count(1)
 
     await coordinator.unbind_presenter(second_presenter)
-    assert coordinator.active_envelope is not None
+    assert coordinator._active is not None
     await coordinator.unbind_presenter(first_presenter)
     with pytest.raises(ConfirmationAborted):
         await active
@@ -456,7 +460,6 @@ async def test_close_is_idempotent_and_post_close_requests_fail_closed() -> None
     await coordinator.close()
     with pytest.raises(ConfirmationAborted):
         await request_task
-    assert coordinator.queued_counts == (0, 0)
-    assert coordinator.active_envelope is None
+    _assert_coordinator_idle(coordinator)
     with pytest.raises(ConfirmationAborted):
         await coordinator.request(_foreground("after-close"))

@@ -3654,8 +3654,9 @@ async def test_coordinator_open_modal_is_aborted_and_drained_on_unmount() -> Non
 
     with pytest.raises(ConfirmationAborted):
         await pending
-    assert coordinator.active_envelope is None
-    assert coordinator.queued_counts == (0, 0)
+    assert coordinator._active is None
+    assert not coordinator._foreground
+    assert not coordinator._background
     await coordinator.close()
 
 

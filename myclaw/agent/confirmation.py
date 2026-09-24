@@ -165,19 +165,6 @@ class ToolConfirmationCoordinator:
         self._pump_task: asyncio.Task[None] | None = None
         self._closed = False
 
-    @property
-    def active_envelope(self) -> ConfirmationEnvelope | None:
-        active = self._active
-        return None if active is None else active.envelope
-
-    @property
-    def queued_counts(self) -> tuple[int, int]:
-        return len(self._foreground), len(self._background)
-
-    @property
-    def is_closed(self) -> bool:
-        return self._closed
-
     def bind_presenter(self, presenter: ConfirmationPresenter) -> None:
         if self._closed:
             raise ConfirmationAborted("confirmation coordinator is closed")
