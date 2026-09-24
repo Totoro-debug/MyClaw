@@ -180,6 +180,10 @@ _Avoid_: Direct Tool registry, plugin executor, shell wrapper
 A host-mediated, one-shot user decision bound to one validated Tool call in one live Agent Run.
 _Avoid_: Permission Policy, model approval, chat reply, persistent approval
 
+**Background Tool Confirmation**:
+A Tool Confirmation originating from a user Schedule Agent Run rather than the current foreground Agent Run. It remains bound to exactly one Tool call and is visibly identified as background work.
+_Avoid_: Background permission, Schedule permission, persistent approval
+
 **Tool Catalog**:
 The ordered set of concrete Tool capabilities available for name lookup and invocation through a Tool Gateway. Membership is independent of Tool Exposure.
 _Avoid_: Plugin list, command list, model tools, subagent registry, MCP registry
@@ -240,6 +244,10 @@ _Avoid_: Scheduled Work, a single scheduled task, the scheduling service
 One Workspace-owned persistent task in the Schedule domain with its own execution timing. A user-created Schedule Job has its own Conversation Session; a System Schedule Job may use a dedicated internal executor.
 _Avoid_: Schedule, Scheduled Work, shell cron job, reminder
 
+**Schedule Job Title**:
+The stable user-facing label owned by one Schedule Job, distinct from both its instruction message and its dedicated Conversation Session title.
+_Avoid_: Job message, Schedule Session title, display-only alias
+
 **System Schedule Job**:
 A Schedule Job created and maintained by the Personal Agent for internal Runtime work rather than by the user. It is hidden from user Schedule listing and mutation.
 _Avoid_: User Schedule Job, public Schedule, shell cron job
@@ -252,8 +260,16 @@ _Avoid_: User Schedule Job, Memory Task scheduler, scheduled Agent Run
 The sole management and execution boundary for Schedule Jobs within one Runtime Lifetime.
 _Avoid_: Schedule, Schedule Job, detached background process
 
+**Tool Permission Level**:
+One of Read-Only, Workspace-Write, or Full-Access, selecting how much Tool autonomy the user grants. Lower levels may use exact-call Tool Confirmation to cross their normal boundary; the level governs only Tool capabilities and not runtime-owned persistence.
+_Avoid_: Access Mode, process permission, Tool Exposure, Tool Activation, persistent approval
+
+**Catastrophic Exec Operation**:
+An Exec invocation recognized as capable of erasing broad workspace, repository, user, filesystem, or device state, or disrupting the host system. It always requires Tool Confirmation, including under Full-Access.
+_Avoid_: Full-delete command, ordinary recursive deletion, invalid command
+
 **Permission Policy**:
-The Tool-specific safety rules that determine whether one normalized invocation can run directly, requires Tool Confirmation, or must be refused.
+The Tool-specific authorization rules that determine whether one normalized invocation can run directly or requires Tool Confirmation. Validation, business refusal, missing capabilities, and execution failures are separate hard outcomes rather than permission levels.
 _Avoid_: Tool switch, safety flag, enablement
 
 **Model Route**:
